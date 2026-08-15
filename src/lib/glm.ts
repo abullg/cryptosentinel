@@ -148,11 +148,7 @@ export async function callGLM(
     // Render has 15-minute timeout (vs Vercel Hobby 60s), so we can afford
     // the full reasoning chain. This gives ~24,000 words of output — enough
     // for thorough multi-finding analysis with full PoC outlines.
-    if (config.maxTokens) {
-      requestBody.max_tokens = config.maxTokens;
-    } else if ((model || DEFAULT_MODEL).includes('glm')) {
-      requestBody.max_tokens = 32768; // MAXIMUM — Render 15min timeout allows it
-    }
+    // No max_tokens limit — model decides when analysis is complete
     // DeepSeek and other models keep their explicit limits from config
 
     response = await fetch(OPENROUTER_API_URL, {
