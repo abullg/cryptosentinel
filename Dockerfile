@@ -1,17 +1,7 @@
 FROM node:24-slim
 
-# Install system deps + git (needed by forge install) + curl (for foundryup)
+# Install system deps + curl (for foundryup) + git (for forge install)
 RUN apt-get update && apt-get install -y python3 make g++ curl git && rm -rf /var/lib/apt/lists/*
-
-# Install Foundry — industry standard for smart contract exploit testing
-# Used by Trail of Bits, OpenZeppelin, Code4rena, HackenProof auditors
-RUN curl -L https://foundry.paradigm.xyz | bash && \
-    /root/.foundry/bin/foundryup && \
-    cp /root/.foundry/bin/forge /usr/local/bin/forge && \
-    cp /root/.foundry/bin/cast /usr/local/bin/cast && \
-    cp /root/.foundry/bin/anvil /usr/local/bin/anvil
-
-ENV PATH="/root/.foundry/bin:$PATH"
 
 WORKDIR /app
 
@@ -31,4 +21,6 @@ ENV HOSTNAME=0.0.0.0
 
 EXPOSE 10000
 
-CMD ["sh", "-c", "npx prisma db push --accept-data-loss && npx next start -p ${PORT:-10000} -H 0.0.0.0"]
+# Install Foundry at runtime (not build time) to avoid OOM during Docker build
+# forge is used for real exploit testing of smart contract vulnerabilities
+CMD ["sh", "-c", "curl -L https://foundry.paradigm.xyz | bash && export PATH=$HOME/.foundry/bin:$PATH && foundryup && cp $HOME/.foundry/bin/forge /usr/local/bin/ && npx prisma db push --accept-data-loss && npx next start -p ${PORT:-10000} -H 0.0.0.0"]
