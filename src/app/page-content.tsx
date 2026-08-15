@@ -96,6 +96,11 @@ interface ActivityItem {
 export default function CryptoSentinelDashboard() {
   const [projects, setProjects] = usePersistedState<Project[]>('cs_projects', []);
   const [vulns, setVulns] = usePersistedState<Vulnerability[]>('cs_vulns', []);
+  /** CRITICAL: Only show vulnerabilities with confidence >= 90%
+   *  Applied to EVERY place findings enter the UI. No exceptions. */
+  const MIN_CONFIDENCE = 0.90;
+  const onlyHighConfidence = (findings: any[]): any[] => findings.filter(f => (f.confidence || 0) >= MIN_CONFIDENCE);
+
 
   /** Filter: only show vulnerabilities with confidence >= 90%
    *  This is the USER's explicit requirement — no findings below 90%
@@ -340,7 +345,7 @@ export default function CryptoSentinelDashboard() {
       // No after(), no jobStore, no polling. 50s hard timeout on the server.
       // NOTE: Route is /api/validate (not /api/validate-vuln which doesn't exist).
       // Previously called /api/validate-vuln which returned HTTP 404, causing
-      // every manual "Re-validate" click to fail.
+      // every manual "🔍 Validate" click to fail.
       const res = await fetchWithTimeout('/api/validate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -638,7 +643,7 @@ export default function CryptoSentinelDashboard() {
     }
 
     const data = await res.json();
-    const allFindings = data.allFindings || [];
+    const allFindings = onlyHighConfidence(data.allFindings || []);
     const contractId = data.contractId || '';
     const auditId = data.auditId || '';
 
@@ -646,7 +651,7 @@ export default function CryptoSentinelDashboard() {
     if (allFindings.length > 0) {
       setVulns(prev => {
         const existingIds = new Set(prev.map(v => v.id));
-        return [...allFindings.filter((f: any) => !existingIds.has(f.id)), ...prev]);
+        return [...allFindings.filter((f: any) => !existingIds.has(f.id)), ...prev];
       });
     }
 
@@ -914,11 +919,11 @@ export default function CryptoSentinelDashboard() {
     }
 
     const staticData = await res.json();
-    const staticFindings = staticData.findings || [];
+    const staticFindings = onlyHighConfidence(staticData.findings || []);
     if (staticFindings.length > 0) {
       setVulns(prev => {
         const existingIds = new Set(prev.map(v => v.id));
-        return [...staticFindings.filter((f: any) => !existingIds.has(f.id)), ...prev]);
+        return [...staticFindings.filter((f: any) => !existingIds.has(f.id)), ...prev];
       });
     }
 
@@ -943,7 +948,7 @@ export default function CryptoSentinelDashboard() {
 
       if (aiRes.ok) {
         const aiData = await aiRes.json();
-        const aiFindings = aiData.aiFindings || aiData.allFindings || [];
+        const aiFindings = onlyHighConfidence(aiData.aiFindings || aiData.allFindings || []);
         if (aiFindings.length > 0) {
           setVulns(prev => {
             const existingIds = new Set(prev.map(v => v.id));
@@ -1006,6 +1011,8 @@ export default function CryptoSentinelDashboard() {
       addActivity('scan', `Report download failed: ${e.message}`, 'error', 'Try again', 0);
     }
   };
+
+  /** Download a professional .txt report for a single vulnerability */
 
 const analyzeContract = async () => {
     // ─── LOCK: prevent concurrent analysis ───
@@ -1232,16 +1239,6 @@ const analyzeContract = async () => {
     } finally { setLoading(false); }
   };
 
-  const downloadReport = () => {
-    if (!reportText) return;
-    const blob = new Blob([reportText], { type: 'text/plain' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `audit_report_${new Date().toISOString().slice(0,10)}.txt`;
-    a.click();
-    URL.revokeObjectURL(url);
-  };
 
   const downloadZip = async () => {
     setLoading(true);
@@ -1836,7 +1833,7 @@ const analyzeContract = async () => {
                             <button
                               onClick={() => deleteVuln(v.id)}
                               className="p-1 rounded hover:bg-red-50 text-slate-400 hover:text-red-600 transition-colors"
-                              title="Delete finding"
+                              title="Delete"
                             >
                               <Trash2 className="w-3.5 h-3.5" />
                             </button>
@@ -1884,7 +1881,7 @@ const analyzeContract = async () => {
                               className="text-xs border-violet-300 text-violet-700 hover:bg-violet-50"
                               onClick={() => setPocView({ title: v.title, filename: v.pocFilename || 'attack.t.sol', code: v.poc! })}
                             >
-                              <Code2 className="w-3.5 h-3.5 mr-1" /> View PoC
+                              <Code2 className="w-3.5 h-3.5 mr-1" /> PoC
                             </Button>
                             <span className="text-[10px] text-slate-400">{v.pocFilename}</span>
                             <Badge variant="outline" className="text-[9px] text-violet-600 border-violet-200">Foundry Test</Badge>
