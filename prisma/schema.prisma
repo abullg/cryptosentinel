@@ -1,0 +1,98 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:/data/cryptosentinel.db"
+}
+
+model Settings {
+  id        String   @id @default(cuid())
+  apiKey    String?  // GLM API key (encrypted in production)
+  model     String   @default("glm-5.2")
+  updatedAt DateTime @updatedAt
+}
+
+model Project {
+  id          String   @id @default(cuid())
+  name        String
+  chain       String   @default("ethereum")
+  language    String   @default("solidity")
+  address     String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  contracts   Contract[]
+  audits      Audit[]
+}
+
+model Contract {
+  id          String   @id @default(cuid())
+  projectId   String
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  name        String
+  sourceCode  String?
+  abi         String?
+  address     String?
+  filePath    String?
+  codeHash    String?
+  language    String   @default("solidity")
+  createdAt   DateTime @default(now())
+  vulnerabilities Vulnerability[]
+}
+
+model Vulnerability {
+  id            String   @id @default(cuid())
+  contractId    String
+  contract      Contract @relation(fields: [contractId], references: [id], onDelete: Cascade)
+  type          String
+  severity      String   @default("medium")
+  title         String
+  description   String
+  location      String?
+  codeSnippet  String?
+  poc           String?   // PoC Solidity code
+  pocFilename  String?   // e.g. "ReentrancyAttack.t.sol"
+  confidence    Float    @default(0.0)
+  status        String   @default("candidate")
+  v1Symbolic    Float?
+  v2Fuzzing     Float?
+  v3Formal      Float?
+  v4Economic    Float?
+  hashSignature String?
+  isDuplicate   Boolean  @default(false)
+  duplicateOf   String?
+  patternTag    String?
+  // HakenProof report fields
+  target        String?  // Contract name / address
+  vulnCategory  String?  // SWC/HakenProof category
+  validationSteps String? // Detailed validation steps
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+model Audit {
+  id          String   @id @default(cuid())
+  projectId   String
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  status      String   @default("running")
+  workflow    String
+  startedAt   DateTime @default(now())
+  completedAt DateTime?
+  findings    Int      @default(0)
+  confirmed   Int      @default(0)
+  confidence  Float    @default(0.0)
+}
+
+model MemoryPattern {
+  id          String   @id @default(cuid())
+  type        String
+  name        String
+  description String
+  tags        String
+  chain       String?
+  frequency   Int      @default(1)
+  severity    String   @default("medium")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}

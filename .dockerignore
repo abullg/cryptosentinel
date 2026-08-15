@@ -1,0 +1,11 @@
+node_modules
+.git
+.vercel
+tmp
+tool-results
+download
+db
+*.log
+.env*
+skills
+examples

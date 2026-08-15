@@ -1,0 +1,14 @@
+*.log
+node_modules/
+.next/
+.vercel/
+.env*
+tmp/
+tool-results/
+download/
+db/
+*.tsbuildinfo
+skills/
+examples/
+bun.lock
+upload/

@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: cryptosentinel
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        value: file:/data/cryptosentinel.db
+      - key: PORT
+        value: "10000"
