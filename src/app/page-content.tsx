@@ -985,7 +985,29 @@ export default function CryptoSentinelDashboard() {
     }
   };
 
-  const analyzeContract = async () => {
+  
+  /** Download a professional .txt report for a single vulnerability */
+  const downloadReport = async (vulnId: string) => {
+    try {
+      const res = await fetch(`/api/report?id=${vulnId}`);
+      if (!res.ok) throw new Error('Report generation failed');
+      const text = await res.text();
+      const blob = new Blob([text], { type: 'text/plain' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `vulnerability-report-${vulnId.slice(0, 8)}.txt`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      addActivity('scan', 'Report downloaded successfully', 'success', 'Professional .txt report', 100);
+    } catch (e: any) {
+      addActivity('scan', `Report download failed: ${e.message}`, 'error', 'Try again', 0);
+    }
+  };
+
+const analyzeContract = async () => {
     // ─── LOCK: prevent concurrent analysis ───
     if (isAnalyzingRef.current) {
       addActivity('scan', 'Analysis already in progress — skipping', 'warning', 'Wait for current analysis to finish', 0);
