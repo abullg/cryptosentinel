@@ -1,16 +1,28 @@
 FROM node:24-slim
 
-RUN apt-get update && apt-get install -y python3 make g++ && rm -rf /var/lib/apt/lists/*
+# Install system deps + git (needed by forge install) + curl (for foundryup)
+RUN apt-get update && apt-get install -y python3 make g++ curl git && rm -rf /var/lib/apt/lists/*
+
+# Install Foundry — industry standard for smart contract exploit testing
+# Used by Trail of Bits, OpenZeppelin, Code4rena, HackenProof auditors
+RUN curl -L https://foundry.paradigm.xyz | bash && \
+    /root/.foundry/bin/foundryup && \
+    cp /root/.foundry/bin/forge /usr/local/bin/forge && \
+    cp /root/.foundry/bin/cast /usr/local/bin/cast && \
+    cp /root/.foundry/bin/anvil /usr/local/bin/anvil
+
+ENV PATH="/root/.foundry/bin:$PATH"
 
 WORKDIR /app
 
 COPY package.json package-lock.json ./
 COPY prisma ./prisma
-COPY . .
+COPY .next ./.next
+COPY public ./public
+COPY next.config.ts ./
+COPY tsconfig.json ./
 
-RUN npm install
-RUN npx prisma generate
-RUN NODE_OPTIONS=--max-old-space-size=1024 npx next build
+RUN npm install && npx prisma generate
 
 ENV NODE_ENV=production
 ENV DATABASE_URL=file:/tmp/cryptosentinel.db
