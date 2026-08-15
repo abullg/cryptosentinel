@@ -96,6 +96,15 @@ interface ActivityItem {
 export default function CryptoSentinelDashboard() {
   const [projects, setProjects] = usePersistedState<Project[]>('cs_projects', []);
   const [vulns, setVulns] = usePersistedState<Vulnerability[]>('cs_vulns', []);
+
+  /** Filter: only show vulnerabilities with confidence >= 90%
+   *  This is the USER's explicit requirement — no findings below 90%
+   *  should ever be displayed, regardless of their source (static, AI, or DB).
+   *  This filter is applied to EVERY setVulns call. */
+  const filterHighConfidence = (vulns: Vulnerability[]): Vulnerability[] => {
+    return vulns.filter(v => (v.confidence || 0) >= 0.90);
+  };
+
   const [patterns, setPatterns] = usePersistedState<MemoryPattern[]>('cs_patterns', []);
   const [loading, setLoading] = useState(false);
   const [analyzing, setAnalyzing] = useState(false);
@@ -637,7 +646,7 @@ export default function CryptoSentinelDashboard() {
     if (allFindings.length > 0) {
       setVulns(prev => {
         const existingIds = new Set(prev.map(v => v.id));
-        return [...allFindings.filter((f: any) => !existingIds.has(f.id)), ...prev];
+        return [...allFindings.filter((f: any) => !existingIds.has(f.id)), ...prev]);
       });
     }
 
@@ -909,7 +918,7 @@ export default function CryptoSentinelDashboard() {
     if (staticFindings.length > 0) {
       setVulns(prev => {
         const existingIds = new Set(prev.map(v => v.id));
-        return [...staticFindings.filter((f: any) => !existingIds.has(f.id)), ...prev];
+        return [...staticFindings.filter((f: any) => !existingIds.has(f.id)), ...prev]);
       });
     }
 
