@@ -475,7 +475,10 @@ export async function POST(req: NextRequest) {
           }
         }
 
-        // Step 3: Enhance with DeepSeek (top 4, parallel, with per-item timeout)
+        // Step 3: Enhance with DeepSeek — SKIPPED to avoid multi-minute hang.
+        // Even with 30s per-finding timeout, 4 findings × 30s = 2 min extra.
+        // GLM 5.2 initial description is already detailed enough.
+        /*
         if (aiSavedVulns.length > 0) {
           const toEnhance = aiSavedVulns.sort((a: any, b: any) => {
             const aV = a.rawFinding.blockchainVerified ? 1 : 0;
@@ -501,6 +504,7 @@ export async function POST(req: NextRequest) {
           });
           await Promise.allSettled(enhancementPromises);
         }
+        */
 
         // ─── Step 4: Active on-chain verification for ALL findings ──
         // SKIPPED on Vercel Hobby plan (60s limit) — EVM validation takes
@@ -917,7 +921,8 @@ async function runAIOnlyPhase(
         }
       }
 
-      // Step 3: Enhance with DeepSeek
+      // Step 3: Enhance with DeepSeek — SKIPPED (see full-mode comment above)
+      /*
       if (aiSavedVulns.length > 0) {
         const toEnhance = aiSavedVulns.sort((a: any, b: any) => {
           const aV = a.rawFinding.blockchainVerified ? 1 : 0;
@@ -942,6 +947,7 @@ async function runAIOnlyPhase(
         });
         await Promise.allSettled(enhancementPromises);
       }
+      */
 
       // Step 4: On-chain verification
       // ─── Step 4: REAL active validation via EVM execution ──

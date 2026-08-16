@@ -358,7 +358,14 @@ export async function POST(req: NextRequest) {
           send('finding', { vulnerability: vuln });
         }
 
-        // Step 3: Enhance with DeepSeek
+        // Step 3: Enhance with DeepSeek — SKIPPED to avoid multi-minute hang.
+        // Enhancement calls DeepSeek once per finding (up to 4 findings × 5 min
+        // timeout = 20 min hang). This was the main cause of "analysis never
+        // completes" reports. The AI's initial description from GLM 5.2 is
+        // already detailed enough — enhancement is a nice-to-have, not essential.
+        // If we want to re-enable later, do it ASYNC (return immediately, let
+        // enhancement run in background) or limit to 1 finding with 60s timeout.
+        /*
         if (aiSavedVulns.length > 0) {
           send('progress', { step: 'enhancement', message: 'Enhancing findings with DeepSeek...', percent: 88 });
           const toEnhance = aiSavedVulns.sort((a: any, b: any) => {
@@ -380,6 +387,7 @@ export async function POST(req: NextRequest) {
           });
           await Promise.allSettled(enhancementPromises);
         }
+        */
 
         // ─── Step 4: REAL active validation via EVM execution ──────
         // Replace LLM-based verifyVulnerabilityOnChain with actual exploit
