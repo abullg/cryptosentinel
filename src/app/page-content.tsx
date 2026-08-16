@@ -196,17 +196,16 @@ export default function CryptoSentinelDashboard() {
   // cancelled when a hard timeout fires. This is THE fix for infinite loading.
   const isAnalyzingRef = useRef(false);       // true = analysis in progress (lock)
   const analysisAbortRef = useRef<AbortController | null>(null); // abort all fetches on timeout
-  const HARD_TIMEOUT_MS = 180_000;            // 3 min — hard cap, analysis must complete within this
+  const HARD_TIMEOUT_MS = 900_000;            // 15 min — background job has no SSE timeout
 
   // ─── SAFETY WATCHDOG ──────────────────────────────────────────────────────
-  // Nuclear option: if `analyzing` stays true for too long, FORCIBLY reset it.
-  // This is the LAST line of defense against infinite loading.
-  // AI analysis: 2 min, Active validation: 30s, Total: ~2.5 min
-  // 3 min hard cap ensures the user NEVER waits more than 3 min.
+  // With background polling, the watchdog only needs to catch UI bugs.
+  // The actual analysis runs on the server and can take up to 10 min.
+  // 15 min is generous — if polling hasn't shown 'completed' by then, reset.
   const watchdogSinceRef = useRef<number>(0);
   useEffect(() => {
-    const WATCHDOG_INTERVAL = 5_000;   // Check every 5s
-    const WATCHDOG_MAX = 180_000;     // 3 min — matches HARD_TIMEOUT
+    const WATCHDOG_INTERVAL = 10_000;
+    const WATCHDOG_MAX = 900_000;  // 15 min
 
     const watchdog = setInterval(() => {
       if (analyzing || fetchingUrl) {
@@ -216,7 +215,6 @@ export default function CryptoSentinelDashboard() {
           const mins = Math.round(elapsed / 60_000);
           console.error(`[WATCHDOG] analyzing stuck for ${mins} min — FORCE RESET`);
           isAnalyzingRef.current = false;
-          if (analysisAbortRef.current) analysisAbortRef.current.abort();
           analysisAbortRef.current = null;
           setAnalyzing(false);
           setFetchingUrl(false);
@@ -1074,169 +1072,73 @@ export default function CryptoSentinelDashboard() {
   /** Download a professional .txt report for a single vulnerability */
 
 const analyzeContract = async () => {
-    // ─── LOCK: prevent concurrent analysis ───
     if (isAnalyzingRef.current) {
       addActivity('scan', 'Analysis already in progress — skipping', 'warning', 'Wait for current analysis to finish', 0);
       return;
     }
     isAnalyzingRef.current = true;
-    // ─── ABORT CONTROLLER: cancels ALL in-flight fetches on timeout ───
-    analysisAbortRef.current = new AbortController();
     setAnalyzing(true);
     setFetchError('');
-    addActivity('scan', 'Starting deep analysis...', 'running', sourceCode ? 'Source code analysis' : 'URL analysis', 0);
+    addActivity('scan', 'Starting analysis...', 'running', sourceCode ? 'Source code' : 'URL', 0);
 
-    // ─── Quick connectivity check (VPS is always hot, no cold start) ───
-    await warmupServer();
-
-    // HARD GLOBAL TIMEOUT: Analysis MUST complete in HARD_TIMEOUT_MS no matter what
-    const globalTimeout = setTimeout(() => {
-      // Abort ALL in-flight requests
-      if (analysisAbortRef.current) analysisAbortRef.current.abort();
-      addActivity('scan', `Analysis hard timeout (${HARD_TIMEOUT_MS/1000}s) — showing partial results`, 'warning', 'All in-flight requests cancelled', 90);
-    }, HARD_TIMEOUT_MS);
     try {
-      const projectId = await ensureProject();
-      await runTwoPhaseAnalysis(projectId, sourceCode, 'AnalyzedContract', targetUrl, targetType === 'hackenproof' ? 'contract' : targetType, hackenproofContext);
+      await startBackgroundAnalysis(sourceCode, 'AnalyzedContract', targetType === 'hackenproof' ? 'contract' : targetType, targetUrl || undefined);
       setSourceCode(''); setTargetUrl(''); setHackenproofContext(null);
     } catch (e: any) {
       const msg = String(e);
-      if (msg.includes('AbortError')) {
-        addActivity('scan', 'Analysis timed out — partial results may be available', 'warning', 'Try again', 80);
-      } else if (msg.includes('Failed to fetch') || msg.includes('network error') || msg.includes('NetworkError') || msg.includes('fetch failed')) {
-        setFetchError('Network error after retries — server may be overloaded. Please try again.');
-        addActivity('scan', 'Network error after retries', 'warning', 'Try again in 10-15s');
-      } else {
-        setFetchError(`Analysis error: ${msg}`);
-        addActivity('scan', 'Analysis failed', 'error', msg);
-      }
+      setFetchError(`Analysis error: ${msg}`);
+      addActivity('scan', 'Analysis failed', 'error', msg.slice(0, 100));
     } finally {
-      clearTimeout(globalTimeout);
       isAnalyzingRef.current = false;
-      analysisAbortRef.current = null;
       setAnalyzing(false);
     }
   };
 
   const fetchUrlAndAnalyze = async () => {
     if (!targetUrl) return;
-    // ─── LOCK: prevent concurrent analysis ───
     if (isAnalyzingRef.current) {
       addActivity('scan', 'Analysis already in progress — skipping', 'warning', 'Wait for current analysis to finish', 0);
       return;
     }
     isAnalyzingRef.current = true;
-    // ─── ABORT CONTROLLER: cancels ALL in-flight fetches on timeout ───
-    analysisAbortRef.current = new AbortController();
     setFetchingUrl(true);
     setFetchError('');
-    setHackenproofContext(null);
-    addActivity('scan', 'Starting URL analysis...', 'running', targetUrl, 0);
+    addActivity('scan', 'Fetching URL and starting analysis...', 'running', targetUrl, 5);
 
-    // ─── Quick connectivity check (VPS is always hot, no cold start) ───
-    await warmupServer();
-
-    // HARD GLOBAL TIMEOUT for entire URL analysis flow
-    const fetchGlobalTimeout = setTimeout(() => {
-      // Abort ALL in-flight requests
-      if (analysisAbortRef.current) analysisAbortRef.current.abort();
-      addActivity('scan', `URL analysis hard timeout (${HARD_TIMEOUT_MS/1000}s) — showing partial results`, 'warning', 'All in-flight requests cancelled', 90);
-    }, HARD_TIMEOUT_MS);
     try {
-      // Determine actual type for API (hackenproof is auto-detected by URL)
-      const apiType = targetType === 'hackenproof' ? 'contract' : targetType;
-      // Fetch content from URL — with automatic retry on transient network failures
-      // fetch-url does a deep crawl (10 sitemap pages in parallel) which can
-      // take 30-90s on sites with WAF. Use 180s timeout to accommodate.
-      addActivity('system', 'Fetching URL content...', 'running', targetUrl, 10);
-      let fetchRes: Response | null = null;
-      let lastError: string = '';
-      const MAX_RETRIES = 2;
-      const RETRY_DELAYS = [3_000, 5_000]; // Short backoff
+      // Fetch URL content first
+      const fetchRes = await fetchWithTimeout('/api/fetch-url', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: targetUrl, type: targetType === 'hackenproof' ? 'contract' : targetType }),
+      }, 60_000);
 
-      for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-        throwIfAborted();
-        try {
-          fetchRes = await fetchWithTimeout('/api/fetch-url', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ url: targetUrl, type: apiType }),
-          }, 60_000); // 60s — mobile-friendly, deep crawl now only 3 pages
-          break; // Success — exit retry loop
-        } catch (fetchErr: any) {
-          lastError = String(fetchErr);
-          // If analysis was aborted by user/global timeout, re-throw
-          if (lastError.includes('AbortError') && analysisAbortRef.current?.signal.aborted) throw fetchErr;
-          // Don't retry on AbortError from timeout — it means the fetch took too long
-          if (lastError.includes('AbortError') && !analysisAbortRef.current?.signal.aborted) {
-            // This is a fetchWithTimeout abort (180s), not a global abort
-            addActivity('system', `URL fetch timed out after 180s — site may be slow or blocking`, 'warning', 'Try with a different URL', 15);
-            throw fetchErr;
-          }
-          const isRetryable = lastError.includes('Failed to fetch') || lastError.includes('NetworkError') || lastError.includes('network error');
-          if (!isRetryable || attempt === MAX_RETRIES - 1) throw fetchErr;
-          addActivity('system', `Fetch attempt ${attempt + 1} failed, retrying in ${RETRY_DELAYS[attempt] / 1000}s...`, 'warning', lastError.slice(0, 60), 15);
-          await new Promise(r => setTimeout(r, RETRY_DELAYS[attempt]));
-        }
+      if (!fetchRes.ok) {
+        const errData = await fetchRes.json().catch(() => ({}));
+        throw new Error(errData.error || `Server error: ${fetchRes.status}`);
       }
 
-      if (!fetchRes || !fetchRes.ok) {
-        const errData = await fetchRes?.json().catch(() => ({})) || {};
-        setFetchError(errData.error || `Server error: ${fetchRes?.status || 'no response'}`);
-        addActivity('scan', 'URL fetch failed', 'error', errData.error || `Server error: ${fetchRes?.status || 'no response'}`);
-        return;
-      }
       const data = await fetchRes.json();
-      if (data.error) {
-        setFetchError(data.error);
-        addActivity('scan', 'URL fetch failed', 'error', data.error);
-        return;
-      }
-      if (!data.sourceCode) {
-        setFetchError('No content found at the specified URL. Check the URL and try again.');
-        addActivity('scan', 'No content found', 'error', 'Check the URL and try again');
-        return;
-      }
-      addActivity('system', 'URL content fetched', 'success', `${(data.sourceCode as string).length} chars`, 40);
-      // Store Hackenproof context if present
-      if (data.isHackenproof && data.hackenproofContext) {
-        setHackenproofContext(data.hackenproofContext);
-      }
-      setSourceCode(data.sourceCode);
-      // Auto-detect chain/language from URL type
-      const autoChain = apiType === 'contract' ? 'ethereum' : 'web';
-      const autoLang = apiType === 'contract' ? (data.language || 'solidity') : 'web';
-      const projectId = await ensureProject(data.contractName || 'URL Analysis', autoChain, autoLang);
-      // Now run two-phase analysis with fetched code
-      addActivity('scan', 'Running two-phase analysis on fetched code...', 'running', `Project: ${projectId}`, 40);
-      setAnalyzing(true);
-      await runTwoPhaseAnalysis(
-        projectId,
+      if (data.error) throw new Error(data.error);
+      if (!data.sourceCode) throw new Error('No content found at the URL');
+
+      addActivity('system', `URL content fetched: ${data.sourceCode.length} chars`, 'success', '', 20);
+
+      // Start background analysis with fetched code
+      const apiType = targetType === 'hackenproof' ? 'contract' : targetType;
+      await startBackgroundAnalysis(
         data.sourceCode,
         data.contractName || 'FetchedContract',
-        targetUrl,
         apiType,
-        data.hackenproofContext || null
+        targetUrl
       );
-      addActivity('scan', 'URL analysis complete', 'success', 'Both phases done', 100);
-      setSourceCode('');
-      setTargetUrl('');
-      setHackenproofContext(null);
+      addActivity('scan', 'URL analysis complete', 'success', 'Done', 100);
+      setSourceCode(''); setTargetUrl(''); setHackenproofContext(null);
     } catch (e: any) {
-      const errMsg = String(e);
-      if (errMsg.includes('AbortError')) {
-        setFetchError('Analysis timed out — partial results may be available.');
-        addActivity('scan', 'Analysis timed out', 'warning', 'Try again');
-      } else if (errMsg.includes('Failed to fetch') || errMsg.includes('network error') || errMsg.includes('NetworkError')) {
-        setFetchError('Network error — server may be unreachable. Please try again in a few seconds.');
-        addActivity('scan', 'Network error — server may be unreachable', 'warning', 'Try again in a few seconds');
-      } else {
-        setFetchError(`Analysis error: ${errMsg}`);
-        addActivity('scan', 'URL analysis failed', 'error', errMsg.slice(0, 100));
-      }
+      const msg = String(e);
+      setFetchError(`Analysis error: ${msg}`);
+      addActivity('scan', 'Analysis failed', 'error', msg.slice(0, 100));
     } finally {
-      clearTimeout(fetchGlobalTimeout);
       isAnalyzingRef.current = false;
-      analysisAbortRef.current = null;
       setFetchingUrl(false);
       setAnalyzing(false);
     }

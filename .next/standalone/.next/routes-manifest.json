@@ -21,7 +21,16 @@
     "afterFiles": [],
     "fallback": []
   },
-  "dynamicRoutes": [],
+  "dynamicRoutes": [
+    {
+      "page": "/api/job-status/[id]",
+      "regex": "^/api/job\\-status/([^/]+?)(?:/)?$",
+      "routeKeys": {
+        "nxtPid": "nxtPid"
+      },
+      "namedRegex": "^/api/job\\-status/(?<nxtPid>[^/]+?)(?:/)?$"
+    }
+  ],
   "staticRoutes": [
     {
       "page": "/",
@@ -64,6 +73,12 @@
       "regex": "^/api/analyze\\-ai(?:/)?$",
       "routeKeys": {},
       "namedRegex": "^/api/analyze\\-ai(?:/)?$"
+    },
+    {
+      "page": "/api/analyze-job",
+      "regex": "^/api/analyze\\-job(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/api/analyze\\-job(?:/)?$"
     },
     {
       "page": "/api/analyze-stream",
