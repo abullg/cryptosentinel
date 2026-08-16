@@ -198,9 +198,14 @@ export async function callGLM(
   // answer in `reasoning`. Fall back to reasoning if content is empty.
   let content = message.content;
   if (!content && message.reasoning) {
+    // GLM 5.2 reasoning often wraps JSON in markdown fences — strip them
+    // before extracting the JSON array.
+    let reasoning = message.reasoning;
+    const mdMatch = reasoning.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);
+    if (mdMatch) reasoning = mdMatch[1].trim();
     // Try to extract JSON array from reasoning (some models put the answer there)
-    const jsonMatch = message.reasoning.match(/\[[\s\S]*\]/);
-    content = jsonMatch ? jsonMatch[0] : message.reasoning;
+    const jsonMatch = reasoning.match(/\[[\s\S]*\]/);
+    content = jsonMatch ? jsonMatch[0] : reasoning;
   }
   if (!content) {
     // Model returned empty response
