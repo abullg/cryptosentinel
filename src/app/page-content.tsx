@@ -110,6 +110,21 @@ export default function CryptoSentinelDashboard() {
     return vulns.filter(v => (v.confidence || 0) >= 0.90);
   };
 
+  /** SAFETY NET: After every vulns state change, sweep and drop anything
+   *  below 90% confidence. This catches cases where:
+   *   - A finding was added by SSE without filtering (lines 253, 651, 786, 808, 821, 924, 953)
+   *   - A re-validation dropped confidence below 90% (lines 386, 407)
+   *   - localStorage was restored from an older session with looser filtering
+   *  Without this sweep, low-confidence findings can leak through via paths
+   *  that forgot to call onlyHighConfidence. */
+  useEffect(() => {
+    setVulns(prev => {
+      const filtered = prev.filter(v => (v.confidence || 0) >= 0.90);
+      // Only update if something was actually filtered out — avoids infinite loop
+      return filtered.length === prev.length ? prev : filtered;
+    });
+  }, [vulns]);
+
   const [patterns, setPatterns] = usePersistedState<MemoryPattern[]>('cs_patterns', []);
   const [loading, setLoading] = useState(false);
   const [analyzing, setAnalyzing] = useState(false);
@@ -249,10 +264,12 @@ export default function CryptoSentinelDashboard() {
         const serverVulns: Vulnerability[] = await vRes.json();
         // MERGE: keep union of server + localStorage, dedup by ID.
         // Server data ADDS to localStorage — never replaces (fixes cold-start data loss)
+        // Apply 90% confidence filter — never display low-confidence findings.
         if (serverVulns.length > 0) {
+          const highConfServerVulns = onlyHighConfidence(serverVulns);
           setVulns(prev => {
             const existingIds = new Set(prev.map(v => v.id));
-            const toAdd = serverVulns.filter(v => !existingIds.has(v.id));
+            const toAdd = highConfServerVulns.filter(v => !existingIds.has(v.id));
             return toAdd.length > 0 ? [...toAdd, ...prev] : prev;
           });
         }
@@ -382,20 +399,28 @@ export default function CryptoSentinelDashboard() {
         return;
       }
 
-      // Update the vulnerability in state with validation results
-      setVulns(prev => prev.map(vn => vn.id === v.id ? {
-        ...vn,
-        v1Symbolic: result.v1Symbolic ?? vn.v1Symbolic,
-        v2Fuzzing: result.v2Fuzzing ?? vn.v2Fuzzing,
-        v3Formal: result.v3Formal ?? vn.v3Formal,
-        v4Economic: result.v4Economic ?? vn.v4Economic,
-        confidence: result.confidence ?? vn.confidence,
-        status: result.status ?? vn.status,
-        poc: result.poc ?? vn.poc,
-        pocFilename: result.pocFilename ?? vn.pocFilename,
-        validationSteps: result.validationSteps ?? vn.validationSteps,
-        description: result?.exploitAnalysis ? `${vn.description}\n\n[Validation] ${result.exploitAnalysis}` : vn.description,
-      } : vn));
+      // Update the vulnerability in state with validation results.
+      // If the new confidence drops below 90%, REMOVE the finding from
+      // the visible list — the user only wants >=90% confidence shown.
+      const newConfidence = result.confidence ?? 0;
+      if (newConfidence < 0.90) {
+        setVulns(prev => prev.filter(vn => vn.id !== v.id));
+        addActivity('validation', `Finding removed (confidence dropped to ${(newConfidence * 100).toFixed(0)}% — below 90% threshold): ${v.title}`, 'warning', 'Filtered by confidence', 0);
+      } else {
+        setVulns(prev => prev.map(vn => vn.id === v.id ? {
+          ...vn,
+          v1Symbolic: result.v1Symbolic ?? vn.v1Symbolic,
+          v2Fuzzing: result.v2Fuzzing ?? vn.v2Fuzzing,
+          v3Formal: result.v3Formal ?? vn.v3Formal,
+          v4Economic: result.v4Economic ?? vn.v4Economic,
+          confidence: result.confidence ?? vn.confidence,
+          status: result.status ?? vn.status,
+          poc: result.poc ?? vn.poc,
+          pocFilename: result.pocFilename ?? vn.pocFilename,
+          validationSteps: result.validationSteps ?? vn.validationSteps,
+          description: result?.exploitAnalysis ? `${vn.description}\n\n[Validation] ${result.exploitAnalysis}` : vn.description,
+        } : vn));
+      }
 
       const confPct = ((result.confidence ?? 0) * 100).toFixed(1);
       const statusLabel = result.status === 'confirmed' ? 'CONFIRMED ✓' : result.status === 'validated' ? 'VALIDATED' : result.status === 'refuted' ? 'REFUTED ✗' : result.status;
@@ -646,11 +671,12 @@ export default function CryptoSentinelDashboard() {
     const contractId = data.contractId || '';
     const auditId = data.auditId || '';
 
-    // Show findings immediately
-    if (allFindings.length > 0) {
+    // Show findings immediately — filter to >=90% confidence only
+    const highConfFindings = onlyHighConfidence(allFindings);
+    if (highConfFindings.length > 0) {
       setVulns(prev => {
         const existingIds = new Set(prev.map(v => v.id));
-        return [...allFindings.filter((f: any) => !existingIds.has(f.id)), ...prev];
+        return [...highConfFindings.filter((f: any) => !existingIds.has(f.id)), ...prev];
       });
     }
 
@@ -781,11 +807,12 @@ export default function CryptoSentinelDashboard() {
                 contractId = data.contractId || '';
                 auditId = data.auditId || '';
 
-                // Show static findings immediately!
-                if (findings.length > 0) {
+                // Show static findings immediately — only >=90% confidence
+                const highConfStaticFindings = onlyHighConfidence(findings);
+                if (highConfStaticFindings.length > 0) {
                   setVulns(prev => {
                     const existingIds = new Set(prev.map(v => v.id));
-                    const newFindings = findings.filter((f: any) => !existingIds.has(f.id));
+                    const newFindings = highConfStaticFindings.filter((f: any) => !existingIds.has(f.id));
                     return [...newFindings, ...prev];
                   });
                 }
@@ -803,7 +830,9 @@ export default function CryptoSentinelDashboard() {
 
               case 'finding': {
                 const vuln = data.vulnerability;
-                if (vuln) {
+                // Only add if confidence >= 90% — server may stream
+                // candidate findings that haven't been validated yet.
+                if (vuln && (vuln.confidence || 0) >= 0.90) {
                   aiFindingsCount++;
                   setVulns(prev => {
                     const existingIds = new Set(prev.map(v => v.id));
@@ -816,17 +845,18 @@ export default function CryptoSentinelDashboard() {
 
               case 'complete': {
                 const allFindings = data.findings || [];
-                // Merge any findings we haven't seen yet
-                if (allFindings.length > 0) {
+                // Merge any findings we haven't seen yet — only >=90% confidence
+                const highConfComplete = onlyHighConfidence(allFindings);
+                if (highConfComplete.length > 0) {
                   setVulns(prev => {
                     const existingIds = new Set(prev.map(v => v.id));
-                    const newFindings = allFindings.filter((f: any) => !existingIds.has(f.id));
+                    const newFindings = highConfComplete.filter((f: any) => !existingIds.has(f.id));
                     if (newFindings.length === 0) return prev;
                     return [...newFindings, ...prev];
                   });
                 }
-                const total = allFindings.length;
-                const confirmed = allFindings.filter((f: any) => f.status === 'confirmed').length;
+                const total = highConfComplete.length;
+                const confirmed = highConfComplete.filter((f: any) => f.status === 'confirmed').length;
                 addActivity('scan', `Analysis complete: ${total} findings (${confirmed} confirmed)`, 'success', 'Full analysis done', 100);
                 clearInterval(heartbeatWatchdog);
                 resolved = true;
