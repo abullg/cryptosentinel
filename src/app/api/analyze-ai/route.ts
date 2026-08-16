@@ -8,8 +8,14 @@ import { NextRequest, NextResponse } from 'next/server';
 // ═══════════════════════════════════════════════════════════════════
 
 // maxDuration must be a static export (Next.js requirement).
-// Vercel Hobby plan caps at 60s — set maxDuration=60 to match.
-export const maxDuration = 60; // Vercel Hobby plan limit
+// On Render self-hosted Next.js, this is informational only — Render's
+// own proxy enforces the actual request timeout (~100s on free tier,
+// 300s on paid). The sync /api/analyze-ai path is a SECONDARY fallback;
+// the PRIMARY analysis path is SSE streaming via /api/analyze-stream,
+// which bypasses Render's request timeout via heartbeats.
+// Set maxDuration=300 so Vercel deployments (if ever used) also allow
+// the full AI analysis window.
+export const maxDuration = 300;
 export const dynamic = 'force-dynamic';
 
 import { db } from '@/lib/db';

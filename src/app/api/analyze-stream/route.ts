@@ -92,9 +92,17 @@ export async function POST(req: NextRequest) {
         } catch { /* stream closed */ }
       };
 
+      // Send "connected" event IMMEDIATELY — this proves the stream is alive
+      // and bypasses Render's request-start timeout (which would otherwise
+      // kill the connection before any data is flushed).
+      send('progress', { step: 'connected', message: 'Stream connected — starting analysis...', percent: 1 });
+
+      // Heartbeat every 5s — aggressive enough to bypass Render's 100s
+      // request timeout. (8s was too close to Render's proxy idle window
+      // during long GLM calls.)
       heartbeatId = setInterval(() => {
         send('heartbeat', { ts: Date.now() });
-      }, 8_000); // Heartbeat every 8s
+      }, 5_000);
 
       try {
         // ═══════════════════════════════════════════════════════════

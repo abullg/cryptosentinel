@@ -562,59 +562,58 @@ export default function CryptoSentinelDashboard() {
 
   /** UNIFIED SSE STREAMING ANALYSIS — THE DEFINITIVE FIX
    *  Uses /api/analyze-stream for BOTH phases in ONE connection.
-   *  - Heartbeats every 8s keep Vercel from killing the function
+   *  - Heartbeats every 5s keep Render's proxy from killing the connection
+   *    during long GLM calls (which can take 60-180s).
    *  - Static results appear immediately (phase1_complete event)
    *  - AI results stream in as they're found (finding events)
    *  - No cold-start gap between phases — same serverless instance
-   *  - Robust retry logic: 2 attempts with quick backoff
-   *  - Graceful fallback to SSE streaming if sync fails */
+   *  - Robust retry logic: 3 attempts with progressive backoff
+   *  - Sync /api/analyze-ai is now the SECONDARY fallback (it times out
+   *    at Render's 100s request limit, so it only works for fast analyses). */
   const runTwoPhaseAnalysis = async (projectId: string, code: string, contractNm: string, tUrl?: string, tType?: string, hpContext?: any) => {
 
     // ═══════════════════════════════════════════════════════════════
-    // SYNCHRONOUS APPROACH — primary path (most reliable)
+    // SSE STREAMING — PRIMARY path (most reliable on Render free tier)
     // ═══════════════════════════════════════════════════════════════
-    // SSE streaming through Vercel serverless is unreliable for long-running
-    // operations (60-180s GLM calls). The connection drops, heartbeat
-    // timeouts fire, and the user sees "Network error (likely cold start)"
-    // even when the server is working fine.
-    //
-    // The synchronous /api/analyze-ai endpoint with phase='full' does
-    // static + AI + EVM validation in ONE request and returns JSON when
-    // complete. No streaming = no heartbeat issues = no retry loops.
-    // Retry with longer delays to accommodate Render cold start (30-60s wake-up)
-    const SYNC_RETRIES = 3;
-    const SYNC_RETRY_DELAYS = [10_000, 20_000, 30_000]; // 10s, 20s, 30s
+    // Render's free tier caps HTTP requests at ~100s. The synchronous
+    // /api/analyze-ai endpoint can't fit a 30-180s GLM call inside that
+    // window. SSE streaming bypasses the limit because data flows
+    // continuously (heartbeats every 5s) — Render's proxy sees an active
+    // connection and doesn't kill it.
+    const SSE_RETRIES = 3;
+    const SSE_RETRY_DELAYS = [5_000, 15_000, 30_000]; // 5s, 15s, 30s
 
-    for (let attempt = 0; attempt < SYNC_RETRIES; attempt++) {
+    for (let attempt = 0; attempt < SSE_RETRIES; attempt++) {
       throwIfAborted();
       try {
-        addActivity('scan', attempt === 0 ? 'Starting deep analysis...' : `Retrying analysis (attempt ${attempt + 1})...`, 'running', 'Connecting', 5);
+        addActivity('scan', attempt === 0 ? 'Starting deep analysis...' : `Retrying analysis (attempt ${attempt + 1}/${SSE_RETRIES})...`, 'running', 'Connecting', 5);
 
-        const result = await runSyncAnalysis(projectId, code, contractNm, tUrl, tType, hpContext);
+        const result = await runSSEStream(projectId, code, contractNm, tUrl, tType, hpContext);
         return result; // Success!
 
       } catch (err: any) {
         const errMsg = String(err);
         if (errMsg.includes('AbortError') && analysisAbortRef.current?.signal.aborted) throw err;
 
-        const isNetworkError = errMsg.includes('Failed to fetch') || errMsg.includes('network error') || errMsg.includes('NetworkError') || errMsg.includes('fetch failed') || errMsg.includes('Load failed');
+        const isNetworkError = errMsg.includes('Failed to fetch') || errMsg.includes('network error') || errMsg.includes('NetworkError') || errMsg.includes('fetch failed') || errMsg.includes('Load failed') || errMsg.includes('SSE heartbeat timeout');
 
-        if (isNetworkError && attempt < SYNC_RETRIES - 1) {
-          addActivity('scan', `Connection failed (attempt ${attempt + 1}/${SYNC_RETRIES}), retrying in ${SYNC_RETRY_DELAYS[attempt] / 1000}s...`, 'warning', 'Cold start?', 10);
-          await new Promise(r => setTimeout(r, SYNC_RETRY_DELAYS[attempt]));
+        if (isNetworkError && attempt < SSE_RETRIES - 1) {
+          addActivity('scan', `Connection failed (attempt ${attempt + 1}/${SSE_RETRIES}), retrying in ${SSE_RETRY_DELAYS[attempt] / 1000}s...`, 'warning', 'Cold start?', 10);
+          await new Promise(r => setTimeout(r, SSE_RETRY_DELAYS[attempt]));
           continue;
         }
 
-        // Non-network error or exhausted retries — try SSE as last resort
+        // Non-network error or exhausted retries — try sync as last resort
         if (!isNetworkError) throw err;
       }
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // FALLBACK: SSE streaming approach (last resort)
+    // FALLBACK: Synchronous approach (last resort — only works for
+    // fast analyses that complete within Render's ~100s request limit)
     // ═══════════════════════════════════════════════════════════════
-    addActivity('scan', 'Sync analysis failed, trying SSE streaming...', 'warning', 'Last resort', 15);
-    return await runSSEStream(projectId, code, contractNm, tUrl, tType, hpContext);
+    addActivity('scan', 'SSE streaming failed, trying sync analysis...', 'warning', 'Last resort', 15);
+    return await runSyncAnalysis(projectId, code, contractNm, tUrl, tType, hpContext);
   };
 
   /** Synchronous analysis — calls /api/analyze-ai with phase='full' */
@@ -704,17 +703,15 @@ export default function CryptoSentinelDashboard() {
 
           const decoder = new TextDecoder();
           let buffer = '';
-          // Heartbeat timeout increased from 45s to 200s to accommodate GLM 5.2
-          // deep reasoning with max_tokens=32768. The AI call can take 60-180s,
-          // during which Vercel serverless may not flush SSE heartbeats. If the
-          // client kills the connection at 45s, the user sees a 35-minute retry
-          // loop (5 retries × ~7 min each). With 200s timeout, the client
-          // waits long enough for the AI call to complete.
-          const HEARTBEAT_TIMEOUT_MS = 200_000; // 3.3 min — accommodates 180s AI call
+          // Heartbeat timeout — server now sends heartbeats every 5s (down
+          // from 8s). If no event arrives within 60s, the connection is
+          // definitely dead and we should retry instead of waiting forever.
+          // Previous 200s timeout was too forgiving — a dead connection
+          // sat idle for 3+ minutes before the user got feedback.
+          const HEARTBEAT_TIMEOUT_MS = 60_000; // 60s — server sends heartbeats every 5s
           let lastEventTime = Date.now();
 
-          // Heartbeat watchdog — detect dead connections.
-          // Check every 30s (not 10s) to reduce overhead during long AI calls.
+          // Heartbeat watchdog — check every 10s for faster detection.
           const heartbeatWatchdog = setInterval(() => {
             if (Date.now() - lastEventTime > HEARTBEAT_TIMEOUT_MS) {
               clearInterval(heartbeatWatchdog);
@@ -723,7 +720,7 @@ export default function CryptoSentinelDashboard() {
                 reject(new Error('SSE heartbeat timeout — connection died'));
               }
             }
-          }, 30_000);
+          }, 10_000);
 
           const processBuffer = () => {
             // SSE format: "event: type\ndata: json\n\n"
@@ -760,7 +757,10 @@ export default function CryptoSentinelDashboard() {
                 break;
 
               case 'progress':
-                if (data.step === 'static') {
+                if (data.step === 'connected') {
+                  // Stream established — server is alive and starting work.
+                  addActivity('scan', data.message || 'Stream connected', 'running', 'Connected', data.percent || 1);
+                } else if (data.step === 'static') {
                   addActivity('scan', data.message || 'Running static analysis...', 'running', 'Phase 1', data.percent || 5);
                 } else if (data.step === 'ai_start' || data.step === 'ai_analysis') {
                   if (!phase1Shown) phase1Shown = true;

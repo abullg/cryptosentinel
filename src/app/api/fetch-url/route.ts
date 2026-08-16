@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-export const maxDuration = 60; // Vercel Hobby plan limit (60s)
+export const maxDuration = 120; // Render free tier allows ~100s; keep margin for slow sites
 // analyzeWebApp removed — lightweight fetchWebsite + multi-pass AI in /api/analyze is faster
 import { checkStandardRateLimit } from '@/lib/rate-limit';
 
