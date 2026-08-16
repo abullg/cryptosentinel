@@ -740,7 +740,7 @@ async function fetchWebsite(parsedUrl: URL, isContractFallback = false) {
   // ── PHASE 5.5: Deep Sitemap Crawl — fetch key pages in parallel for richer AI context ──
   const sitemapUrls = extractSitemapUrls(sections.join('\n'), origin);
   if (sitemapUrls.length > 0) {
-    const deepCrawlLimit = 12; // Crawl up to 12 sitemap pages in parallel — scan every corner
+    const deepCrawlLimit = 3; // Crawl 3 sitemap pages — fast, doesn't timeout on mobile
     const urlsToCrawl = sitemapUrls.slice(0, deepCrawlLimit);
     console.log(`[fetchWebsite] Deep crawl: ${urlsToCrawl.length} sitemap pages in parallel`);
     const deepResults = await Promise.allSettled(

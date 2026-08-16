@@ -1178,7 +1178,7 @@ const analyzeContract = async () => {
           fetchRes = await fetchWithTimeout('/api/fetch-url', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ url: targetUrl, type: apiType }),
-          }, 180_000); // 3 min — allows deep crawl of 10 sitemap pages
+          }, 60_000); // 60s — mobile-friendly, deep crawl now only 3 pages
           break; // Success — exit retry loop
         } catch (fetchErr: any) {
           lastError = String(fetchErr);
