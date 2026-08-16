@@ -592,11 +592,19 @@ export default function CryptoSentinelDashboard() {
   const fetchWithTimeout = (url: string, options: RequestInit = {}, timeoutMs: number = 45_000): Promise<Response> => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
-    // Link to analysis abort: if analysis is aborted, this fetch aborts too
+    // Link to analysis abort: if analysis is aborted, this fetch aborts too.
+    // BUT only abort if the analysis signal is ACTUALLY aborted (not just
+    // because the ref changed). This prevents false-positive aborts when
+    // a previous analysis's ref is cleared during cleanup.
     const analysisSignal = analysisAbortRef.current?.signal;
     if (analysisSignal) {
-      if (analysisSignal.aborted) { controller.abort(); }
-      else { analysisSignal.addEventListener('abort', () => controller.abort(), { once: true }); }
+      if (analysisSignal.aborted) {
+        // Analysis already aborted — abort this fetch immediately
+        controller.abort();
+      } else {
+        // Only abort if the SAME signal fires (not a new one)
+        analysisSignal.addEventListener('abort', () => controller.abort(), { once: true });
+      }
     }
     return fetch(url, { ...options, signal: controller.signal }).finally(() => clearTimeout(timer));
   };
@@ -1156,11 +1164,13 @@ const analyzeContract = async () => {
       // Determine actual type for API (hackenproof is auto-detected by URL)
       const apiType = targetType === 'hackenproof' ? 'contract' : targetType;
       // Fetch content from URL — with automatic retry on transient network failures
+      // fetch-url does a deep crawl (10 sitemap pages in parallel) which can
+      // take 30-90s on sites with WAF. Use 180s timeout to accommodate.
       addActivity('system', 'Fetching URL content...', 'running', targetUrl, 10);
       let fetchRes: Response | null = null;
       let lastError: string = '';
-      const MAX_RETRIES = 3;
-      const RETRY_DELAYS = [2_000, 5_000, 10_000]; // Progressive backoff for cold starts
+      const MAX_RETRIES = 2;
+      const RETRY_DELAYS = [3_000, 5_000]; // Short backoff
 
       for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
         throwIfAborted();
@@ -1168,15 +1178,21 @@ const analyzeContract = async () => {
           fetchRes = await fetchWithTimeout('/api/fetch-url', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ url: targetUrl, type: apiType }),
-          }, 60_000); // 60s timeout per attempt
+          }, 180_000); // 3 min — allows deep crawl of 10 sitemap pages
           break; // Success — exit retry loop
         } catch (fetchErr: any) {
           lastError = String(fetchErr);
-          // If analysis was aborted, re-throw
+          // If analysis was aborted by user/global timeout, re-throw
           if (lastError.includes('AbortError') && analysisAbortRef.current?.signal.aborted) throw fetchErr;
-          const isRetryable = lastError.includes('AbortError') || lastError.includes('Failed to fetch') || lastError.includes('NetworkError') || lastError.includes('network error');
+          // Don't retry on AbortError from timeout — it means the fetch took too long
+          if (lastError.includes('AbortError') && !analysisAbortRef.current?.signal.aborted) {
+            // This is a fetchWithTimeout abort (180s), not a global abort
+            addActivity('system', `URL fetch timed out after 180s — site may be slow or blocking`, 'warning', 'Try with a different URL', 15);
+            throw fetchErr;
+          }
+          const isRetryable = lastError.includes('Failed to fetch') || lastError.includes('NetworkError') || lastError.includes('network error');
           if (!isRetryable || attempt === MAX_RETRIES - 1) throw fetchErr;
-          addActivity('system', `Fetch attempt ${attempt + 1} failed (network error?), retrying in ${RETRY_DELAYS[attempt] / 1000}s...`, 'warning', lastError.slice(0, 60), 15);
+          addActivity('system', `Fetch attempt ${attempt + 1} failed, retrying in ${RETRY_DELAYS[attempt] / 1000}s...`, 'warning', lastError.slice(0, 60), 15);
           await new Promise(r => setTimeout(r, RETRY_DELAYS[attempt]));
         }
       }
