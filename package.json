@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "next dev -p 3000",
     "build": "next build",
-    "start": "mkdir -p /data && npx prisma db push --accept-data-loss && npx next start -p ${PORT:-10000}",
+    "start": "mkdir -p /data && npx prisma db push --accept-data-loss && PORT=${PORT:-10000} HOSTNAME=0.0.0.0 node .next/standalone/server.js",
     "lint": "eslint .",
     "db:push": "prisma db push --accept-data-loss",
     "db:generate": "prisma generate",

@@ -21,4 +21,12 @@ EXPOSE 10000
 
 # Install Foundry at runtime (forge) for real exploit testing
 # + run prisma db push + start Next.js
-CMD ["sh", "-c", "curl -L https://foundry.paradigm.xyz | bash && $HOME/.foundry/bin/foundryup && cp $HOME/.foundry/bin/forge /usr/local/bin/forge && npx prisma db push --accept-data-loss && npx next start -p ${PORT:-10000} -H 0.0.0.0"]
+#
+# IMPORTANT: use `node .next/standalone/server.js`, NOT `next start`.
+# next.config.ts has output: 'standalone', and Next.js 16 warns:
+#   "next start" does not work with "output: standalone" configuration.
+#   Use "node .next/standalone/server.js" instead.
+# Running `next start` with standalone causes silent crashes on
+# long-running requests (AI analysis times out after 100s, PM2 restarts
+# the process, user sees 'stuck loading for 20 minutes').
+CMD ["sh", "-c", "curl -L https://foundry.paradigm.xyz | bash && $HOME/.foundry/bin/foundryup && cp $HOME/.foundry/bin/forge /usr/local/bin/forge && npx prisma db push --accept-data-loss && PORT=${PORT:-10000} HOSTNAME=0.0.0.0 node .next/standalone/server.js"]
