@@ -1,5 +1,5 @@
 import { NextRequest } from 'next/server';
-export const maxDuration = 300;
+export const maxDuration = 900; // 15 min — VPS KVM 2, no Render/Vercel limits
 export const dynamic = 'force-dynamic';
 
 import { db } from '@/lib/db';

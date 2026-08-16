@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-export const maxDuration = 120; // Render free tier allows ~100s; keep margin for slow sites
+export const maxDuration = 600; // VPS KVM 2 — no Render/Vercel limits; allow 10min for slow sites with WAF
 // analyzeWebApp removed — lightweight fetchWebsite + multi-pass AI in /api/analyze is faster
 import { checkStandardRateLimit } from '@/lib/rate-limit';
 

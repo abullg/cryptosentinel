@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-export const maxDuration = 300;
+export const maxDuration = 900; // 15 min — VPS KVM 2, no Render/Vercel limits
 import { db } from '@/lib/db';
 import { analyzeWithGLM, analyzeWebWithGLM, enhanceVulnerabilityDescription, verifyVulnerabilityOnChain, DEFAULT_MODEL, DEEPSEEK_MODEL } from '@/lib/glm';
 import { runBlockchainVerification } from '@/lib/blockchain-verifier';

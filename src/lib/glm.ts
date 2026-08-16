@@ -129,15 +129,15 @@ export async function callGLM(
     throw new Error('API key is required for GLM analysis');
   }
 
-  // Default 90s — GLM 5.2 normally completes in 30-60s. If it hangs past
-  // 90s, the model is likely stuck reasoning in circles (a known failure
-  // mode for unlimited-token reasoning models). Aborting at 90s prevents
-  // the "hour-long loading" bug where the user sees the spinner forever
-  // and only gets a single low-quality finding when the call finally
-  // completes at 600s.
-  // Override per-call via config.timeoutMs for cases that genuinely need
-  // longer (e.g. on-chain verification with multi-step reasoning).
-  const callTimeout = config.timeoutMs || 90_000;
+  // VPS KVM 2 (Hostinger, 8GB RAM) — no serverless timeout limits.
+  // Allow GLM 5.2 to reason for the full 5 minutes when needed. This is
+  // essential for:
+  //   - Multi-pass vulnerability analysis on large codebases
+  //   - Deep reasoning chains that build PoCs for complex DeFi protocols
+  //   - On-chain verification with multiple RPC round-trips
+  // Previous 90s timeout was cutting off deep analysis — the model was
+  // forced to return a shallow result before completing its reasoning.
+  const callTimeout = config.timeoutMs || 300_000; // 5 min
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), callTimeout);
   let response: Response;

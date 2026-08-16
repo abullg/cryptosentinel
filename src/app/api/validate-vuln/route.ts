@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { activelyValidate } from '@/lib/active-validator';
 
-export const maxDuration = 300;
+export const maxDuration = 600; // 10 min — VPS KVM 2, allows full Foundry + cast on-chain validation
 export const dynamic = 'force-dynamic';
 
 /** POST /api/validate-vuln — Run active validation for a SINGLE vulnerability

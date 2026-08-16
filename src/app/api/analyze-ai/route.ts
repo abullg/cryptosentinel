@@ -8,14 +8,12 @@ import { NextRequest, NextResponse } from 'next/server';
 // ═══════════════════════════════════════════════════════════════════
 
 // maxDuration must be a static export (Next.js requirement).
-// On Render self-hosted Next.js, this is informational only — Render's
-// own proxy enforces the actual request timeout (~100s on free tier,
-// 300s on paid). The sync /api/analyze-ai path is a SECONDARY fallback;
-// the PRIMARY analysis path is SSE streaming via /api/analyze-stream,
-// which bypasses Render's request timeout via heartbeats.
-// Set maxDuration=300 so Vercel deployments (if ever used) also allow
-// the full AI analysis window.
-export const maxDuration = 300;
+// VPS KVM 2 (Hostinger, 8GB RAM) — no serverless timeout limits. Allow
+// the full 15-minute window for deep AI analysis + active validation
+// (Foundry + on-chain cast calls). Previously capped at 300s for Render
+// free tier, which was cutting off the final EVM validation phase on
+// large smart contract audits.
+export const maxDuration = 900; // 15 min
 export const dynamic = 'force-dynamic';
 
 import { db } from '@/lib/db';
@@ -528,7 +526,7 @@ export async function POST(req: NextRequest) {
                     { title: v.title, type: v.type, severity: v.severity, description: v.description, location: v.location },
                     apiKey, model
                   ),
-                  120_000,
+                  300_000,
                   'Active validation (target+lab)'
                 );
                 if (verification.confirmed) {
@@ -956,7 +954,7 @@ async function runAIOnlyPhase(
                   contractName || 'Contract',
                   { title: v.title, type: v.type, severity: v.severity, description: v.description, location: v.location },
                 ),
-                120_000, 'Active validation (target+lab)'  
+                300_000, 'Active validation (target+lab)'  
               );
               if (verification.confirmed) {
                 const scope = verification.validationScope || 'lab';

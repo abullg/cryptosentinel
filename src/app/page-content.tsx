@@ -193,7 +193,7 @@ export default function CryptoSentinelDashboard() {
   // cancelled when a hard timeout fires. This is THE fix for infinite loading.
   const isAnalyzingRef = useRef(false);       // true = analysis in progress (lock)
   const analysisAbortRef = useRef<AbortController | null>(null); // abort all fetches on timeout
-  const HARD_TIMEOUT_MS = 330_000;            // 330s — static (<10s) + AI (maxDuration:300s) + margin
+  const HARD_TIMEOUT_MS = 900_000;            // 15 min — VPS KVM 2, no serverless limits
 
   // ─── SAFETY WATCHDOG ──────────────────────────────────────────────────────
   // Nuclear option: if `analyzing` stays true for 3.5 minutes, FORCIBLY reset it.
@@ -736,20 +736,20 @@ export default function CryptoSentinelDashboard() {
           const decoder = new TextDecoder();
           let buffer = '';
           // Heartbeat timeout — server sends heartbeats every 5s. AI calls
-          // (GLM 5.2 deep analysis) can take 30-90s. During a long AI call,
-          // Node.js event loop may be busy with the OpenRouter HTTP request
-          // and heartbeats can be delayed beyond 5s. Set timeout to 180s to
-          // accommodate:
+          // (GLM 5.2 deep analysis) can take up to 5 minutes on a real VPS
+          // (no serverless limits). During the AI call, Node.js event loop
+          // is busy with the OpenRouter HTTP request and heartbeats can be
+          // delayed. Set timeout to 10 min to accommodate:
           //   - Normal AI call: 30-60s (heartbeats arrive, watchdog resets)
-          //   - Slow AI call: 60-90s (some heartbeats arrive, watchdog still resets)
-          //   - Dead connection: no heartbeats for 180s → real timeout, retry
-          // Previous 60s timeout caused false-positive "Connection failed"
-          // retries on every analysis with a slow AI call — the user saw
-          // 3 retries × 60s = 3+ minutes of "Cold start?" messages.
-          const HEARTBEAT_TIMEOUT_MS = 180_000; // 3 min — generous for AI calls
+          //   - Slow AI call: 60-180s (some heartbeats arrive, still resets)
+          //   - Deep reasoning on large codebase: 180-300s (still resets)
+          //   - Real dead connection: no heartbeats for 10 min → timeout
+          // Previous 180s was still too aggressive for deep reasoning on
+          // large smart contract audits with multi-pass AI analysis.
+          const HEARTBEAT_TIMEOUT_MS = 600_000; // 10 min
           let lastEventTime = Date.now();
 
-          // Heartbeat watchdog — check every 15s.
+          // Heartbeat watchdog — check every 30s.
           const heartbeatWatchdog = setInterval(() => {
             if (Date.now() - lastEventTime > HEARTBEAT_TIMEOUT_MS) {
               clearInterval(heartbeatWatchdog);
@@ -758,7 +758,7 @@ export default function CryptoSentinelDashboard() {
                 reject(new Error('SSE heartbeat timeout — connection died'));
               }
             }
-          }, 15_000);
+          }, 30_000);
 
           const processBuffer = () => {
             // SSE format: "event: type\ndata: json\n\n"
