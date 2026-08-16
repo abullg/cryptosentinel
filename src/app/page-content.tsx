@@ -196,22 +196,20 @@ export default function CryptoSentinelDashboard() {
   // cancelled when a hard timeout fires. This is THE fix for infinite loading.
   const isAnalyzingRef = useRef(false);       // true = analysis in progress (lock)
   const analysisAbortRef = useRef<AbortController | null>(null); // abort all fetches on timeout
-  const HARD_TIMEOUT_MS = 300_000;            // 5 min — hard cap, no analysis should take longer
+  const HARD_TIMEOUT_MS = 180_000;            // 3 min — hard cap, analysis must complete within this
 
   // ─── SAFETY WATCHDOG ──────────────────────────────────────────────────────
-  // Nuclear option: if `analyzing` stays true for 12 minutes, FORCIBLY reset it.
+  // Nuclear option: if `analyzing` stays true for too long, FORCIBLY reset it.
   // This is the LAST line of defense against infinite loading.
-  // AI analysis can legitimately take up to 5 min (GLM deep reasoning),
-  // plus active validation (Foundry + cast) can add another 3-5 min.
-  // 12 min gives ample headroom; if it still triggers, something is
-  // genuinely stuck and the user should retry.
+  // AI analysis: 2 min, Active validation: 30s, Total: ~2.5 min
+  // 3 min hard cap ensures the user NEVER waits more than 3 min.
   const watchdogSinceRef = useRef<number>(0);
   useEffect(() => {
-    const WATCHDOG_INTERVAL = 10_000;  // Check every 10s
-    const WATCHDOG_MAX = 240_000;      // 4 min — must be LESS than HARD_TIMEOUT (5 min)
+    const WATCHDOG_INTERVAL = 5_000;   // Check every 5s
+    const WATCHDOG_MAX = 180_000;     // 3 min — matches HARD_TIMEOUT
 
     const watchdog = setInterval(() => {
-      if (analyzing) {
+      if (analyzing || fetchingUrl) {
         if (watchdogSinceRef.current === 0) watchdogSinceRef.current = Date.now();
         const elapsed = Date.now() - watchdogSinceRef.current;
         if (elapsed > WATCHDOG_MAX) {
@@ -222,7 +220,7 @@ export default function CryptoSentinelDashboard() {
           analysisAbortRef.current = null;
           setAnalyzing(false);
           setFetchingUrl(false);
-          setFetchError(`Analysis timed out after ${mins} minutes. The server may be overloaded — please try again.`);
+          setFetchError(`Analysis timed out after ${mins} min. The server may be overloaded — please try again.`);
           addActivity('scan', `Analysis timed out after ${mins} min — force reset`, 'error', 'Server may be overloaded; please retry', 0);
           watchdogSinceRef.current = 0;
         }
@@ -761,7 +759,7 @@ export default function CryptoSentinelDashboard() {
           //   - Real dead connection: no heartbeats for 10 min → timeout
           // Previous 180s was still too aggressive for deep reasoning on
           // large smart contract audits with multi-pass AI analysis.
-          const HEARTBEAT_TIMEOUT_MS = 600_000; // 10 min
+          const HEARTBEAT_TIMEOUT_MS = 180_000; // 3 min — matches HARD_TIMEOUT
           let lastEventTime = Date.now();
 
           // Heartbeat watchdog — check every 30s.
@@ -773,7 +771,7 @@ export default function CryptoSentinelDashboard() {
                 reject(new Error('SSE heartbeat timeout — connection died'));
               }
             }
-          }, 30_000);
+          }, 15_000);
 
           const processBuffer = () => {
             // SSE format: "event: type\ndata: json\n\n"
