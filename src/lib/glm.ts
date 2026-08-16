@@ -129,9 +129,15 @@ export async function callGLM(
     throw new Error('API key is required for GLM analysis');
   }
 
-  // Default 180s — Render has 15-minute timeout, so we can afford
-  // generous budgets for deep reasoning with max_tokens=32768.
-  const callTimeout = config.timeoutMs || 180_000;
+  // Default 90s — GLM 5.2 normally completes in 30-60s. If it hangs past
+  // 90s, the model is likely stuck reasoning in circles (a known failure
+  // mode for unlimited-token reasoning models). Aborting at 90s prevents
+  // the "hour-long loading" bug where the user sees the spinner forever
+  // and only gets a single low-quality finding when the call finally
+  // completes at 600s.
+  // Override per-call via config.timeoutMs for cases that genuinely need
+  // longer (e.g. on-chain verification with multi-step reasoning).
+  const callTimeout = config.timeoutMs || 90_000;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), callTimeout);
   let response: Response;
@@ -326,17 +332,65 @@ If you have NO basis to estimate a validator, set it to 0.5 (neutral). Do NOT se
 10. **BlockchainVerified**: true/false — whether on-chain evidence confirms this vulnerability
 11. **OnChainEvidence**: String describing any on-chain evidence (transaction hashes, addresses, patterns)
 
-CRITICAL STYLE RULES:
-- For vulnerabilities you DO report, write with CONFIDENCE. Avoid weak hedging language like "may", "might", "could", "potentially", "possibly", "appears to", "seems to".
-- Use definitive language: "IS", "HAS", "CAUSES", "LEADS TO", "ALLOWS", "ENABLES", "CREATES", "TRIGGERS", "EXPOSES".
-- Every vulnerability description MUST state the vulnerability as a CONFIRMED FACT, with the dataflow path explicit: "User input (source: X) flows through variable Y to sink Z without sanitization."
-- When blockchain evidence is available, state it explicitly: "On-chain verification CONFIRMS: [evidence]"
+CRITICAL EVIDENCE RULES (READ CAREFULLY — VIOLATING THESE INVALIDATES THE REPORT):
 
-IMPORTANT — REPORTING DISCIPLINE (do NOT contradict the OUT OF SCOPE rule above):
-- If you are NOT certain a vulnerability exists OR cannot construct a concrete exploit, DO NOT report it.
-- This is consistent with the OUT OF SCOPE rule: theoretical without practical exploit = omit.
-- It is BETTER to report 2 confirmed findings than 10 speculative ones.
-- When you DO report, write with confidence. When you're NOT confident, omit — do NOT hedge.
+You MUST distinguish three strictly different evidence tiers. Mixing them is the #1 quality failure mode.
+
+**TIER 1 — Confirmed configuration weakness / code smell (OBSERVATION only):**
+  Something is technically missing or non-ideal in the code, observable via static review, but you have NOT constructed a concrete exploit.
+  Examples: missing zero-check on a parameter, use of tx.origin, use of block.timestamp for randomness, missing event emission on a state change, missing timelock on admin functions.
+  These are NOT vulnerabilities by themselves. They are weaknesses that COULD become exploitable under specific conditions you have not yet demonstrated.
+  → Severity: LOW at most, unless paired with a Tier 2 finding.
+  → Title format: "Missing zero-check on <param>" / "Use of tx.origin in <function>" — NOT "Use of tx.origin enables auth bypass".
+  → Description format: "Observation: line N of <file> uses tx.origin for authorization. No concrete auth-bypass chain demonstrated — this is a defense-in-depth weakness."
+  → Do NOT speculate about exploit chains in the description. Save that for the validationSteps field.
+
+**TIER 2 — Confirmed vulnerability (PROVEN exploit chain):**
+  You have demonstrated a complete chain: a SOURCE where attacker-controlled data enters (msg.sender, function param, external call, oracle data), a DATAFLOW that propagates it without sufficient sanitization, and a SINK where it causes harm (external call, state write, transfer). All three must be concrete, not hypothetical.
+  Examples: reentrancy with a proven external call before state update, access control bypass with a proven attacker address calling a privileged function, integer overflow with concrete parameter values that trigger it.
+  → Severity: matches the actual financial impact of the proven chain (MEDIUM/HIGH/CRITICAL per HackenProof tiers above).
+  → Title format: "Reentrancy in <function> via <external call>" / "Access control bypass on <function>".
+  → Description format: "SOURCE: <concrete input>. DATAFLOW: <trace through code, line by line>. SINK: <concrete dangerous operation>. SANITIZER: <none found, or name and why insufficient>. EXPLOIT: <concrete attack scenario with function calls, params, state transitions>. IMPACT: <quantified financial/systemic impact>."
+
+**TIER 3 — Confirmed high-impact chain (PROVEN vuln + amplifying factor):**
+  A Tier 2 vulnerability combined with a Tier 1 weakness or external condition that materially amplifies its impact.
+  Example: proven reentrancy (Tier 2) + missing nonReentrant modifier elsewhere in flow (Tier 1) + flash-loan available to amplify capital (external condition) → critical fund-drain chain.
+  → Severity: HIGH or CRITICAL — but ONLY when both halves are proven.
+  → You MUST cite the Tier 2 finding by title and the Tier 1 finding by title.
+
+**FORBIDDEN LOGICAL LEAPS (these will cause your output to be rejected):**
+
+1. You may NOT turn a Tier 1 observation into a Tier 2 vulnerability.
+   - BAD: "Use of tx.origin → auth bypass possible → fund theft" (conflates tiers).
+   - GOOD: "Use of tx.origin in transfer() (Tier 1, LOW)" as a separate finding. If you also have a proven auth-bypass chain, add a SEPARATE Tier 3 finding that cites both.
+
+2. You may NOT use the words "possible", "could", "may", "might", "if attacked", "potentially" inside a Tier 2 or Tier 3 description.
+   - If you find yourself writing "an attacker could call...", you have NOT proven the chain. Downgrade to Tier 1 or omit the finding entirely (per the OUT OF SCOPE rule below).
+
+3. You may NOT claim a dataflow exists just because a pattern is "common" or "typical" in DeFi contracts.
+   - BAD: "Flash loans commonly manipulate AMM price oracles → price manipulation possible"
+   - GOOD: "Line N of getReserves() reads spot price from Uniswap V2 pair. Line N+10 of borrow() uses this price without TWAP. Attacker can flash-borrow 90% of pool, manipulate spot price by 35%, borrow 42% over collateralization, repay with profit. Concrete exploit attached."
+
+4. You may NOT claim "ACTIVE VALIDATION PASSED" or "On-chain evidence CONFIRMS" unless blockchain data actually validates the SPECIFIC claim.
+   - "Contract deployed at 0x... CONFIRMED" does NOT confirm a reentrancy exists.
+   - Match the evidence to the claim precisely.
+
+5. Severity MUST match the evidence tier:
+   - Tier 1 alone → LOW
+   - Tier 2 proven but limited impact (e.g. griefing without profit) → MEDIUM
+   - Tier 2 proven with fund-theft impact → HIGH or CRITICAL
+   - Tier 3 (Tier 2 + amplifying Tier 1 + economic viability) → CRITICAL
+
+**STYLE:**
+- Use precise, technical language. State exactly what you observed and exactly what you did NOT observe.
+- Hedging is REQUIRED when the evidence is incomplete. "Likely", "probable", "appears to" are correct language when you have not proven the chain.
+- Do NOT use marketing words ("devastating", "severe" as adjectives — only use the severity enum value).
+
+IMPORTANT — REPORTING DISCIPLINE:
+- If you are NOT certain a vulnerability exists OR cannot construct a concrete exploit, DO NOT report it as Tier 2 or Tier 3.
+- Either downgrade it to Tier 1 (with LOW severity) or omit it entirely (per the OUT OF SCOPE rule above).
+- It is BETTER to report 2 confirmed Tier 2 findings than 10 speculative ones.
+- A small number of high-confidence findings is FAR more valuable than a large number of speculative ones.
 
 DEEP REASONING INSTRUCTION:
 - You have UNLIMITED reasoning capacity. Think as deeply and thoroughly as needed.
@@ -571,7 +625,12 @@ export async function enhanceVulnerabilityDescription(
       role: 'system',
       content: `You are a senior smart contract auditor. Provide a detailed, well-argued vulnerability analysis in HakenProof format. Be precise, technical, and include specific code references. Write in clear, professional English.
 
-CRITICAL STYLE: Write with ABSOLUTE CERTAINTY. NEVER use hedging words: "may", "might", "could", "potentially", "possibly", "appears to", "seems to", "likely", "probably". Use definitive language: "IS", "HAS", "CAUSES", "LEADS TO", "ALLOWS", "EXPOSES", "CREATES". Every finding must read as a CONFIRMED FACT, not a hypothesis.`,
+CRITICAL EVIDENCE RULES:
+- Match language strength to actual evidence strength.
+- If the vulnerability was already proven (concrete source → dataflow → sink → exploit), use definitive language: "IS", "HAS", "CAUSES", "LEADS TO", "ALLOWS".
+- If the vulnerability is an OBSERVATION only (a missing check, a code smell, a configuration weakness), use observational language: "is missing", "does not include", "uses X pattern" — and DO NOT speculate about exploit chains in the description.
+- FORBIDDEN: turning a configuration observation into a confirmed exploit chain. "Missing CSP header" is an observation; it does NOT become "XSS execution possible → wallet hijack" unless you have separately proven an XSS dataflow.
+- Use "may", "could", "appears to" only when the evidence is genuinely incomplete — and if so, downgrade the finding rather than elevating its impact language.`,
     },
     {
       role: 'user',
@@ -652,13 +711,62 @@ For each vulnerability, provide:
 10. **BlockchainVerified**: true/false
 11. **OnChainEvidence**: String
 
-CRITICAL STYLE RULES:
-- Write with ABSOLUTE CERTAINTY. NEVER use hedging language.
-- Use definitive statements: "IS", "HAS", "CAUSES", "LEADS TO", "ALLOWS", "EXPOSES".
-- Every vulnerability description MUST be stated as a CONFIRMED FACT.
-- Include the taint flow path.
+CRITICAL EVIDENCE RULES (READ CAREFULLY — VIOLATING THESE INVALIDATES THE REPORT):
 
-Focus on real, exploitable vulnerabilities. Prioritize those leading to fund theft, data leaks, or trading manipulation.
+You MUST distinguish three strictly different evidence tiers. Mixing them is the #1 quality failure mode.
+
+**TIER 1 — Confirmed configuration weakness (OBSERVATION only):**
+  Something is technically missing or misconfigured, observable via direct HTTP request, header inspection, or static code review.
+  Examples: missing CSP header, missing HSTS, missing X-Frame-Options, missing rate limiting on a public endpoint, presence of inline scripts.
+  These are NOT vulnerabilities by themselves. They are weaknesses that COULD amplify the impact of an actual vulnerability.
+  → Severity: LOW at most, unless paired with a Tier 2 finding.
+  → Title format: "Missing X header" / "Y not configured" — NOT "Missing X enables Z".
+  → Description format: "HTTP response from <url> does not contain X header. Confirmed via direct request. This is a defense-in-depth weakness; it does not by itself constitute an exploit."
+  → Do NOT speculate about exploit chains in the description. Save that for the validationSteps field.
+
+**TIER 2 — Confirmed vulnerability (PROVEN exploit chain):**
+  You have demonstrated a complete chain: a SOURCE where attacker-controlled data enters, a DATAFLOW that propagates it without sanitization, and a SINK where it executes. All three must be concrete, not hypothetical.
+  Examples: reflected XSS with a proven ?param= to innerHTML dataflow, SQL injection with a proven ' OR 1=1 payload, IDOR with a proven userId=N parameter that returns another user's data.
+  → Severity: matches the actual impact of the proven chain (MEDIUM/HIGH/CRITICAL).
+  → Title format: "Reflected XSS via <param> in <function>" / "SQL injection in <query>".
+  → Description format: "SOURCE: <concrete input>. DATAFLOW: <trace through code>. SINK: <concrete dangerous operation>. SANITIZER: <none found, or name>. EXPLOIT: <working payload or URL>. IMPACT: <what attacker achieves>."
+
+**TIER 3 — Confirmed high-impact chain (PROVEN vuln + amplifying factor):**
+  A Tier 2 vulnerability combined with a Tier 1 weakness that materially amplifies its impact.
+  Example: proven reflected XSS (Tier 2) + missing CSP (Tier 1) + Web3 wallet integration detected on the page → high-impact chain (XSS can hijack wallet connections because no CSP blocks inline script execution).
+  → Severity: HIGH or CRITICAL — but ONLY when both halves are proven.
+  → You MUST cite the Tier 2 finding by title and the Tier 1 finding by title.
+
+**FORBIDDEN LOGICAL LEAPS (these will cause your output to be rejected):**
+
+1. You may NOT turn a Tier 1 observation into a Tier 2 vulnerability.
+   - BAD: "Missing CSP → XSS execution possible → wallet hijack" (this conflates tiers).
+   - GOOD: "Missing CSP header (Tier 1, LOW)" as a separate finding. If you also have a proven XSS, add a SEPARATE Tier 3 finding that cites both.
+
+2. You may NOT use the words "possible", "could", "may", "might", "if attacked", "potentially" inside a Tier 2 or Tier 3 description.
+   - If you find yourself writing "an attacker could inject...", you have NOT proven the chain. Downgrade to Tier 1 or remove the finding.
+
+3. You may NOT claim a dataflow exists just because an API pattern is common in the codebase.
+   - BAD: "innerHTML, document.write, eval patterns common in Nuxt/Vite bundles → untrusted input reaches these sinks"
+   - GOOD: "Line 47 of login.js: document.getElementById('username').innerHTML = req.query.name — proven dataflow from ?name= to innerHTML sink, no sanitization."
+
+4. You may NOT claim "ACTIVE VALIDATION PASSED" or "On-chain evidence CONFIRMS" unless you have actually validated the specific claim.
+   - "CSP MISSING CONFIRMED" validates only that CSP is missing — it does NOT validate that XSS is exploitable.
+   - Do not append "[ACTIVE VALIDATION PASSED]" to a Tier 1 finding to make it sound like Tier 2.
+
+5. Severity MUST match the evidence tier:
+   - Tier 1 alone → LOW
+   - Tier 2 proven but limited impact (e.g. reflected XSS on a non-sensitive page) → MEDIUM
+   - Tier 2 proven with sensitive impact (e.g. stored XSS, SQL injection) → HIGH
+   - Tier 3 (Tier 2 + amplifying Tier 1 + sensitive context like wallet integration) → HIGH or CRITICAL
+
+**STYLE:**
+- Use precise, technical language. Avoid marketing words ("devastating", "critical", "severe" as adjectives — only use them as the severity enum value).
+- State exactly what you observed and exactly what you did NOT observe.
+- If you cannot complete a Tier 2 chain, say so explicitly: "Source and sink identified, but no proven dataflow between them — downgrade to Tier 1 observation."
+- Hedging is REQUIRED when the evidence is incomplete. "Likely", "probable", "appears to" are correct language when you have not proven the chain.
+
+Focus on real, exploitable vulnerabilities. A small number of high-confidence findings is FAR more valuable than a large number of speculative ones. If you only find 1-2 truly confirmed vulnerabilities, that is a successful analysis.
 
 Respond in JSON format as an array:
 [
