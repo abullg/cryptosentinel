@@ -215,27 +215,31 @@ export default function CryptoSentinelDashboard() {
   const HARD_TIMEOUT_MS = 900_000;            // 15 min — VPS KVM 2, no serverless limits
 
   // ─── SAFETY WATCHDOG ──────────────────────────────────────────────────────
-  // Nuclear option: if `analyzing` stays true for 3.5 minutes, FORCIBLY reset it.
+  // Nuclear option: if `analyzing` stays true for 12 minutes, FORCIBLY reset it.
   // This is the LAST line of defense against infinite loading.
-  // With synchronous API calls (no polling), this should NEVER trigger.
+  // AI analysis can legitimately take up to 5 min (GLM deep reasoning),
+  // plus active validation (Foundry + cast) can add another 3-5 min.
+  // 12 min gives ample headroom; if it still triggers, something is
+  // genuinely stuck and the user should retry.
   const watchdogSinceRef = useRef<number>(0);
   useEffect(() => {
-    const WATCHDOG_INTERVAL = 5_000;  // Check every 5s
-    const WATCHDOG_MAX = 900_000;    // 15 min — matches Render timeout
+    const WATCHDOG_INTERVAL = 10_000;  // Check every 10s
+    const WATCHDOG_MAX = 720_000;      // 12 min — AI (5 min) + validation (5 min) + margin
 
     const watchdog = setInterval(() => {
       if (analyzing) {
         if (watchdogSinceRef.current === 0) watchdogSinceRef.current = Date.now();
         const elapsed = Date.now() - watchdogSinceRef.current;
         if (elapsed > WATCHDOG_MAX) {
-          console.error(`[WATCHDOG] analyzing stuck for ${Math.round(elapsed/1000)}s — FORCE RESET`);
+          const mins = Math.round(elapsed / 60_000);
+          console.error(`[WATCHDOG] analyzing stuck for ${mins} min — FORCE RESET`);
           isAnalyzingRef.current = false;
           if (analysisAbortRef.current) analysisAbortRef.current.abort();
           analysisAbortRef.current = null;
           setAnalyzing(false);
           setFetchingUrl(false);
-          setFetchError('Analysis timed out (watchdog). Please try again.');
-          addActivity('scan', 'WATCHDOG: Forced analysis reset after 2 min', 'error', 'This should not happen — please report', 0);
+          setFetchError(`Analysis timed out after ${mins} minutes. The server may be overloaded — please try again.`);
+          addActivity('scan', `Analysis timed out after ${mins} min — force reset`, 'error', 'Server may be overloaded; please retry', 0);
           watchdogSinceRef.current = 0;
         }
       } else {
@@ -271,7 +275,7 @@ export default function CryptoSentinelDashboard() {
 
   const fetchData = useCallback(async () => {
     try {
-      // Use fetchWithTimeout (15s) to prevent infinite hang on cold starts
+      // Use fetchWithTimeout (15s) to prevent infinite hang on slow networks
       const [pRes, vRes, mRes, sRes] = await Promise.all([
         fetchWithTimeout('/api/projects', {}, 15_000),
         fetchWithTimeout('/api/vulnerabilities', {}, 15_000),
@@ -282,7 +286,7 @@ export default function CryptoSentinelDashboard() {
       if (vRes.ok) {
         const serverVulns: Vulnerability[] = await vRes.json();
         // MERGE: keep union of server + localStorage, dedup by ID.
-        // Server data ADDS to localStorage — never replaces (fixes cold-start data loss)
+        // Server data ADDS to localStorage — never replaces (fixes data loss on restart)
         // Apply 90% confidence filter — never display low-confidence findings.
         if (serverVulns.length > 0) {
           const highConfServerVulns = onlyValidated(serverVulns);
@@ -306,7 +310,7 @@ export default function CryptoSentinelDashboard() {
 
   useEffect(() => { fetchData(); }, [fetchData]);
 
-  // WARMUP: Pre-warm all serverless functions on page load to prevent cold starts
+  // CONNECTIVITY CHECK: Quick ping to verify server is reachable on page load
   useEffect(() => {
     const endpoints = ['/api', '/api/analyze', '/api/validate-vuln', '/api/vulnerabilities'];
     endpoints.forEach(url => {
@@ -527,7 +531,7 @@ export default function CryptoSentinelDashboard() {
       // Masked value from GET — user didn't change it, just save the model
     } else if (apiKey) {
       if (apiKey.startsWith('vcp_')) {
-        addActivity('scan', 'API key rejected: this is a Vercel token, not an OpenRouter key. OpenRouter keys start with "sk-or-v1-"', 'error', 'Invalid key format', 0);
+        addActivity('scan', 'API key rejected: this is not an OpenRouter key. OpenRouter keys start with "sk-or-v1-"', 'error', 'Invalid key format', 0);
         return;
       }
       if (apiKey.startsWith('sk-') && !apiKey.startsWith('sk-or-')) {
@@ -582,7 +586,7 @@ export default function CryptoSentinelDashboard() {
   };
 
   /** Fetch with timeout — prevents infinite loading if server hangs
-   *  Default 45s (Vercel cold starts can take 40s+)
+   *  Default 45s timeout for fetches — generous enough for slow networks.
    *  Override for specific calls: 15s for 202 status, 10s for polls
    *  IMPORTANT: Also respects the analysis AbortController signal */
   const fetchWithTimeout = (url: string, options: RequestInit = {}, timeoutMs: number = 45_000): Promise<Response> => {
@@ -606,23 +610,23 @@ export default function CryptoSentinelDashboard() {
 
   /** UNIFIED SSE STREAMING ANALYSIS — THE DEFINITIVE FIX
    *  Uses /api/analyze-stream for BOTH phases in ONE connection.
-   *  - Heartbeats every 5s keep Render's proxy from killing the connection
+   *  - Heartbeats every 5s keep the connection alive during long AI calls
    *    during long GLM calls (which can take 60-180s).
    *  - Static results appear immediately (phase1_complete event)
    *  - AI results stream in as they're found (finding events)
-   *  - No cold-start gap between phases — same serverless instance
+   *  - No gap between phases — same server instance
    *  - Robust retry logic: 3 attempts with progressive backoff
    *  - Sync /api/analyze-ai is now the SECONDARY fallback (it times out
-   *    at Render's 100s request limit, so it only works for fast analyses). */
+   *    at the server's request limit, so it only works for fast analyses). */
   const runTwoPhaseAnalysis = async (projectId: string, code: string, contractNm: string, tUrl?: string, tType?: string, hpContext?: any) => {
 
     // ═══════════════════════════════════════════════════════════════
-    // SSE STREAMING — PRIMARY path (most reliable on Render free tier)
+    // SSE STREAMING — PRIMARY path (most reliable for long AI calls)
     // ═══════════════════════════════════════════════════════════════
-    // Render's free tier caps HTTP requests at ~100s. The synchronous
+    // Serverless platforms cap HTTP requests at ~100s. The synchronous
     // /api/analyze-ai endpoint can't fit a 30-180s GLM call inside that
     // window. SSE streaming bypasses the limit because data flows
-    // continuously (heartbeats every 5s) — Render's proxy sees an active
+    // continuously (heartbeats every 5s) — the proxy sees an active
     // connection and doesn't kill it.
     //
     // ONE retry with 5s delay — this is enough for genuine network blips
@@ -660,7 +664,7 @@ export default function CryptoSentinelDashboard() {
 
     // ═══════════════════════════════════════════════════════════════
     // FALLBACK: Synchronous approach (last resort — only works for
-    // fast analyses that complete within Render's ~100s request limit)
+    // fast analyses that complete within the server's request limit)
     // ═══════════════════════════════════════════════════════════════
     addActivity('scan', 'SSE streaming failed, trying sync analysis...', 'warning', 'Last resort', 15);
     return await runSyncAnalysis(projectId, code, contractNm, tUrl, tType, hpContext);
@@ -670,7 +674,7 @@ export default function CryptoSentinelDashboard() {
   const runSyncAnalysis = async (projectId: string, code: string, contractNm: string, tUrl?: string, tType?: string, hpContext?: any): Promise<{ contractId: string; auditId: string }> => {
     addActivity('scan', 'Running deep analysis...', 'running', 'Phase 1', 5);
 
-    // Render has 15-minute timeout. Client timeout 600s (10 min) gives
+    // VPS has no request timeout. Client timeout 600s (10 min) gives
     // plenty of room for deep AI analysis + EVM validation.
     const res = await fetchWithTimeout('/api/analyze-ai', {
       method: 'POST',
@@ -684,7 +688,7 @@ export default function CryptoSentinelDashboard() {
         targetType: tType || targetType,
         hackenproofContext: hpContext,
       }),
-    }, 600_000); // 10 min — Render 15min timeout
+    }, 600_000); // 10 min — VPS has no serverless timeout
 
     if (!res.ok) {
       const errData = await res.json().catch(() => ({}));
@@ -1033,27 +1037,25 @@ export default function CryptoSentinelDashboard() {
     return { contractId, auditId };
   };
 
-  /** Warm up the Render server before analysis — Render free plan sleeps
-   *  after 15 min of inactivity. This pings the server to wake it up
-   *  before the actual analysis request. Without this, the first analysis
-   *  request after sleep fails with "Network error (likely cold start)". */
+  /** Quick connectivity check — VPS with PM2 has no cold start (the
+   *  server is always hot), so we just verify it's reachable before
+   *  starting the analysis. No retry loop needed. */
   const warmupServer = async (): Promise<void> => {
-    addActivity('scan', 'Waking up server (Render cold start)...', 'running', 'Connecting', 2);
     try {
-      const res = await fetch('/api/settings', { method: 'GET' });
+      // 5s timeout — server is always hot on VPS, no cold start to wait for
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5_000);
+      const res = await fetch('/api/settings', {
+        method: 'GET',
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
       if (res.ok) {
         addActivity('scan', 'Server ready', 'success', 'Connected', 5);
       }
     } catch {
-      // Server still waking up — wait and retry
-      addActivity('scan', 'Server waking up, waiting 10s...', 'running', 'Cold start', 3);
-      await new Promise(r => setTimeout(r, 10_000));
-      try {
-        await fetch('/api/settings', { method: 'GET' });
-        addActivity('scan', 'Server ready after retry', 'success', 'Connected', 5);
-      } catch {
-        addActivity('scan', 'Server still warming up — proceeding anyway', 'warning', 'May be slow', 5);
-      }
+      // Server unreachable — proceed anyway, the analysis call will surface the error
+      addActivity('scan', 'Server ping failed — proceeding with analysis', 'warning', 'May be slow', 5);
     }
   };
 
@@ -1094,7 +1096,7 @@ const analyzeContract = async () => {
     setFetchError('');
     addActivity('scan', 'Starting deep analysis...', 'running', sourceCode ? 'Source code analysis' : 'URL analysis', 0);
 
-    // ─── Warm up the server first (Render cold start fix) ───
+    // ─── Quick connectivity check (VPS is always hot, no cold start) ───
     await warmupServer();
 
     // HARD GLOBAL TIMEOUT: Analysis MUST complete in HARD_TIMEOUT_MS no matter what
@@ -1141,7 +1143,7 @@ const analyzeContract = async () => {
     setHackenproofContext(null);
     addActivity('scan', 'Starting URL analysis...', 'running', targetUrl, 0);
 
-    // ─── Warm up the server first (Render cold start fix) ───
+    // ─── Quick connectivity check (VPS is always hot, no cold start) ───
     await warmupServer();
 
     // HARD GLOBAL TIMEOUT for entire URL analysis flow
@@ -1153,7 +1155,7 @@ const analyzeContract = async () => {
     try {
       // Determine actual type for API (hackenproof is auto-detected by URL)
       const apiType = targetType === 'hackenproof' ? 'contract' : targetType;
-      // Fetch content from URL — with automatic retry on cold start / transient failures
+      // Fetch content from URL — with automatic retry on transient network failures
       addActivity('system', 'Fetching URL content...', 'running', targetUrl, 10);
       let fetchRes: Response | null = null;
       let lastError: string = '';
@@ -1174,7 +1176,7 @@ const analyzeContract = async () => {
           if (lastError.includes('AbortError') && analysisAbortRef.current?.signal.aborted) throw fetchErr;
           const isRetryable = lastError.includes('AbortError') || lastError.includes('Failed to fetch') || lastError.includes('NetworkError') || lastError.includes('network error');
           if (!isRetryable || attempt === MAX_RETRIES - 1) throw fetchErr;
-          addActivity('system', `Fetch attempt ${attempt + 1} failed (cold start?), retrying in ${RETRY_DELAYS[attempt] / 1000}s...`, 'warning', lastError.slice(0, 60), 15);
+          addActivity('system', `Fetch attempt ${attempt + 1} failed (network error?), retrying in ${RETRY_DELAYS[attempt] / 1000}s...`, 'warning', lastError.slice(0, 60), 15);
           await new Promise(r => setTimeout(r, RETRY_DELAYS[attempt]));
         }
       }
@@ -1227,8 +1229,8 @@ const analyzeContract = async () => {
         setFetchError('Analysis timed out — partial results may be available.');
         addActivity('scan', 'Analysis timed out', 'warning', 'Try again');
       } else if (errMsg.includes('Failed to fetch') || errMsg.includes('network error') || errMsg.includes('NetworkError')) {
-        setFetchError('Network error — server may be waking up from cold start. Please try again in a few seconds.');
-        addActivity('scan', 'Network error (likely cold start)', 'warning', 'Try again in 5-10s');
+        setFetchError('Network error — server may be unreachable. Please try again in a few seconds.');
+        addActivity('scan', 'Network error — server may be unreachable', 'warning', 'Try again in a few seconds');
       } else {
         setFetchError(`Analysis error: ${errMsg}`);
         addActivity('scan', 'URL analysis failed', 'error', errMsg.slice(0, 100));
@@ -1395,7 +1397,7 @@ const analyzeContract = async () => {
                       {keySource === 'env' ? (
                         <Badge variant="outline" className="text-blue-700 border-blue-300 bg-blue-50">env var (OPENROUTER_API_KEY)</Badge>
                       ) : (
-                        <Badge variant="outline" className="text-amber-700 border-amber-300 bg-amber-50">database (resets on cold start)</Badge>
+                        <Badge variant="outline" className="text-amber-700 border-amber-300 bg-amber-50">database (resets on restart)</Badge>
                       )}
                       <span className="text-slate-400">|</span>
                       <span className="text-slate-500">Current: <code className="font-mono">{maskedKey}</code></span>
@@ -1403,12 +1405,12 @@ const analyzeContract = async () => {
                   )}
                   {keySource === 'env' && (
                     <p className="text-xs text-blue-700 bg-blue-50 border border-blue-200 p-2 rounded">
-                      <strong>Env var is active:</strong> The <code>OPENROUTER_API_KEY</code> env var (set via Vercel dashboard or API) takes precedence over the DB key. This is the most reliable configuration — the key persists across cold starts. Saving a new key below will store it in the DB, but the env var will still win.
+                      <strong>Env var is active:</strong> The <code>OPENROUTER_API_KEY</code> env var takes precedence over the DB key. This is the most reliable configuration — the key persists across server restarts. Saving a new key below will store it in the DB, but the env var will still win.
                     </p>
                   )}
                   {hasKey && keySource !== 'env' && (
                     <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 p-2 rounded">
-                      <strong>DB-only key:</strong> The key is stored in the per-instance SQLite database and may be lost on cold starts. For reliable persistence, set <code>OPENROUTER_API_KEY</code> as a Vercel env var.
+                      <strong>DB-only key:</strong> The key is stored in the per-instance SQLite database and may be lost on server restarts. For reliable persistence, set <code>OPENROUTER_API_KEY</code> as an env var in the PM2 ecosystem config.
                     </p>
                   )}
                   <div>
