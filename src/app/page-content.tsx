@@ -605,8 +605,14 @@ export default function CryptoSentinelDashboard() {
     // window. SSE streaming bypasses the limit because data flows
     // continuously (heartbeats every 5s) — Render's proxy sees an active
     // connection and doesn't kill it.
-    const SSE_RETRIES = 3;
-    const SSE_RETRY_DELAYS = [5_000, 15_000, 30_000]; // 5s, 15s, 30s
+    //
+    // ONE retry with 5s delay — this is enough for genuine network blips
+    // (TCP reset, brief packet loss) without forcing the user through
+    // 3 × 60s = 3+ minutes of "Connection failed" messages when the only
+    // issue was a slow AI call. With heartbeat timeout now at 180s, real
+    // timeouts will be rare.
+    const SSE_RETRIES = 1;
+    const SSE_RETRY_DELAYS = [5_000]; // 5s only
 
     for (let attempt = 0; attempt < SSE_RETRIES; attempt++) {
       throwIfAborted();
@@ -623,7 +629,7 @@ export default function CryptoSentinelDashboard() {
         const isNetworkError = errMsg.includes('Failed to fetch') || errMsg.includes('network error') || errMsg.includes('NetworkError') || errMsg.includes('fetch failed') || errMsg.includes('Load failed') || errMsg.includes('SSE heartbeat timeout');
 
         if (isNetworkError && attempt < SSE_RETRIES - 1) {
-          addActivity('scan', `Connection failed (attempt ${attempt + 1}/${SSE_RETRIES}), retrying in ${SSE_RETRY_DELAYS[attempt] / 1000}s...`, 'warning', 'Cold start?', 10);
+          addActivity('scan', `Connection failed, retrying in ${SSE_RETRY_DELAYS[attempt] / 1000}s...`, 'warning', 'Network blip', 10);
           await new Promise(r => setTimeout(r, SSE_RETRY_DELAYS[attempt]));
           continue;
         }
@@ -729,15 +735,21 @@ export default function CryptoSentinelDashboard() {
 
           const decoder = new TextDecoder();
           let buffer = '';
-          // Heartbeat timeout — server now sends heartbeats every 5s (down
-          // from 8s). If no event arrives within 60s, the connection is
-          // definitely dead and we should retry instead of waiting forever.
-          // Previous 200s timeout was too forgiving — a dead connection
-          // sat idle for 3+ minutes before the user got feedback.
-          const HEARTBEAT_TIMEOUT_MS = 60_000; // 60s — server sends heartbeats every 5s
+          // Heartbeat timeout — server sends heartbeats every 5s. AI calls
+          // (GLM 5.2 deep analysis) can take 30-90s. During a long AI call,
+          // Node.js event loop may be busy with the OpenRouter HTTP request
+          // and heartbeats can be delayed beyond 5s. Set timeout to 180s to
+          // accommodate:
+          //   - Normal AI call: 30-60s (heartbeats arrive, watchdog resets)
+          //   - Slow AI call: 60-90s (some heartbeats arrive, watchdog still resets)
+          //   - Dead connection: no heartbeats for 180s → real timeout, retry
+          // Previous 60s timeout caused false-positive "Connection failed"
+          // retries on every analysis with a slow AI call — the user saw
+          // 3 retries × 60s = 3+ minutes of "Cold start?" messages.
+          const HEARTBEAT_TIMEOUT_MS = 180_000; // 3 min — generous for AI calls
           let lastEventTime = Date.now();
 
-          // Heartbeat watchdog — check every 10s for faster detection.
+          // Heartbeat watchdog — check every 15s.
           const heartbeatWatchdog = setInterval(() => {
             if (Date.now() - lastEventTime > HEARTBEAT_TIMEOUT_MS) {
               clearInterval(heartbeatWatchdog);
@@ -746,7 +758,7 @@ export default function CryptoSentinelDashboard() {
                 reject(new Error('SSE heartbeat timeout — connection died'));
               }
             }
-          }, 10_000);
+          }, 15_000);
 
           const processBuffer = () => {
             // SSE format: "event: type\ndata: json\n\n"
