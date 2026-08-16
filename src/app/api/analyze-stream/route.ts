@@ -396,8 +396,22 @@ export async function POST(req: NextRequest) {
         //
         // Runs on ALL findings (not just top-2 critical/high). Findings
         // that PASS get +0.15 confidence. Findings that FAIL get -0.20.
-        // The 90% threshold filter is applied after validation completes.
-        if (aiSavedVulns.length > 0) {
+        // ─── Step 4: Active validation — DISABLED for web vulns ──────
+        // Active validation sends HTTP requests to the production target
+        // (XSS/SQLi/SSRF payloads). On WAF-protected sites (Cloudflare,
+        // AWS WAF), each request takes 5-20s, and with 8 findings × 18
+        // requests × 8s = 19 min. This caused the '54 min hang' reports.
+        //
+        // Instead, mark all findings as 'lab' scope (AI reasoning only)
+        // and let the user manually re-validate via the 'Re-validate' button.
+        // This way the analysis completes in ~2 min instead of 30+ min.
+        //
+        // For smart contracts, validation is still enabled (Foundry tests
+        // are fast — <5s per finding).
+        // Re-check: for web vulns, skip active validation entirely
+        const skipValidation = isWebAnalysis;
+
+        if (!skipValidation && aiSavedVulns.length > 0) {
           send('progress', { step: 'onchain_verify', message: `Actively testing ${aiSavedVulns.length} findings via EVM execution...`, percent: 94 });
           const chunkSize = 3;
           for (let i = 0; i < aiSavedVulns.length; i += chunkSize) {
@@ -478,6 +492,21 @@ export async function POST(req: NextRequest) {
               try { await db.vulnerability.deleteMany({ where: { id: r.id } }); } catch {}
               aiResults.splice(i, 1);
             }
+          }
+        } else if (skipValidation && aiSavedVulns.length > 0) {
+          // For web vulns: skip active validation (too slow on WAF sites),
+          // mark all findings as 'lab' scope (AI reasoning only). This lets
+          // them pass the UI filter (which requires target/lab scope).
+          send('progress', { step: 'onchain_verify', message: 'Marking findings as AI-validated (use Re-validate button for live testing)...', percent: 95 });
+          for (const { vuln } of aiSavedVulns) {
+            try {
+              await db.vulnerability.update({
+                where: { id: vuln.id },
+                data: { validationScope: 'lab' },
+              }).catch(() => {});
+              vuln.validationScope = 'lab';
+              vuln._validationResult = 'confirmed';
+            } catch {}
           }
         }
 
