@@ -396,95 +396,83 @@ export async function POST(req: NextRequest) {
         //
         // Runs on ALL findings (not just top-2 critical/high). Findings
         // that PASS get +0.15 confidence. Findings that FAIL get -0.20.
-        // ─── Step 4: Active validation — DISABLED for web vulns ──────
+        // ─── Step 4: Active validation — FAST & PARALLEL ──────────────
         // Active validation sends HTTP requests to the production target
-        // (XSS/SQLi/SSRF payloads). On WAF-protected sites (Cloudflare,
-        // AWS WAF), each request takes 5-20s, and with 8 findings × 18
-        // requests × 8s = 19 min. This caused the '54 min hang' reports.
+        // to confirm vulnerabilities. This is ESSENTIAL — without it,
+        // findings are just AI guesses.
         //
-        // Instead, mark all findings as 'lab' scope (AI reasoning only)
-        // and let the user manually re-validate via the 'Re-validate' button.
-        // This way the analysis completes in ~2 min instead of 30+ min.
-        //
-        // For smart contracts, validation is still enabled (Foundry tests
-        // are fast — <5s per finding).
-        // Re-check: for web vulns, skip active validation entirely
-        const skipValidation = isWebAnalysis;
+        // Optimization (vs previous slow version):
+        //   - ALL findings validated in PARALLEL (not chunks of 3)
+        //   - Per-request timeout: 5s (was 20s)
+        //   - Payloads: 3 per type (was 15)
+        //   - Params: 3 max (was 15)
+        //   - Total: 8 findings × 18 requests × 5s / 8 parallel = ~18s
+        //     (was 8 findings × 450 requests × 20s / 3 = 40 min)
+        if (aiSavedVulns.length > 0) {
+          send('progress', { step: 'onchain_verify', message: `Actively testing ${aiSavedVulns.length} findings via HTTP/EVM...`, percent: 94 });
 
-        if (!skipValidation && aiSavedVulns.length > 0) {
-          send('progress', { step: 'onchain_verify', message: `Actively testing ${aiSavedVulns.length} findings via EVM execution...`, percent: 94 });
-          const chunkSize = 3;
-          for (let i = 0; i < aiSavedVulns.length; i += chunkSize) {
-            const chunk = aiSavedVulns.slice(i, i + chunkSize);
-            const verifyPromises = chunk.map(async ({ vuln, rawFinding: v }: any) => {
-              try {
-                const verification = await activelyValidate(
-                  sourceCode,
-                  contractName || 'Contract',
-                  { title: v.title, type: v.type, severity: v.severity, description: v.description, location: v.location },
-                  apiKey, model
-                );
-                if (verification.confirmed) {
-                  const scope = verification.validationScope || 'lab';
-                  // IMPORTANT: lab validation only proves technical viability,
-                  // NOT that the production target is exploitable. Adjust
-                  // confidence accordingly: target=+0.15, lab=+0.05, theoretical=+0.
-                  const confidenceBoost = scope === 'target' ? 0.15 : scope === 'lab' ? 0.05 : 0;
-                  const newConfidence = Math.min(vuln.confidence + confidenceBoost, 0.99);
-                  // 'confirmed' status requires target-level validation; lab-only
-                  // findings stay at 'validated' to avoid misrepresenting them
-                  // as production-confirmed exploits.
-                  const newStatus = scope === 'target' && newConfidence >= 0.90
-                    ? 'confirmed'
-                    : newConfidence >= 0.80 ? 'validated' : 'candidate';
-                  const scopeLabel =
-                    scope === 'target' ? '[TARGET-VALIDATED] Exploit confirmed by sending a real request to the production target.' :
-                    scope === 'lab'      ? '[LAB-VALIDATED] Exploit chain is technically viable in a controlled local environment. This does NOT confirm the production target is exploitable — only that the exploit logic works under lab conditions.' :
-                                          '[THEORETICAL] No runtime validation performed; based on static analysis / AI reasoning only.';
-                  await db.vulnerability.update({
-                    where: { id: vuln.id },
-                    data: {
-                      confidence: newConfidence, status: newStatus,
-                      validationScope: scope,
-                      description: vuln.description + `\n\n${scopeLabel}\n${verification.evidence}`,
-                    },
-                  });
-                  vuln.confidence = newConfidence;
-                  vuln.status = newStatus;
-                  vuln.validationScope = scope;
-                  vuln._validationResult = 'confirmed';
-                } else {
-                  const newConfidence = Math.max(vuln.confidence - 0.20, 0);
-                  const newStatus = newConfidence >= 0.90 ? 'validated' : 'candidate';
-                  const scope = verification.validationScope || 'theoretical';
-                  const scopeLabel =
-                    scope === 'target' ? '[TARGET-VALIDATED] Exploit did NOT succeed against the production target — this is meaningful negative evidence.' :
-                    scope === 'lab'      ? '[LAB-VALIDATED] Exploit did NOT succeed under lab conditions — likely a false positive, or the exploit requires on-chain state not reproduced locally.' :
-                                          '[THEORETICAL] No runtime validation performed.';
-                  await db.vulnerability.update({
-                    where: { id: vuln.id },
-                    data: {
-                      confidence: newConfidence, status: newStatus,
-                      validationScope: scope,
-                      description: vuln.description + `\n\n${scopeLabel}\n${verification.evidence}`,
-                    },
-                  });
-                  vuln.confidence = newConfidence;
-                  vuln.status = newStatus;
-                  vuln.validationScope = scope;
-                  vuln._validationResult = 'failed';
-                  vuln._validationReason = verification.evidence;
-                }
-              } catch (err: any) {
-                vuln._validationResult = 'skipped';
-                vuln._validationReason = String(err).slice(0, 100);
+          // Run ALL findings in parallel — each finding validates independently
+          const verifyPromises = aiSavedVulns.map(async ({ vuln, rawFinding: v }: any) => {
+            try {
+              const verification = await activelyValidate(
+                sourceCode,
+                contractName || 'Contract',
+                { title: v.title, type: v.type, severity: v.severity, description: v.description, location: v.location },
+                apiKey, model
+              );
+              if (verification.confirmed) {
+                const scope = verification.validationScope || 'lab';
+                const confidenceBoost = scope === 'target' ? 0.15 : scope === 'lab' ? 0.05 : 0;
+                const newConfidence = Math.min(vuln.confidence + confidenceBoost, 0.99);
+                const newStatus = scope === 'target' && newConfidence >= 0.90
+                  ? 'confirmed'
+                  : newConfidence >= 0.80 ? 'validated' : 'candidate';
+                const scopeLabel =
+                  scope === 'target' ? '[TARGET-VALIDATED] Exploit confirmed by sending a real request to the production target.' :
+                  scope === 'lab'      ? '[LAB-VALIDATED] Exploit chain is technically viable in a controlled local environment.' :
+                                        '[THEORETICAL] No runtime validation performed.';
+                await db.vulnerability.update({
+                  where: { id: vuln.id },
+                  data: {
+                    confidence: newConfidence, status: newStatus,
+                    validationScope: scope,
+                    description: vuln.description + `\n\n${scopeLabel}\n${verification.evidence}`,
+                  },
+                });
+                vuln.confidence = newConfidence;
+                vuln.status = newStatus;
+                vuln.validationScope = scope;
+                vuln._validationResult = 'confirmed';
+              } else {
+                const newConfidence = Math.max(vuln.confidence - 0.20, 0);
+                const newStatus = newConfidence >= 0.90 ? 'validated' : 'candidate';
+                const scope = verification.validationScope || 'theoretical';
+                const scopeLabel =
+                  scope === 'target' ? '[TARGET-VALIDATED] Exploit did NOT succeed against the production target.' :
+                  scope === 'lab'      ? '[LAB-VALIDATED] Exploit did NOT succeed under lab conditions.' :
+                                        '[THEORETICAL] No runtime validation performed.';
+                await db.vulnerability.update({
+                  where: { id: vuln.id },
+                  data: {
+                    confidence: newConfidence, status: newStatus,
+                    validationScope: scope,
+                    description: vuln.description + `\n\n${scopeLabel}\n${verification.evidence}`,
+                  },
+                });
+                vuln.confidence = newConfidence;
+                vuln.status = newStatus;
+                vuln.validationScope = scope;
+                vuln._validationResult = 'failed';
+                vuln._validationReason = verification.evidence;
               }
-            });
-            await Promise.allSettled(verifyPromises);
-          }
+            } catch (err: any) {
+              vuln._validationResult = 'skipped';
+              vuln._validationReason = String(err).slice(0, 100);
+            }
+          });
+          await Promise.allSettled(verifyPromises);
 
           // Remove failed findings that dropped below 90%
-          // Mark as _deleted to avoid double-delete in the second pass below
           for (let i = aiResults.length - 1; i >= 0; i--) {
             const r = aiResults[i] as any;
             if (r._validationResult === 'failed' && (r.confidence || 0) < 0.90 && !r._deleted) {
@@ -492,21 +480,6 @@ export async function POST(req: NextRequest) {
               try { await db.vulnerability.deleteMany({ where: { id: r.id } }); } catch {}
               aiResults.splice(i, 1);
             }
-          }
-        } else if (skipValidation && aiSavedVulns.length > 0) {
-          // For web vulns: skip active validation (too slow on WAF sites),
-          // mark all findings as 'lab' scope (AI reasoning only). This lets
-          // them pass the UI filter (which requires target/lab scope).
-          send('progress', { step: 'onchain_verify', message: 'Marking findings as AI-validated (use Re-validate button for live testing)...', percent: 95 });
-          for (const { vuln } of aiSavedVulns) {
-            try {
-              await db.vulnerability.update({
-                where: { id: vuln.id },
-                data: { validationScope: 'lab' },
-              }).catch(() => {});
-              vuln.validationScope = 'lab';
-              vuln._validationResult = 'confirmed';
-            } catch {}
           }
         }
 

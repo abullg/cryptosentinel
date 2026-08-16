@@ -637,7 +637,7 @@ async function sendTestRequest(
   param: string,
   options: { timeoutMs?: number; followRedirect?: boolean } = {},
 ): Promise<{ status: number; body: string; headers: Record<string, string>; finalUrl: string }> {
-  const { timeoutMs = 8_000, followRedirect = true } = options;
+  const { timeoutMs = 5_000, followRedirect = true } = options;
   try {
     const params = new URLSearchParams();
     params.set(param, payload);
