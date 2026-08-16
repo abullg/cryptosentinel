@@ -212,7 +212,7 @@ export default function CryptoSentinelDashboard() {
   // cancelled when a hard timeout fires. This is THE fix for infinite loading.
   const isAnalyzingRef = useRef(false);       // true = analysis in progress (lock)
   const analysisAbortRef = useRef<AbortController | null>(null); // abort all fetches on timeout
-  const HARD_TIMEOUT_MS = 900_000;            // 15 min — VPS KVM 2, no serverless limits
+  const HARD_TIMEOUT_MS = 300_000;            // 5 min — hard cap, no analysis should take longer
 
   // ─── SAFETY WATCHDOG ──────────────────────────────────────────────────────
   // Nuclear option: if `analyzing` stays true for 12 minutes, FORCIBLY reset it.
@@ -224,7 +224,7 @@ export default function CryptoSentinelDashboard() {
   const watchdogSinceRef = useRef<number>(0);
   useEffect(() => {
     const WATCHDOG_INTERVAL = 10_000;  // Check every 10s
-    const WATCHDOG_MAX = 720_000;      // 12 min — AI (5 min) + validation (5 min) + margin
+    const WATCHDOG_MAX = 240_000;      // 4 min — must be LESS than HARD_TIMEOUT (5 min)
 
     const watchdog = setInterval(() => {
       if (analyzing) {
