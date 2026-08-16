@@ -1,0 +1,19 @@
+{
+  "/_global-error/page": "/_global-error",
+  "/_not-found/page": "/_not-found",
+  "/api/ai-debug/route": "/api/ai-debug",
+  "/api/analyze-ai/route": "/api/analyze-ai",
+  "/api/analyze-stream/route": "/api/analyze-stream",
+  "/api/analyze/route": "/api/analyze",
+  "/api/fetch-url/route": "/api/fetch-url",
+  "/api/memory/route": "/api/memory",
+  "/api/projects/route": "/api/projects",
+  "/api/report/route": "/api/report",
+  "/api/route": "/api",
+  "/api/settings/route": "/api/settings",
+  "/api/test-key/route": "/api/test-key",
+  "/api/validate-vuln/route": "/api/validate-vuln",
+  "/api/validate/route": "/api/validate",
+  "/api/vulnerabilities/route": "/api/vulnerabilities",
+  "/page": "/"
+}

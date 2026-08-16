@@ -468,9 +468,9 @@ interface WebTestPayload {
 const XSS_PAYLOADS: WebTestPayload = {
   name: 'XSS',
   payloads: [
-    \'<script>alert(1)</script>\',
-    \'><img src=x onerror=alert(1)>\',
-    \'<svg onload=alert(1)>\',
+    '<script>alert(1)</script>',
+    '"><img src=x onerror=alert(1)>',
+    '<svg onload=alert(1)>',
   ],
   check: (resp, payload) => {
     // Decode URL-encoded payloads to compare against the response
@@ -496,9 +496,9 @@ const XSS_PAYLOADS: WebTestPayload = {
 const SQLI_PAYLOADS: WebTestPayload = {
   name: 'SQL Injection',
   payloads: [
-    \"' OR '1'='1\",
-    \"' OR '1'='1' --\",
-    \"admin'--\",
+    "' OR '1'='1",
+    "' OR '1'='1' --",
+    "admin'--",
   ],
   check: (resp, payload) => {
     const body = resp.body.toLowerCase();

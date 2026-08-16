@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "functions": {
+    "/api/ai-debug": {
+      "maxDuration": 60
+    },
+    "/api/analyze": {
+      "maxDuration": 900
+    },
+    "/api/analyze-ai": {
+      "maxDuration": 900
+    },
+    "/api/analyze-stream": {
+      "maxDuration": 900
+    },
+    "/api/fetch-url": {
+      "maxDuration": 600
+    },
+    "/api/test-key": {
+      "maxDuration": 15
+    },
+    "/api/validate-vuln": {
+      "maxDuration": 600
+    }
+  }
+}
