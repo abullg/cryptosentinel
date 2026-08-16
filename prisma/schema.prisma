@@ -67,6 +67,14 @@ model Vulnerability {
   target        String?  // Contract name / address
   vulnCategory  String?  // SWC/HakenProof category
   validationSteps String? // Detailed validation steps
+  // Validation scope — what kind of validation was performed:
+  //   'target'      = real exploit sent to production target (HTTP request, on-chain call)
+  //   'lab'         = exploit chain proved viable in local Foundry/EVM
+  //   'theoretical' = no runtime validation, AI reasoning only
+  //   null          = validation not yet run
+  // The UI filters to only show 'target' or 'lab' findings (the user's
+  // explicit request: hide findings without active validation).
+  validationScope String?
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 }

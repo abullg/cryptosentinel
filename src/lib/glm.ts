@@ -129,14 +129,18 @@ export async function callGLM(
     throw new Error('API key is required for GLM analysis');
   }
 
-  // VPS KVM 2 (Hostinger, 8GB RAM) — no serverless timeout limits, BUT
-  // GLM 5.2 with unlimited reasoning can enter infinite loops. Cap at
-  // 120s (2 min) — this is enough for deep analysis of even large
-  // codebases; if it takes longer, the model is stuck in a reasoning
-  // loop and should be aborted.
-  // 5 min timeout (previous setting) caused the '40 min hang' — each
-  // retry waited 5 min, and with multiple findings × retries it stacked.
-  const callTimeout = config.timeoutMs || 120_000; // 2 min
+  // VPS KVM 2 (Hostinger, 8GB RAM) — no serverless limits. Allow GLM 5.2
+  // up to 5 minutes for deep analysis. User feedback:
+  //   "почём ты думаешь для ии достаточно 2 минут чтобы обойти полностью сайт
+  //    и протестировать все его точки на уязвимости"
+  // 2 minutes was cutting off deep multi-pass analysis. With 5 minutes,
+  // the model can:
+  //   - Parse large codebases (50K+ chars)
+  //   - Build complete source→dataflow→sink chains
+  //   - Construct concrete exploit scenarios
+  //   - Cross-reference with known exploits (DAO, bZx, etc.)
+  // If still running at 5 min, model is stuck — abort and use partial.
+  const callTimeout = config.timeoutMs || 300_000; // 5 min
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), callTimeout);
   let response: Response;

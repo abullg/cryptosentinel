@@ -423,11 +423,13 @@ export async function POST(req: NextRequest) {
                     where: { id: vuln.id },
                     data: {
                       confidence: newConfidence, status: newStatus,
+                      validationScope: scope,
                       description: vuln.description + `\n\n${scopeLabel}\n${verification.evidence}`,
                     },
                   });
                   vuln.confidence = newConfidence;
                   vuln.status = newStatus;
+                  vuln.validationScope = scope;
                   vuln._validationResult = 'confirmed';
                 } else {
                   const newConfidence = Math.max(vuln.confidence - 0.20, 0);
@@ -441,11 +443,13 @@ export async function POST(req: NextRequest) {
                     where: { id: vuln.id },
                     data: {
                       confidence: newConfidence, status: newStatus,
+                      validationScope: scope,
                       description: vuln.description + `\n\n${scopeLabel}\n${verification.evidence}`,
                     },
                   });
                   vuln.confidence = newConfidence;
                   vuln.status = newStatus;
+                  vuln.validationScope = scope;
                   vuln._validationResult = 'failed';
                   vuln._validationReason = verification.evidence;
                 }

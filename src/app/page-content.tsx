@@ -28,6 +28,7 @@ interface Vulnerability {
   isDuplicate: boolean; pocFilename: string | null; poc: string | null; target: string | null;
   vulnCategory: string | null; validationSteps: string | null; location: string | null;
   codeSnippet: string | null; createdAt: string;
+  validationScope?: 'target' | 'lab' | 'theoretical' | null;
   contract?: { name: string; project?: { name: string } };
 }
 interface Project {
@@ -102,28 +103,46 @@ export default function CryptoSentinelDashboard() {
   const onlyHighConfidence = (findings: any[]): any[] => findings.filter(f => (f.confidence || 0) >= MIN_CONFIDENCE);
 
 
-  /** Filter: only show vulnerabilities with confidence >= 90%
-   *  This is the USER's explicit requirement — no findings below 90%
-   *  should ever be displayed, regardless of their source (static, AI, or DB).
-   *  This filter is applied to EVERY setVulns call. */
+  /** Filter: only show vulnerabilities with confidence >= 90% AND
+   *  active validation (target or lab). Findings without runtime validation
+   *  (theoretical / null scope) are HIDDEN from the UI — the user wants
+   *  only confirmed-by-execution findings displayed. */
   const filterHighConfidence = (vulns: Vulnerability[]): Vulnerability[] => {
-    return vulns.filter(v => (v.confidence || 0) >= 0.90);
+    return vulns.filter(v =>
+      (v.confidence || 0) >= 0.90 &&
+      (v.validationScope === 'target' || v.validationScope === 'lab')
+    );
   };
 
   /** SAFETY NET: After every vulns state change, sweep and drop anything
-   *  below 90% confidence. This catches cases where:
-   *   - A finding was added by SSE without filtering (lines 253, 651, 786, 808, 821, 924, 953)
-   *   - A re-validation dropped confidence below 90% (lines 386, 407)
-   *   - localStorage was restored from an older session with looser filtering
-   *  Without this sweep, low-confidence findings can leak through via paths
-   *  that forgot to call onlyHighConfidence. */
+   *  below 90% confidence OR without active validation. This catches:
+   *   - Findings added by SSE without filtering
+   *   - Findings whose validation failed and dropped below threshold
+   *   - localStorage restored from older session with looser filtering
+   *   - Theoretical findings that never got runtime validation
+   *  This is the LAST line of defense — enforces user's requirement:
+   *  "уязвимости без активной валидации не показывают" */
   useEffect(() => {
     setVulns(prev => {
-      const filtered = prev.filter(v => (v.confidence || 0) >= 0.90);
+      const filtered = prev.filter(v =>
+        (v.confidence || 0) >= 0.90 &&
+        (v.validationScope === 'target' || v.validationScope === 'lab')
+      );
       // Only update if something was actually filtered out — avoids infinite loop
       return filtered.length === prev.length ? prev : filtered;
     });
   }, [vulns]);
+
+  /** Helper: check if a finding passes BOTH filters (confidence + validation).
+   *  Used at every setVulns call site to prevent unvalidated findings from
+   *  even entering the UI state. */
+  const hasActiveValidation = (v: any): boolean =>
+    v.validationScope === 'target' || v.validationScope === 'lab';
+
+  /** Extended filter: confidence >= 90% AND active validation scope. */
+  const onlyValidated = (findings: any[]): any[] => findings.filter(f =>
+    (f.confidence || 0) >= 0.90 && hasActiveValidation(f)
+  );
 
   const [patterns, setPatterns] = usePersistedState<MemoryPattern[]>('cs_patterns', []);
   const [loading, setLoading] = useState(false);
@@ -266,7 +285,7 @@ export default function CryptoSentinelDashboard() {
         // Server data ADDS to localStorage — never replaces (fixes cold-start data loss)
         // Apply 90% confidence filter — never display low-confidence findings.
         if (serverVulns.length > 0) {
-          const highConfServerVulns = onlyHighConfidence(serverVulns);
+          const highConfServerVulns = onlyValidated(serverVulns);
           setVulns(prev => {
             const existingIds = new Set(prev.map(v => v.id));
             const toAdd = highConfServerVulns.filter(v => !existingIds.has(v.id));
@@ -673,12 +692,12 @@ export default function CryptoSentinelDashboard() {
     }
 
     const data = await res.json();
-    const allFindings = onlyHighConfidence(data.allFindings || []);
+    const allFindings = onlyValidated(data.allFindings || []);
     const contractId = data.contractId || '';
     const auditId = data.auditId || '';
 
     // Show findings immediately — filter to >=90% confidence only
-    const highConfFindings = onlyHighConfidence(allFindings);
+    const highConfFindings = onlyValidated(allFindings);
     if (highConfFindings.length > 0) {
       setVulns(prev => {
         const existingIds = new Set(prev.map(v => v.id));
@@ -820,7 +839,7 @@ export default function CryptoSentinelDashboard() {
                 auditId = data.auditId || '';
 
                 // Show static findings immediately — only >=90% confidence
-                const highConfStaticFindings = onlyHighConfidence(findings);
+                const highConfStaticFindings = onlyValidated(findings);
                 if (highConfStaticFindings.length > 0) {
                   setVulns(prev => {
                     const existingIds = new Set(prev.map(v => v.id));
@@ -842,9 +861,15 @@ export default function CryptoSentinelDashboard() {
 
               case 'finding': {
                 const vuln = data.vulnerability;
-                // Only add if confidence >= 90% — server may stream
-                // candidate findings that haven't been validated yet.
-                if (vuln && (vuln.confidence || 0) >= 0.90) {
+                // Only add if BOTH conditions met:
+                //   1. confidence >= 90%
+                //   2. validationScope is 'target' or 'lab' (not theoretical/null)
+                // The server streams findings as they're found, but validation
+                // happens AFTER all findings are reported. So this check will
+                // usually FAIL here for the initial stream — the finding will
+                // be added later via the post-validation 'complete' event when
+                // its scope has been updated to 'target' or 'lab'.
+                if (vuln && (vuln.confidence || 0) >= 0.90 && hasActiveValidation(vuln)) {
                   aiFindingsCount++;
                   setVulns(prev => {
                     const existingIds = new Set(prev.map(v => v.id));
@@ -858,7 +883,7 @@ export default function CryptoSentinelDashboard() {
               case 'complete': {
                 const allFindings = data.findings || [];
                 // Merge any findings we haven't seen yet — only >=90% confidence
-                const highConfComplete = onlyHighConfidence(allFindings);
+                const highConfComplete = onlyValidated(allFindings);
                 if (highConfComplete.length > 0) {
                   setVulns(prev => {
                     const existingIds = new Set(prev.map(v => v.id));
@@ -961,7 +986,7 @@ export default function CryptoSentinelDashboard() {
     }
 
     const staticData = await res.json();
-    const staticFindings = onlyHighConfidence(staticData.findings || []);
+    const staticFindings = onlyValidated(staticData.findings || []);
     if (staticFindings.length > 0) {
       setVulns(prev => {
         const existingIds = new Set(prev.map(v => v.id));
@@ -990,7 +1015,7 @@ export default function CryptoSentinelDashboard() {
 
       if (aiRes.ok) {
         const aiData = await aiRes.json();
-        const aiFindings = onlyHighConfidence(aiData.aiFindings || aiData.allFindings || []);
+        const aiFindings = onlyValidated(aiData.aiFindings || aiData.allFindings || []);
         if (aiFindings.length > 0) {
           setVulns(prev => {
             const existingIds = new Set(prev.map(v => v.id));

@@ -549,11 +549,13 @@ export async function POST(req: NextRequest) {
                     where: { id: vuln.id },
                     data: {
                       confidence: newConfidence, status: newStatus, severity: verification.updatedSeverity || v.severity,
+                      validationScope: scope,
                       description: vuln.description + `\n\n${scopeLabel}\n${verification.evidence}`,
                     },
                   }).catch(() => {});
                   vuln.confidence = newConfidence;
                   vuln.status = newStatus;
+                  vuln.validationScope = scope;
                   vuln._validationResult = 'confirmed';
                 } else {
                   // FAIL — downgrade confidence. If it drops below 90%, mark for removal.
@@ -568,10 +570,12 @@ export async function POST(req: NextRequest) {
                     where: { id: vuln.id },
                     data: {
                       confidence: newConfidence, status: newStatus,
+                      validationScope: scope,
                       description: vuln.description + `\n\n${scopeLabel}\nReason: ${verification.evidence}`,
                     },
                   }).catch(() => {});
                   vuln.confidence = newConfidence;
+                  vuln.validationScope = scope;
                   vuln.status = newStatus;
                   vuln._validationResult = 'failed';
                   vuln._validationReason = verification.evidence;
@@ -973,11 +977,13 @@ async function runAIOnlyPhase(
                   where: { id: vuln.id },
                   data: {
                     confidence: newConfidence, status: newStatus, severity: verification.updatedSeverity || v.severity,
+                    validationScope: scope,
                     description: vuln.description + `\n\n${scopeLabel}\n${verification.evidence}`,
                   },
                 }).catch(() => {});
                 vuln.confidence = newConfidence;
                 vuln.status = newStatus;
+                vuln.validationScope = scope;
                 vuln._validationResult = 'confirmed';
               } else {
                 const newConfidence = Math.max(vuln.confidence - 0.20, 0);
@@ -991,10 +997,12 @@ async function runAIOnlyPhase(
                   where: { id: vuln.id },
                   data: {
                     confidence: newConfidence, status: newStatus,
+                    validationScope: scope,
                     description: vuln.description + `\n\n${scopeLabel}\nReason: ${verification.evidence}`,
                   },
                 }).catch(() => {});
                 vuln.confidence = newConfidence;
+                vuln.validationScope = scope;
                 vuln.status = newStatus;
                 vuln._validationResult = 'failed';
                 vuln._validationReason = verification.evidence;
