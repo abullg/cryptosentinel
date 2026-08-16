@@ -618,6 +618,17 @@ export async function analyzeWithGLM(
   // Parse JSON from response
   try {
     let jsonStr = response.content.trim();
+
+    // Strip markdown code fences (```json ... ``` or ``` ... ```)
+    // GLM 5.2 often wraps JSON responses in markdown blocks despite
+    // instructions not to. Without stripping, the JSON.parse fails and
+    // all findings are silently dropped.
+    const markdownMatch = jsonStr.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);
+    if (markdownMatch) {
+      jsonStr = markdownMatch[1].trim();
+    }
+
+    // Find the JSON array — look for the outermost [...] matching
     const jsonMatch = jsonStr.match(/\[[\s\S]*\]/);
     if (jsonMatch) {
       jsonStr = jsonMatch[0];
@@ -1146,6 +1157,13 @@ export async function analyzeWebWithGLM(
 
   try {
     let jsonStr = response.content.trim();
+
+    // Strip markdown code fences (```json ... ``` or ``` ... ```)
+    const markdownMatch = jsonStr.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);
+    if (markdownMatch) {
+      jsonStr = markdownMatch[1].trim();
+    }
+
     const jsonMatch = jsonStr.match(/\[[\s\S]*\]/);
     if (jsonMatch) jsonStr = jsonMatch[0];
 
@@ -1228,6 +1246,13 @@ Respond in JSON format:
 
   try {
     let jsonStr = response.content.trim();
+
+    // Strip markdown code fences (```json ... ``` or ``` ... ```)
+    const markdownMatch = jsonStr.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);
+    if (markdownMatch) {
+      jsonStr = markdownMatch[1].trim();
+    }
+
     const jsonMatch = jsonStr.match(/\{[\s\S]*\}/);
     if (jsonMatch) jsonStr = jsonMatch[0];
     const parsed = JSON.parse(jsonStr);
