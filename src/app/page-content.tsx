@@ -103,45 +103,29 @@ export default function CryptoSentinelDashboard() {
   const onlyHighConfidence = (findings: any[]): any[] => findings.filter(f => (f.confidence || 0) >= MIN_CONFIDENCE);
 
 
-  /** Filter: only show vulnerabilities with confidence >= 90% AND
-   *  active validation (target or lab). Findings without runtime validation
-   *  (theoretical / null scope) are HIDDEN from the UI — the user wants
-   *  only confirmed-by-execution findings displayed. */
+  /** Filter: only show vulnerabilities with confidence >= 90%.
+   *  Findings without active validation are SHOWN but with a "Needs validation"
+   *  badge in the UI. The user can click "Re-validate" to run active testing. */
   const filterHighConfidence = (vulns: Vulnerability[]): Vulnerability[] => {
-    return vulns.filter(v =>
-      (v.confidence || 0) >= 0.90 &&
-      (v.validationScope === 'target' || v.validationScope === 'lab')
-    );
+    return vulns.filter(v => (v.confidence || 0) >= 0.90);
   };
 
   /** SAFETY NET: After every vulns state change, sweep and drop anything
-   *  below 90% confidence OR without active validation. This catches:
-   *   - Findings added by SSE without filtering
-   *   - Findings whose validation failed and dropped below threshold
-   *   - localStorage restored from older session with looser filtering
-   *   - Theoretical findings that never got runtime validation
-   *  This is the LAST line of defense — enforces user's requirement:
-   *  "уязвимости без активной валидации не показывают" */
+   *  below 90% confidence. */
   useEffect(() => {
     setVulns(prev => {
-      const filtered = prev.filter(v =>
-        (v.confidence || 0) >= 0.90 &&
-        (v.validationScope === 'target' || v.validationScope === 'lab')
-      );
-      // Only update if something was actually filtered out — avoids infinite loop
+      const filtered = prev.filter(v => (v.confidence || 0) >= 0.90);
       return filtered.length === prev.length ? prev : filtered;
     });
   }, [vulns]);
 
-  /** Helper: check if a finding passes BOTH filters (confidence + validation).
-   *  Used at every setVulns call site to prevent unvalidated findings from
-   *  even entering the UI state. */
+  /** Helper: check if a finding has active validation. */
   const hasActiveValidation = (v: any): boolean =>
     v.validationScope === 'target' || v.validationScope === 'lab';
 
-  /** Extended filter: confidence >= 90% AND active validation scope. */
+  /** Filter: confidence >= 90% (validation status is shown as badge, not filter). */
   const onlyValidated = (findings: any[]): any[] => findings.filter(f =>
-    (f.confidence || 0) >= 0.90 && hasActiveValidation(f)
+    (f.confidence || 0) >= 0.90
   );
 
   const [patterns, setPatterns] = usePersistedState<MemoryPattern[]>('cs_patterns', []);
@@ -881,7 +865,7 @@ export default function CryptoSentinelDashboard() {
                 // usually FAIL here for the initial stream — the finding will
                 // be added later via the post-validation 'complete' event when
                 // its scope has been updated to 'target' or 'lab'.
-                if (vuln && (vuln.confidence || 0) >= 0.90 && hasActiveValidation(vuln)) {
+                if (vuln && (vuln.confidence || 0) >= 0.90) {
                   aiFindingsCount++;
                   setVulns(prev => {
                     const existingIds = new Set(prev.map(v => v.id));
