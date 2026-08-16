@@ -56,6 +56,14 @@ if ec != 0:
     print(f"ERROR: build failed (exit {ec})", file=sys.stderr)
     sys.exit(5)
 
+# IMPORTANT: when output: 'standalone' is set in next.config.ts, Next.js builds
+# the server bundle in .next/standalone but does NOT copy the static assets
+# (JS chunks, CSS, public/) into it. Without this copy step, every chunk
+# returns 404 and the browser shows "Page couldn't load".
+print("\n=== Step 8b: copy static into standalone ===", flush=True)
+run(f"cd {PROJECT_DIR} && cp -r .next/static .next/standalone/.next/ && cp -r public .next/standalone/ 2>&1 | tail -3", t=30)
+run(f"ls {PROJECT_DIR}/.next/standalone/.next/static/chunks/ 2>&1 | head -10", t=15)
+
 print("\n=== Step 9: restart PM2 ===", flush=True)
 run(f"pm2 restart cryptosentinel --update-env 2>&1 | tail -10", t=60)
 run("pm2 list", t=15)
