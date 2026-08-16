@@ -1,4 +1,4 @@
-module.exports=[40780,e=>{"use strict";let i="z-ai/glm-5.2",t="deepseek/deepseek-v4-pro-0813";async function a(e,t){let a,{apiKey:n,model:o,temperature:r=.1}=t;if(!n)throw Error("API key is required for GLM analysis");let s=t.timeoutMs||12e4,c=new AbortController,l=setTimeout(()=>c.abort(),s);try{a=await fetch("https://openrouter.ai/api/v1/chat/completions",{method:"POST",headers:{"Content-Type":"application/json",Authorization:`Bearer ${n}`,"HTTP-Referer":"https://cryptosentinel.app","X-Title":"CryptoSentinel"},body:JSON.stringify({model:o||i,messages:e,temperature:r}),signal:c.signal})}catch(e){if(clearTimeout(l),e instanceof Error&&"AbortError"===e.name)throw Error(`OpenRouter API request timed out after ${s/1e3}s. The model may be overloaded — try again or switch to a faster model (e.g. GLM 4.7 Flash).`);throw Error(`Network error reaching OpenRouter: ${e instanceof Error?e.message:String(e)}`)}if(clearTimeout(l),!a.ok){let e=await a.text().catch(()=>"");throw Error(function(e,i,t){let a="";try{let e=JSON.parse(i);a=e?.error?.message||e?.message||""}catch{a=i.slice(0,200)}switch(e){case 400:return`OpenRouter rejected the request (400 Bad Request${t?` for ${t}`:""}). ${a}`.trim();case 401:return'OpenRouter API key is invalid or missing (401). Get a valid key at https://openrouter.ai/keys — it must start with "sk-or-v1-".';case 402:return"OpenRouter credits exhausted (402 Payment Required). Add credits at https://openrouter.ai/credits.";case 403:return`OpenRouter denied access (403 Forbidden). The key may not have permission to use ${t}. ${a}`.trim();case 408:return"OpenRouter request timed out (408). The model may be overloaded — retry, or switch to a faster model.";case 429:return"OpenRouter rate limit hit (429 Too Many Requests). Wait a few seconds and retry.";case 500:case 502:case 503:case 504:return`OpenRouter upstream error (${e}). The model provider is having issues — retry in a moment. ${a}`.trim();default:return`OpenRouter API error (${e}): ${a||"Unknown error"}`}}(a.status,e,o||i))}let d=await a.json();if(!d.choices||0===d.choices.length)throw Error("No response from model");let u=d.choices[0].message,p=u.content;if(!p&&u.reasoning){let e=u.reasoning,i=e.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);i&&(e=i[1].trim());let t=e.match(/\[[\s\S]*\]/);p=t?t[0]:e}if(!p){if("length"===d.choices[0].finish_reason)throw Error("Model ran out of tokens. This should not happen with unlimited tokens — the model may have hit a context window limit. Try with a shorter input.");throw Error("Model returned empty response")}return{content:p,model:d.model||o,usage:d.usage}}async function n(e,i){return a(e,{...i,model:t,temperature:.2,maxTokens:8192,timeoutMs:3e4})}let o=`You are CryptoSentinel, an elite autonomous AI vulnerability scanner for smart contracts and crypto ecosystems. You perform HACKENPROOF-TIER deep scanning — not surface-level pattern matching. You combine CodeQL dataflow analysis, Semgrep pattern precision, formal verification reasoning, and DeFi economic attack modeling.
+module.exports=[40780,e=>{"use strict";let t="z-ai/glm-5.2",i="deepseek/deepseek-v4-pro-0813";async function a(e,i){let a,{apiKey:n,model:o,temperature:r=.1}=i;if(!n)throw Error("API key is required for GLM analysis");let s=i.timeoutMs||12e4,c=new AbortController,l=setTimeout(()=>c.abort(),s);try{a=await fetch("https://openrouter.ai/api/v1/chat/completions",{method:"POST",headers:{"Content-Type":"application/json",Authorization:`Bearer ${n}`,"HTTP-Referer":"https://cryptosentinel.app","X-Title":"CryptoSentinel"},body:JSON.stringify({model:o||t,messages:e,temperature:r}),signal:c.signal})}catch(e){if(clearTimeout(l),e instanceof Error&&"AbortError"===e.name)throw Error(`OpenRouter API request timed out after ${s/1e3}s. The model may be overloaded — try again or switch to a faster model (e.g. GLM 4.7 Flash).`);throw Error(`Network error reaching OpenRouter: ${e instanceof Error?e.message:String(e)}`)}if(clearTimeout(l),!a.ok){let e=await a.text().catch(()=>"");throw Error(function(e,t,i){let a="";try{let e=JSON.parse(t);a=e?.error?.message||e?.message||""}catch{a=t.slice(0,200)}switch(e){case 400:return`OpenRouter rejected the request (400 Bad Request${i?` for ${i}`:""}). ${a}`.trim();case 401:return'OpenRouter API key is invalid or missing (401). Get a valid key at https://openrouter.ai/keys — it must start with "sk-or-v1-".';case 402:return"OpenRouter credits exhausted (402 Payment Required). Add credits at https://openrouter.ai/credits.";case 403:return`OpenRouter denied access (403 Forbidden). The key may not have permission to use ${i}. ${a}`.trim();case 408:return"OpenRouter request timed out (408). The model may be overloaded — retry, or switch to a faster model.";case 429:return"OpenRouter rate limit hit (429 Too Many Requests). Wait a few seconds and retry.";case 500:case 502:case 503:case 504:return`OpenRouter upstream error (${e}). The model provider is having issues — retry in a moment. ${a}`.trim();default:return`OpenRouter API error (${e}): ${a||"Unknown error"}`}}(a.status,e,o||t))}let d=await a.json();if(!d.choices||0===d.choices.length)throw Error("No response from model");let u=d.choices[0].message,p=u.content;if(!p&&u.reasoning){let e=u.reasoning,t=e.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);t&&(e=t[1].trim());let i=e.match(/\[[\s\S]*\]/);p=i?i[0]:e}if(!p){if("length"===d.choices[0].finish_reason)throw Error("Model ran out of tokens. This should not happen with unlimited tokens — the model may have hit a context window limit. Try with a shorter input.");throw Error("Model returned empty response")}return{content:p,model:d.model||o,usage:d.usage}}async function n(e,t){return a(e,{...t,model:i,temperature:.2,maxTokens:8192,timeoutMs:3e4})}let o=`You are CryptoSentinel, an elite autonomous AI vulnerability scanner for smart contracts and crypto ecosystems. You perform HACKENPROOF-TIER deep scanning — not surface-level pattern matching. You combine CodeQL dataflow analysis, Semgrep pattern precision, formal verification reasoning, and DeFi economic attack modeling.
 
 You have UNLIMITED reasoning capacity. Take as long as needed to deeply analyze EVERY corner of the contract where vulnerabilities may hide.
 
@@ -286,10 +286,35 @@ You MUST distinguish three strictly different evidence tiers. Mixing them is the
    - "THEORETICAL" means no runtime validation was performed — static analysis / AI reasoning only.
    - Use the matching label exactly. Never write "[ACTIVE VALIDATION PASSED]" or "Exploit succeeded on local EVM" without the LAB-VALIDATED qualifier — those phrases imply target-level confirmation.
 
+8. You MUST prove each step of a smart contract exploit chain — DO NOT ASSUME:
+   A finding is only Tier 2 if ALL of these are proven:
+     a. SOURCE: identify the exact function + parameter that attacker controls
+     b. REACHABILITY: prove the function is callable (not behind onlyOwner, not internal)
+     c. STATE: prove the contract state required for the exploit exists (e.g., contract holds ETH for reentrancy drain)
+     d. EXECUTION: construct a CONCRETE exploit with specific parameter values, not hypothetical
+     e. IMPACT: quantify the financial impact (ETH amount, token amount)
+     f. ECONOMIC VIABILITY: for flash loan attacks, prove the attack is profitable after gas + MEV costs
+
+   If ANY step is unproven, DOWNGRADE or OMIT.
+
+9. For reentrancy findings, you MUST:
+   - Identify the EXACT external call that enables reentrancy (line number, function name)
+   - Show the state update that happens AFTER the external call (the window of vulnerability)
+   - Specify what the attacker's fallback function does during re-entry
+   - Calculate how much ETH/tokens can be drained per tx
+   - State whether nonReentrant modifier is present on OTHER functions that could be used for cross-function reentrancy
+
+10. For oracle/price manipulation findings, you MUST:
+    - Identify the exact oracle source (Chainlink, Uniswap TWAP, spot price)
+    - Calculate the capital required to manipulate the price (flash loan amount)
+    - Show the exact profit calculation: manipulated_price * borrowed_amount - flash_loan_fee - gas
+    - State whether TWAP is used (if yes, time-weighted manipulation cost is exponential)
+
 **STYLE:**
 - Use precise, technical language. State exactly what you observed and exactly what you did NOT observe.
 - Hedging is REQUIRED when the evidence is incomplete. "Likely", "probable", "appears to" are correct language when you have not proven the chain.
 - Do NOT use marketing words ("devastating", "severe" as adjectives — only use the severity enum value).
+- For each finding, include a "PROOF CHAIN" section listing each step (a-f above) with PROVEN or UNPROVEN status.
 
 IMPORTANT — REPORTING DISCIPLINE:
 - If you are NOT certain a vulnerability exists OR cannot construct a concrete exploit, DO NOT report it as Tier 2 or Tier 3.
@@ -325,9 +350,9 @@ Respond in JSON format as an array of vulnerabilities:
     "blockchainVerified": true/false,
     "onChainEvidence": "..."
   }
-]`;async function r(e,i,t,n){let r=`Analyze the following smart contract for vulnerabilities:
+]`;async function r(e,t,i,n){let r=`Analyze the following smart contract for vulnerabilities:
 
-Contract: ${i}
+Contract: ${t}
 \`\`\`solidity
 ${e}
 \`\`\`
@@ -337,7 +362,7 @@ ${n}
 Use this data to confirm or deny vulnerabilities. Update blockchainVerified and onChainEvidence fields accordingly.
 `);let s=[{role:"system",content:o},{role:"user",content:r+=`
 Identify all vulnerabilities. Think DEEPLY — you have unlimited reasoning capacity. Your FINAL output MUST be a valid JSON array — no markdown, no prose after the array. Output ONLY the JSON array:
-[{"title":"...","type":"...","severity":"...","location":"...","description":"...","validationSteps":"...","pocOutline":"...","v1Symbolic":0.0,"v2Fuzzing":0.0,"v3Formal":0.0,"v4Economic":0.0,"cwe":"...","blockchainVerified":false,"onChainEvidence":""}]`}],c=await a(s,{...t,temperature:.05});try{let e=c.content.trim(),t=e.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);t&&(e=t[1].trim());let a=e.match(/\[[\s\S]*\]/);a&&(e=a[0]);let n=JSON.parse(e);if(Array.isArray(n))return n.map(e=>({title:e.title||"Unknown Vulnerability",type:e.type||"unknown",severity:e.severity||"medium",location:e.location||`${i}:L1`,description:e.description||"No description provided",validationSteps:e.validationSteps||"Validation pending.",pocOutline:e.pocOutline||"",v1Symbolic:"number"==typeof e.v1Symbolic?e.v1Symbolic:.5,v2Fuzzing:"number"==typeof e.v2Fuzzing?e.v2Fuzzing:.5,v3Formal:"number"==typeof e.v3Formal?e.v3Formal:.5,v4Economic:"number"==typeof e.v4Economic?e.v4Economic:0,blockchainVerified:"boolean"==typeof e.blockchainVerified&&e.blockchainVerified,onChainEvidence:e.onChainEvidence||""}));return[]}catch{return console.error("Failed to parse GLM response as JSON, attempting text extraction..."),function(e,i){if(!e||e.length<50)return[];let t=[],a=/\b(critical|high|medium|low)\b/gi,n=/\b(reentrancy|oracle_manipulation|access_control|integer_overflow|flash_loan|front_running|delegatecall|storage_collision|unchecked_call|denial_of_service|business_logic|governance_hijack|info_exposure)\b/gi,o=e.split("\n"),r=null;for(let e of o){let o=e.match(/^\s*\d+\.\s*\**(.+?)\**\s*$/);if(o&&o[1].length>5){if(r&&r.lines.length>0){let e=r.lines.join("\n").trim(),o=e.match(a)?.[0]?.toLowerCase()||"medium",s=e.match(n)?.[0]?.toLowerCase()||"unknown";t.push({title:r.title,type:s,severity:["critical","high","medium","low"].includes(o)?o:"medium",location:`${i}:L1`,description:e.slice(0,2e3),validationSteps:"Extracted from AI reasoning text. Run structured analysis for detailed validation.",pocOutline:"",v1Symbolic:.6,v2Fuzzing:.5,v3Formal:.4,v4Economic:.2,blockchainVerified:!1,onChainEvidence:""})}r={title:o[1].trim(),lines:[]}}else r&&r.lines.push(e)}if(r&&r.lines.length>0){let e=r.lines.join("\n").trim(),o=e.match(a)?.[0]?.toLowerCase()||"medium",s=e.match(n)?.[0]?.toLowerCase()||"unknown";t.push({title:r.title,type:s,severity:["critical","high","medium","low"].includes(o)?o:"medium",location:`${i}:L1`,description:e.slice(0,2e3),validationSteps:"Extracted from AI reasoning text. Run structured analysis for detailed validation.",pocOutline:"",v1Symbolic:.6,v2Fuzzing:.5,v3Formal:.4,v4Economic:.2,blockchainVerified:!1,onChainEvidence:""})}if(0===t.length){let a=e.match(n);if(a)for(let e of[...new Set(a.map(e=>e.toLowerCase()))].slice(0,5))t.push({title:`AI detected: ${e.replace(/_/g," ")}`,type:e,severity:"reentrancy"===e?"critical":"medium",location:`${i}:L1`,description:`AI reasoning identified a potential ${e.replace(/_/g," ")} vulnerability. See reasoning text for details.`,validationSteps:"Extracted from AI reasoning. Run structured analysis for validation.",pocOutline:"",v1Symbolic:.5,v2Fuzzing:.4,v3Formal:.3,v4Economic:.1,blockchainVerified:!1,onChainEvidence:""})}let s=/\b(already detected|false positive|not (?:really|a )?vulnerability|not applicable|not exploitable|correct behavior|no risk|safe|secure|benign)\b/i,c=t.filter(e=>!s.test(e.title)&&!s.test(e.description));return console.log(`Extracted ${c.length} vulnerabilities from reasoning text (filtered from ${t.length})`),c.slice(0,8)}(c.content,i)}}async function s(e,i,t){let a="";e.blockchainVerified&&e.onChainEvidence&&(a=`
+[{"title":"...","type":"...","severity":"...","location":"...","description":"...","validationSteps":"...","pocOutline":"...","v1Symbolic":0.0,"v2Fuzzing":0.0,"v3Formal":0.0,"v4Economic":0.0,"cwe":"...","blockchainVerified":false,"onChainEvidence":""}]`}],c=await a(s,{...i,temperature:.05});try{let e=c.content.trim(),i=e.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);i&&(e=i[1].trim());let a=e.match(/\[[\s\S]*\]/);a&&(e=a[0]);let n=JSON.parse(e);if(Array.isArray(n))return n.map(e=>({title:e.title||"Unknown Vulnerability",type:e.type||"unknown",severity:e.severity||"medium",location:e.location||`${t}:L1`,description:e.description||"No description provided",validationSteps:e.validationSteps||"Validation pending.",pocOutline:e.pocOutline||"",v1Symbolic:"number"==typeof e.v1Symbolic?e.v1Symbolic:.5,v2Fuzzing:"number"==typeof e.v2Fuzzing?e.v2Fuzzing:.5,v3Formal:"number"==typeof e.v3Formal?e.v3Formal:.5,v4Economic:"number"==typeof e.v4Economic?e.v4Economic:0,blockchainVerified:"boolean"==typeof e.blockchainVerified&&e.blockchainVerified,onChainEvidence:e.onChainEvidence||""}));return[]}catch{return console.error("Failed to parse GLM response as JSON, attempting text extraction..."),function(e,t){if(!e||e.length<50)return[];let i=[],a=/\b(critical|high|medium|low)\b/gi,n=/\b(reentrancy|oracle_manipulation|access_control|integer_overflow|flash_loan|front_running|delegatecall|storage_collision|unchecked_call|denial_of_service|business_logic|governance_hijack|info_exposure)\b/gi,o=e.split("\n"),r=null;for(let e of o){let o=e.match(/^\s*\d+\.\s*\**(.+?)\**\s*$/);if(o&&o[1].length>5){if(r&&r.lines.length>0){let e=r.lines.join("\n").trim(),o=e.match(a)?.[0]?.toLowerCase()||"medium",s=e.match(n)?.[0]?.toLowerCase()||"unknown";i.push({title:r.title,type:s,severity:["critical","high","medium","low"].includes(o)?o:"medium",location:`${t}:L1`,description:e.slice(0,2e3),validationSteps:"Extracted from AI reasoning text. Run structured analysis for detailed validation.",pocOutline:"",v1Symbolic:.6,v2Fuzzing:.5,v3Formal:.4,v4Economic:.2,blockchainVerified:!1,onChainEvidence:""})}r={title:o[1].trim(),lines:[]}}else r&&r.lines.push(e)}if(r&&r.lines.length>0){let e=r.lines.join("\n").trim(),o=e.match(a)?.[0]?.toLowerCase()||"medium",s=e.match(n)?.[0]?.toLowerCase()||"unknown";i.push({title:r.title,type:s,severity:["critical","high","medium","low"].includes(o)?o:"medium",location:`${t}:L1`,description:e.slice(0,2e3),validationSteps:"Extracted from AI reasoning text. Run structured analysis for detailed validation.",pocOutline:"",v1Symbolic:.6,v2Fuzzing:.5,v3Formal:.4,v4Economic:.2,blockchainVerified:!1,onChainEvidence:""})}if(0===i.length){let a=e.match(n);if(a)for(let e of[...new Set(a.map(e=>e.toLowerCase()))].slice(0,5))i.push({title:`AI detected: ${e.replace(/_/g," ")}`,type:e,severity:"reentrancy"===e?"critical":"medium",location:`${t}:L1`,description:`AI reasoning identified a potential ${e.replace(/_/g," ")} vulnerability. See reasoning text for details.`,validationSteps:"Extracted from AI reasoning. Run structured analysis for validation.",pocOutline:"",v1Symbolic:.5,v2Fuzzing:.4,v3Formal:.3,v4Economic:.1,blockchainVerified:!1,onChainEvidence:""})}let s=/\b(already detected|false positive|not (?:really|a )?vulnerability|not applicable|not exploitable|correct behavior|no risk|safe|secure|benign)\b/i,c=i.filter(e=>!s.test(e.title)&&!s.test(e.description));return console.log(`Extracted ${c.length} vulnerabilities from reasoning text (filtered from ${i.length})`),c.slice(0,8)}(c.content,t)}}async function s(e,t,i){let a="";e.blockchainVerified&&e.onChainEvidence&&(a=`
 
 [BLOCKCHAIN-VERIFIED] This vulnerability IS confirmed on-chain. Evidence: ${e.onChainEvidence}
 Include this evidence in your enhancement.`);let o=[{role:"system",content:`You are a senior smart contract auditor. Provide a detailed, well-argued vulnerability analysis in HakenProof format. Be precise, technical, and include specific code references. Write in clear, professional English.
@@ -357,7 +382,7 @@ Current Description: ${e.description}${a}
 
 Source code context:
 \`\`\`solidity
-${i.slice(0,4e3)}
+${t.slice(0,4e3)}
 \`\`\`
 
 Provide a comprehensive vulnerability details section with:
@@ -365,7 +390,7 @@ Provide a comprehensive vulnerability details section with:
 2. Attack scenario step-by-step
 3. Impact assessment (financial, systemic)
 4. Recommended fix with code example
-5. References to SWC/EIP standards`}];return(await n(o,t)).content}let c=`You are CryptoSentinel, an elite autonomous AI vulnerability scanner specializing in crypto exchanges, DeFi frontends, and web3 applications. You perform HACKENPROOF-TIER deep scanning — not surface-level pattern matching.
+5. References to SWC/EIP standards`}];return(await n(o,i)).content}let c=`You are CryptoSentinel, an elite autonomous AI vulnerability scanner specializing in crypto exchanges, DeFi frontends, and web3 applications. You perform HACKENPROOF-TIER deep scanning — not surface-level pattern matching.
 
 You have UNLIMITED reasoning capacity. Take as long as needed to deeply analyze EVERY corner of the target where vulnerabilities may hide.
 
@@ -652,11 +677,47 @@ You MUST distinguish three strictly different evidence tiers. Mixing them is the
    - "THEORETICAL" means no runtime validation was performed.
    - When describing a finding, use the matching label exactly. Never write "[ACTIVE VALIDATION PASSED]" — use the specific scope label instead.
 
+9. You MUST prove each step of an exploit chain — DO NOT ASSUME:
+   A finding is only Tier 2 if ALL of these are proven, not assumed:
+     a. SOURCE: attacker-controlled input enters the system (prove the exact entry point)
+     b. REFERENCE: for cross-origin attacks (postMessage, iframe, popup), prove that an attacker can ACTUALLY obtain a reference to the target window in the real configuration. Check X-Frame-Options, CSP frame-ancestors, popup blocker behavior. If the target can't be framed, say so — the popup variant may still work but must be documented separately.
+     c. DELIVERY: prove the message/payload actually reaches the handler (not blocked by origin check, CORS, etc.)
+     d. EXECUTION: prove that the payload executes — do NOT assume innerHTML = XSS. <script> tags inserted via innerHTML do NOT execute in modern browsers. Only event handlers (onerror, onload, onclick) and javascript: URIs execute via innerHTML. State which specific payload type you use and why it executes.
+     e. ORIGIN: prove that execution happens in the target's origin context, not just "in the page". If you can't prove this experimentally, say "execution in target origin is expected but not experimentally verified."
+     f. IMPACT: prove what data is accessible from the execution context. Don't assume API_KEY is accessible — verify it's in scope. Don't assume cookies are accessible — check httpOnly flag.
+
+   If ANY step (a-f) is unproven, the finding MUST be downgraded:
+     - All 6 steps proven → Tier 2, severity based on actual impact
+     - 4-5 steps proven → Tier 1 with "partially proven chain" note, severity LOW
+     - <4 steps proven → OMIT the finding entirely
+
+10. innerHTML execution rules — you MUST know these:
+    - <script>alert(1)</script> inserted via innerHTML: DOES NOT EXECUTE in any modern browser
+    - <img src=x onerror=alert(1)> inserted via innerHTML: EXECUTES (event handler)
+    - <svg onload=alert(1)> inserted via innerHTML: EXECUTES (event handler)
+    - <body onload=alert(1)> inserted via innerHTML: DOES NOT EXECUTE (body is already loaded)
+    - <iframe src=javascript:alert(1)> inserted via innerHTML: DOES NOT EXECUTE in modern browsers
+    - When claiming XSS via innerHTML, you MUST specify which payload type executes and why
+
+11. Secrets in reports — MASK sensitive values:
+    - If you find a hardcoded API key like "sk-live-abc123def456", in the report write: sk-live-abc***def*** (masked)
+    - Do NOT include the full secret value in the description field
+    - The PoC should demonstrate that the script CAN READ the secret, not exfiltrate the actual value
+    - Example: "PoC reads API_KEY variable and sends SHA256 hash to attacker server — proving secret access without exposing the secret itself"
+
+12. Cross-origin / postMessage findings — ADDITIONAL proof requirements:
+    - You MUST check if X-Frame-Options or CSP frame-ancestors prevents framing
+    - If framing is blocked, document the popup variant: window.open() + postMessage
+    - State which delivery mechanism works: iframe, popup, or neither
+    - If NEITHER works (both blocked), DOWNGRADE to Tier 1 — the postMessage handler is vulnerable but not reachable
+    - Do NOT write "any origin that can obtain a reference" — instead write "an attacker can obtain a reference via [popup/iframe] because [specific reason why it's not blocked]"
+
 **STYLE:**
 - Use precise, technical language. Avoid marketing words ("devastating", "critical", "severe" as adjectives — only use them as the severity enum value).
 - State exactly what you observed and exactly what you did NOT observe.
 - If you cannot complete a Tier 2 chain, say so explicitly: "Source and sink identified, but no proven dataflow between them — downgrade to Tier 1 observation."
 - Hedging is REQUIRED when the evidence is incomplete. "Likely", "probable", "appears to" are correct language when you have not proven the chain.
+- For each finding, include a "PROOF CHAIN" section listing each step (a-f above) with PROVEN or UNPROVEN status.
 
 Focus on real, exploitable vulnerabilities. A small number of high-confidence findings is FAR more valuable than a large number of speculative ones. If you only find 1-2 truly confirmed vulnerabilities, that is a successful analysis.
 
@@ -678,14 +739,14 @@ Respond in JSON format as an array:
     "blockchainVerified": false,
     "onChainEvidence": ""
   }
-]`;async function l(e,i,t){let n=[{role:"system",content:c},{role:"user",content:`Analyze the following crypto exchange/web application for security vulnerabilities:
+]`;async function l(e,t,i){let n=[{role:"system",content:c},{role:"user",content:`Analyze the following crypto exchange/web application for security vulnerabilities:
 
-Target: ${i}
+Target: ${t}
 \`\`\`
 ${e.slice(0,3e4)}
 \`\`\`
 
-Identify all security vulnerabilities. Think DEEPLY. Respond with the JSON array.`}],o=await a(n,{...t,temperature:.05});try{let e=o.content.trim(),t=e.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);t&&(e=t[1].trim());let a=e.match(/\[[\s\S]*\]/);a&&(e=a[0]);let n=JSON.parse(e);if(Array.isArray(n))return n.map(e=>({title:e.title||"Unknown Vulnerability",type:e.type||"unknown",severity:e.severity||"medium",location:e.location||`${i}`,description:e.description||"No description provided",validationSteps:e.validationSteps||"Validation pending.",pocOutline:e.pocOutline||"",v1Symbolic:"number"==typeof e.v1Symbolic?e.v1Symbolic:.5,v2Fuzzing:"number"==typeof e.v2Fuzzing?e.v2Fuzzing:.5,v3Formal:"number"==typeof e.v3Formal?e.v3Formal:.5,v4Economic:"number"==typeof e.v4Economic?e.v4Economic:0,blockchainVerified:"boolean"==typeof e.blockchainVerified&&e.blockchainVerified,onChainEvidence:e.onChainEvidence||""}));return[]}catch{return console.error("Failed to parse web analysis response as JSON:",o.content),[]}}async function d(e,i,t,n){let o=[{role:"system",content:`You are a blockchain security verification agent. Your job is to CONFIRM or DENY vulnerability reports using on-chain evidence. Think deeply — this is the most critical step. You have unlimited reasoning capacity.
+Identify all security vulnerabilities. Think DEEPLY. Respond with the JSON array.`}],o=await a(n,{...i,temperature:.05});try{let e=o.content.trim(),i=e.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);i&&(e=i[1].trim());let a=e.match(/\[[\s\S]*\]/);a&&(e=a[0]);let n=JSON.parse(e);if(Array.isArray(n))return n.map(e=>({title:e.title||"Unknown Vulnerability",type:e.type||"unknown",severity:e.severity||"medium",location:e.location||`${t}`,description:e.description||"No description provided",validationSteps:e.validationSteps||"Validation pending.",pocOutline:e.pocOutline||"",v1Symbolic:"number"==typeof e.v1Symbolic?e.v1Symbolic:.5,v2Fuzzing:"number"==typeof e.v2Fuzzing?e.v2Fuzzing:.5,v3Formal:"number"==typeof e.v3Formal?e.v3Formal:.5,v4Economic:"number"==typeof e.v4Economic?e.v4Economic:0,blockchainVerified:"boolean"==typeof e.blockchainVerified&&e.blockchainVerified,onChainEvidence:e.onChainEvidence||""}));return[]}catch{return console.error("Failed to parse web analysis response as JSON:",o.content),[]}}async function d(e,t,i,n){let o=[{role:"system",content:`You are a blockchain security verification agent. Your job is to CONFIRM or DENY vulnerability reports using on-chain evidence. Think deeply — this is the most critical step. You have unlimited reasoning capacity.
 
 Given a vulnerability report and blockchain data, determine:
 1. Is the vulnerability REAL? (not theoretical — actually exploitable on-chain)
@@ -708,12 +769,12 @@ Description: ${e.description}
 
 SOURCE CODE:
 \`\`\`solidity
-${i.slice(0,3e3)}
+${t.slice(0,3e3)}
 \`\`\`
 
 BLOCKCHAIN DATA:
-${t}
+${i}
 
-Analyze the on-chain evidence and determine if this vulnerability is confirmed. Think deeply.`}],r=await a(o,{...n,temperature:.05});try{let e=r.content.trim(),i=e.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);i&&(e=i[1].trim());let t=e.match(/\{[\s\S]*\}/);t&&(e=t[0]);let a=JSON.parse(e);return{confirmed:"boolean"==typeof a.confirmed&&a.confirmed,evidence:a.evidence||"No evidence provided",updatedSeverity:a.updatedSeverity||void 0,confidence:"number"==typeof a.confidence?a.confidence:.5}}catch{return{confirmed:!1,evidence:"Verification failed — could not parse AI response",confidence:.5}}}e.s(["DEEPSEEK_MODEL",0,t,"DEFAULT_MODEL",0,i,"analyzeWebWithGLM",0,l,"analyzeWithGLM",0,r,"enhanceVulnerabilityDescription",0,s,"verifyVulnerabilityOnChain",0,d])}];
+Analyze the on-chain evidence and determine if this vulnerability is confirmed. Think deeply.`}],r=await a(o,{...n,temperature:.05});try{let e=r.content.trim(),t=e.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);t&&(e=t[1].trim());let i=e.match(/\{[\s\S]*\}/);i&&(e=i[0]);let a=JSON.parse(e);return{confirmed:"boolean"==typeof a.confirmed&&a.confirmed,evidence:a.evidence||"No evidence provided",updatedSeverity:a.updatedSeverity||void 0,confidence:"number"==typeof a.confidence?a.confidence:.5}}catch{return{confirmed:!1,evidence:"Verification failed — could not parse AI response",confidence:.5}}}e.s(["DEEPSEEK_MODEL",0,i,"DEFAULT_MODEL",0,t,"analyzeWebWithGLM",0,l,"analyzeWithGLM",0,r,"enhanceVulnerabilityDescription",0,s,"verifyVulnerabilityOnChain",0,d])}];
 
 //# sourceMappingURL=src_lib_glm_ts_07a5-32._.js.map
