@@ -594,7 +594,7 @@ export async function POST(req: NextRequest) {
             if (r._validationResult === 'failed' && r.confidence < MIN_CONFIDENCE_THRESHOLD && !r._deleted) {
               r._deleted = true;
               // Delete from DB and remove from results
-              try { await db.vulnerability.delete({ where: { id: r.id } }).catch(() => {}); } catch {}
+              try { await db.vulnerability.deleteMany({ where: { id: r.id } }); } catch {}
               aiResults.splice(i, 1);
             }
           }
@@ -660,7 +660,7 @@ export async function POST(req: NextRequest) {
       if ((r.confidence || 0) < MIN_CONFIDENCE_THRESHOLD && !r._deleted) {
         r._deleted = true;
         // Delete from DB and remove from results
-        try { await db.vulnerability.delete({ where: { id: r.id } }).catch(() => {}); } catch {}
+        try { await db.vulnerability.deleteMany({ where: { id: r.id } }); } catch {}
         allResults.splice(i, 1);
       }
     }
@@ -1011,7 +1011,7 @@ async function runAIOnlyPhase(
           const r = aiResults[i] as any;
           if (r._validationResult === 'failed' && r.confidence < MIN_CONFIDENCE_THRESHOLD && !r._deleted) {
             r._deleted = true;
-            try { await db.vulnerability.delete({ where: { id: r.id } }).catch(() => {}); } catch {}
+            try { await db.vulnerability.deleteMany({ where: { id: r.id } }); } catch {}
             aiResults.splice(i, 1);
           }
         }
@@ -1029,7 +1029,7 @@ async function runAIOnlyPhase(
       const r = aiResults[i] as any;
       if ((r.confidence || 0) < MIN_CONFIDENCE_THRESHOLD && !r._deleted) {
         r._deleted = true;
-        try { await db.vulnerability.delete({ where: { id: r.id } }).catch(() => {}); } catch {}
+        try { await db.vulnerability.deleteMany({ where: { id: r.id } }); } catch {}
         aiResults.splice(i, 1);
       }
     }

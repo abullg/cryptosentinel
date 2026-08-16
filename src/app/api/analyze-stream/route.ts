@@ -235,7 +235,7 @@ export async function POST(req: NextRequest) {
         // Delete dropped findings from DB
         for (const r of staticResults) {
           if ((r.confidence || 0) < 0.90) {
-            try { await db.vulnerability.delete({ where: { id: r.id } }).catch(() => {}); } catch {}
+            try { await db.vulnerability.deleteMany({ where: { id: r.id } }); } catch {}
           }
         }
 
@@ -463,7 +463,7 @@ export async function POST(req: NextRequest) {
             const r = aiResults[i] as any;
             if (r._validationResult === 'failed' && (r.confidence || 0) < 0.90 && !r._deleted) {
               r._deleted = true;
-              try { await db.vulnerability.delete({ where: { id: r.id } }).catch(() => {}); } catch {}
+              try { await db.vulnerability.deleteMany({ where: { id: r.id } }); } catch {}
               aiResults.splice(i, 1);
             }
           }
@@ -479,7 +479,7 @@ export async function POST(req: NextRequest) {
         for (const r of allResultsRaw) {
           if ((r.confidence || 0) < 0.90 && !r._deleted) {
             r._deleted = true;
-            try { await db.vulnerability.delete({ where: { id: r.id } }).catch(() => {}); } catch {}
+            try { await db.vulnerability.deleteMany({ where: { id: r.id } }); } catch {}
           }
         }
         try {
