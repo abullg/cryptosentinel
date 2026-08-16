@@ -13,7 +13,7 @@
  * WEB/MOBILE: HTTP-based payload testing against the production target.
  */
 
-import { writeFileSync, mkdirSync, rmSync } from 'fs';
+import { writeFileSync, mkdirSync, rmSync, existsSync, symlinkSync } from 'fs';
 import { join } from 'path';
 import { execSync } from 'child_process';
 
@@ -394,10 +394,33 @@ async function validateWithFoundry(
     writeFileSync(join(tmpDir, 'test', 'PoC.t.sol'), generatePoCTest(sourceCode, actualName, vuln));
     writeFileSync(join(tmpDir, 'foundry.toml'), `[profile.default]\nsrc="src"\nout="out"\nlibs=["lib"]\nsolc_version="0.8.20"\noptimizer=true\n`);
 
-    try { execSync('git init && git add -A && git commit -m init', { cwd: tmpDir, timeout: 10_000, stdio: 'pipe' }); } catch {}
-    execSync('forge install foundry-rs/forge-std --no-commit --no-git', { cwd: tmpDir, timeout: 30_000, stdio: 'pipe' });
+    // CRITICAL PERFORMANCE OPTIMIZATION: cache forge-std globally.
+    // `forge install foundry-rs/forge-std` downloads ~50MB from GitHub every
+    // single time it runs. With 5 findings × 30s timeout = 2.5 minutes just
+    // for forge-std downloads. We cache it once in /opt/forge-lib/forge-std
+    // and symlink it into each test directory. Download happens once at
+    // server startup; subsequent tests reuse the symlink.
+    const FORGE_STD_CACHE = '/opt/forge-lib/forge-std';
+    const forgeStdLink = join(tmpDir, 'lib', 'forge-std');
+    try {
+      mkdirSync(join(tmpDir, 'lib'), { recursive: true });
+      if (existsSync(FORGE_STD_CACHE)) {
+        // Symlink the cached forge-std — instant, no download
+        try { symlinkSync(FORGE_STD_CACHE, forgeStdLink, 'dir'); } catch {}
+      } else {
+        // First run — do the slow install once, then cache it
+        try {
+          execSync('git init && git add -A && git commit -m init', { cwd: tmpDir, timeout: 5_000, stdio: 'pipe' });
+        } catch {}
+        try {
+          execSync('forge install foundry-rs/forge-std --no-commit --no-git', { cwd: tmpDir, timeout: 30_000, stdio: 'pipe' });
+          // Cache for future use
+          try { mkdirSync('/opt/forge-lib', { recursive: true }); execSync(`cp -r ${forgeStdLink} ${FORGE_STD_CACHE}`, { timeout: 10_000, stdio: 'pipe' }); } catch {}
+        } catch {}
+      }
+    } catch {}
 
-    const result = execSync('forge test -vvv 2>&1', { cwd: tmpDir, timeout: 60_000, encoding: 'utf-8', stdio: 'pipe' });
+    const result = execSync('forge test -vvv 2>&1', { cwd: tmpDir, timeout: 45_000, encoding: 'utf-8', stdio: 'pipe' });
     const passed = result.includes('[PASS]') || result.includes('SUCCESS');
     const gasMatch = result.match(/(\d+)\s+gas/);
 

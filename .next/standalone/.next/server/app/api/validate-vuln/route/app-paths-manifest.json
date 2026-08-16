@@ -1,0 +1,3 @@
+{
+  "/api/validate-vuln/route": "app/api/validate-vuln/route.js"
+}

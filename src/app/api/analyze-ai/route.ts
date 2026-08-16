@@ -526,7 +526,7 @@ export async function POST(req: NextRequest) {
                     { title: v.title, type: v.type, severity: v.severity, description: v.description, location: v.location },
                     apiKey, model
                   ),
-                  300_000,
+                  60_000,
                   'Active validation (target+lab)'
                 );
                 if (verification.confirmed) {
@@ -591,7 +591,8 @@ export async function POST(req: NextRequest) {
           // should be removed from results — it's effectively refuted.
           for (let i = aiResults.length - 1; i >= 0; i--) {
             const r = aiResults[i] as any;
-            if (r._validationResult === 'failed' && r.confidence < MIN_CONFIDENCE_THRESHOLD) {
+            if (r._validationResult === 'failed' && r.confidence < MIN_CONFIDENCE_THRESHOLD && !r._deleted) {
+              r._deleted = true;
               // Delete from DB and remove from results
               try { await db.vulnerability.delete({ where: { id: r.id } }).catch(() => {}); } catch {}
               aiResults.splice(i, 1);
@@ -655,8 +656,9 @@ export async function POST(req: NextRequest) {
     // low-confidence ones.
     const preFilterCount = allResults.length;
     for (let i = allResults.length - 1; i >= 0; i--) {
-      const r = allResults[i];
-      if ((r.confidence || 0) < MIN_CONFIDENCE_THRESHOLD) {
+      const r = allResults[i] as any;
+      if ((r.confidence || 0) < MIN_CONFIDENCE_THRESHOLD && !r._deleted) {
+        r._deleted = true;
         // Delete from DB and remove from results
         try { await db.vulnerability.delete({ where: { id: r.id } }).catch(() => {}); } catch {}
         allResults.splice(i, 1);
@@ -954,7 +956,7 @@ async function runAIOnlyPhase(
                   contractName || 'Contract',
                   { title: v.title, type: v.type, severity: v.severity, description: v.description, location: v.location },
                 ),
-                300_000, 'Active validation (target+lab)'  
+                60_000, 'Active validation (target+lab)'  
               );
               if (verification.confirmed) {
                 const scope = verification.validationScope || 'lab';
@@ -1007,7 +1009,8 @@ async function runAIOnlyPhase(
         // Post-validation filter: remove failed findings below threshold
         for (let i = aiResults.length - 1; i >= 0; i--) {
           const r = aiResults[i] as any;
-          if (r._validationResult === 'failed' && r.confidence < MIN_CONFIDENCE_THRESHOLD) {
+          if (r._validationResult === 'failed' && r.confidence < MIN_CONFIDENCE_THRESHOLD && !r._deleted) {
+            r._deleted = true;
             try { await db.vulnerability.delete({ where: { id: r.id } }).catch(() => {}); } catch {}
             aiResults.splice(i, 1);
           }
@@ -1023,8 +1026,9 @@ async function runAIOnlyPhase(
     // active validation in Step 4) is below 90%.
     const preFilterCountAI = aiResults.length;
     for (let i = aiResults.length - 1; i >= 0; i--) {
-      const r = aiResults[i];
-      if ((r.confidence || 0) < MIN_CONFIDENCE_THRESHOLD) {
+      const r = aiResults[i] as any;
+      if ((r.confidence || 0) < MIN_CONFIDENCE_THRESHOLD && !r._deleted) {
+        r._deleted = true;
         try { await db.vulnerability.delete({ where: { id: r.id } }).catch(() => {}); } catch {}
         aiResults.splice(i, 1);
       }

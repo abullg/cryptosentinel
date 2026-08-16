@@ -458,9 +458,11 @@ export async function POST(req: NextRequest) {
           }
 
           // Remove failed findings that dropped below 90%
+          // Mark as _deleted to avoid double-delete in the second pass below
           for (let i = aiResults.length - 1; i >= 0; i--) {
             const r = aiResults[i] as any;
-            if (r._validationResult === 'failed' && (r.confidence || 0) < 0.90) {
+            if (r._validationResult === 'failed' && (r.confidence || 0) < 0.90 && !r._deleted) {
+              r._deleted = true;
               try { await db.vulnerability.delete({ where: { id: r.id } }).catch(() => {}); } catch {}
               aiResults.splice(i, 1);
             }
@@ -471,9 +473,12 @@ export async function POST(req: NextRequest) {
         // Use filteredStaticResults (already filtered in phase 1) instead of raw staticResults
         const allResultsRaw = [...filteredStaticResults, ...aiResults];
         const allResults = allResultsRaw.filter((r: any) => (r.confidence || 0) >= 0.90);
-        // Delete dropped findings from DB (AI findings that failed validation)
+        // Delete dropped findings from DB — but only those not already deleted above
+        // (the previous loop marked them _deleted=true). Without this check, Prisma
+        // errors spam the logs: "No record was found for a delete."
         for (const r of allResultsRaw) {
-          if ((r.confidence || 0) < 0.90) {
+          if ((r.confidence || 0) < 0.90 && !r._deleted) {
+            r._deleted = true;
             try { await db.vulnerability.delete({ where: { id: r.id } }).catch(() => {}); } catch {}
           }
         }
