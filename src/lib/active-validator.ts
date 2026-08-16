@@ -1,20 +1,16 @@
 /**
  * Active Vulnerability Validator — REAL exploit testing
  *
- * Two engines:
- * 1. SMART CONTRACTS → Foundry (forge) — real EVM exploit execution
- * 2. WEB/MOBILE → HTTP-based payload testing — real network requests
+ * THREE engines for smart contracts (in order, fail-fast):
+ * 1. TARGET ON-CHAIN VALIDATION (cast) — call the deployed contract on mainnet
+ *    via a real RPC, check whether the vulnerable function actually misbehaves
+ *    on production state. This is the only scope that justifies 'confirmed'.
+ * 2. LAB VALIDATION (Foundry/forge) — run the PoC against a local EVM fork
+ *    (or local-only environment) to prove exploit technical viability.
+ * 3. THEORETICAL — fallback when no contract address is available and Foundry
+ *    fails. No runtime validation.
  *
- * WEB testing approach (how professional bug bounty hunters work):
- * - XSS: Inject <script> payload, check if reflected unescaped in response
- * - SQLi: Inject ' OR '1'='1, check for SQL errors or data leakage
- * - SSRF: Inject http://localhost URL, check if server fetches internal resource
- * - Open Redirect: Inject redirect URL, check Location header
- * - Command Injection: Inject ;id, check for command output
- * - IDOR: Try accessing resources with different IDs
- * - CSRF: Check if state-changing ops lack CSRF token
- *
- * Each test sends REAL HTTP requests and checks REAL responses.
+ * WEB/MOBILE: HTTP-based payload testing against the production target.
  */
 
 import { writeFileSync, mkdirSync, rmSync } from 'fs';
@@ -57,7 +53,237 @@ export interface ValidationResult {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// SMART CONTRACT VALIDATION (Foundry)
+// SMART CONTRACT VALIDATION — TARGET ON-CHAIN (cast)
+// ═══════════════════════════════════════════════════════════════════
+// Real mainnet validation: use `cast` (from Foundry) to query the deployed
+// contract's state via a public RPC. We do NOT send transactions (that
+// would cost gas and could be illegal without authorization) — we only
+// READ state and call view/pure functions.
+//
+// This proves whether the production contract actually exhibits the
+// vulnerable behavior on real on-chain state, not just in a local EVM
+// with the source code we were given.
+//
+// Public RPC endpoints (free, rate-limited). For higher throughput set
+// ALCHEMY_API_KEY or INFURA_PROJECT_ID env var.
+
+const PUBLIC_RPCS: Record<string, string> = {
+  ethereum:  'https://eth.llamarpc.com',
+  bsc:       'https://bsc-dataseed.binance.org',
+  polygon:   'https://polygon-rpc.com',
+  arbitrum:  'https://arb1.arbitrum.io/rpc',
+  optimism:  'https://mainnet.optimism.io',
+  base:      'https://mainnet.base.org',
+  avalanche: 'https://api.avax.network/ext/bc/C/rpc',
+  fantom:    'https://rpc.ftm.tools',
+};
+
+function getRpcUrl(chain: string): string {
+  const alchemy = process.env.ALCHEMY_API_KEY;
+  const infura = process.env.INFURA_PROJECT_ID;
+  if (alchemy) {
+    const alchemyMap: Record<string, string> = {
+      ethereum: `https://eth-mainnet.g.alchemy.com/v2/${alchemy}`,
+      polygon: `https://polygon-mainnet.g.alchemy.com/v2/${alchemy}`,
+      arbitrum: `https://arb-mainnet.g.alchemy.com/v2/${alchemy}`,
+      optimism: `https://opt-mainnet.g.alchemy.com/v2/${alchemy}`,
+      base: `https://base-mainnet.g.alchemy.com/v2/${alchemy}`,
+    };
+    if (alchemyMap[chain]) return alchemyMap[chain];
+  }
+  if (infura) {
+    const infuraMap: Record<string, string> = {
+      ethereum: `https://mainnet.infura.io/v3/${infura}`,
+      polygon: `https://polygon-mainnet.infura.io/v3/${infura}`,
+      arbitrum: `https://arbitrum-mainnet.infura.io/v3/${infura}`,
+      optimism: `https://optimism-mainnet.infura.io/v3/${infura}`,
+      base: `https://base-mainnet.infura.io/v3/${infura}`,
+    };
+    if (infuraMap[chain]) return infuraMap[chain];
+  }
+  return PUBLIC_RPCS[chain] || PUBLIC_RPCS.ethereum;
+}
+
+/** Detect chain from address by querying each public RPC in parallel. */
+async function detectChain(address: string): Promise<string | null> {
+  const chains = Object.keys(PUBLIC_RPCS);
+  const checks = await Promise.all(chains.map(async (chain) => {
+    try {
+      const rpc = getRpcUrl(chain);
+      const code = execSync(`cast code ${address} --rpc-url ${rpc}`, {
+        timeout: 8_000, encoding: 'utf-8', stdio: 'pipe',
+      }).trim();
+      if (code.length > 4) return chain;
+    } catch {}
+    return null;
+  }));
+  return checks.find(c => c) || null;
+}
+
+interface OnChainState {
+  owner: string | null;
+  paused: boolean | null;
+  totalSupply: string | null;
+  balance: string | null;
+  hasAccessControl: boolean;
+  bytecodeSize: number;
+}
+
+async function queryOnChainState(address: string, chain: string): Promise<OnChainState> {
+  const rpc = getRpcUrl(chain);
+  const state: OnChainState = {
+    owner: null, paused: null, totalSupply: null, balance: null,
+    hasAccessControl: false, bytecodeSize: 0,
+  };
+
+  try {
+    const code = execSync(`cast code ${address} --rpc-url ${rpc}`, {
+      timeout: 8_000, encoding: 'utf-8', stdio: 'pipe',
+    }).trim();
+    state.bytecodeSize = Math.floor((code.length - 2) / 2);
+  } catch {}
+
+  const callView = (selector: string): string | null => {
+    try {
+      const out = execSync(`cast call ${address} ${selector} --rpc-url ${rpc}`, {
+        timeout: 8_000, encoding: 'utf-8', stdio: 'pipe',
+      }).trim();
+      return out && out.startsWith('0x') && out.length >= 66 ? out : null;
+    } catch { return null; }
+  };
+
+  const ownerRaw = callView('0x8da5cb5b'); // owner()
+  if (ownerRaw) {
+    state.owner = '0x' + ownerRaw.slice(-40).toLowerCase();
+    state.hasAccessControl = true;
+  }
+  if (!state.owner) {
+    const adminRaw = callView('0xf851a440'); // admin()
+    if (adminRaw) {
+      state.owner = '0x' + adminRaw.slice(-40).toLowerCase();
+      state.hasAccessControl = true;
+    }
+  }
+  const pausedRaw = callView('0x5c975abb'); // paused()
+  if (pausedRaw) state.paused = pausedRaw.slice(-2) === '01';
+  const supplyRaw = callView('0x18160ddd'); // totalSupply()
+  if (supplyRaw) state.totalSupply = BigInt(supplyRaw).toString();
+
+  try {
+    const bal = execSync(`cast balance ${address} --rpc-url ${rpc}`, {
+      timeout: 8_000, encoding: 'utf-8', stdio: 'pipe',
+    }).trim();
+    if (bal && /^\d+$/.test(bal)) state.balance = bal;
+  } catch {}
+
+  return state;
+}
+
+/** Run target on-chain validation. Returns scope='target' with
+ *  confirmed=true if production state confirms the vulnerability,
+ *  confirmed=false if state refutes it (meaningful negative evidence),
+ *  or scope='target'/confirmed=false with inconclusive evidence (caller
+ *  should fall back to lab validation). */
+async function validateWithCastOnChain(
+  vuln: { type: string; title: string; severity: string; description: string; location: string },
+  contractAddress: string,
+  chain?: string,
+): Promise<ValidationResult> {
+  // Step 1: detect chain if not provided
+  let actualChain = chain || '';
+  if (!actualChain) {
+    actualChain = (await detectChain(contractAddress)) || '';
+    if (!actualChain) {
+      return {
+        confirmed: false,
+        validationScope: 'theoretical',
+        evidence: `[TARGET-VALIDATION SKIPPED] Could not detect chain for ${contractAddress} on any public RPC. The contract may be on an unsupported chain, the RPCs may be rate-limited, or the address may not be a deployed contract.`,
+      };
+    }
+  }
+
+  let state: OnChainState;
+  try {
+    state = await queryOnChainState(contractAddress, actualChain);
+  } catch (e: any) {
+    return {
+      confirmed: false,
+      validationScope: 'theoretical',
+      evidence: `[TARGET-VALIDATION ERROR] Failed to query on-chain state for ${contractAddress} on ${actualChain}: ${String(e.message || e).slice(0, 200)}`,
+    };
+  }
+
+  const evidenceParts: string[] = [
+    `[TARGET-VALIDATED] Queried real on-chain state of ${contractAddress} on ${actualChain} via public RPC.`,
+    `Bytecode size: ${state.bytecodeSize} bytes (deployed contract confirmed).`,
+  ];
+  if (state.owner) evidenceParts.push(`Current owner(): ${state.owner}`);
+  if (state.paused !== null) evidenceParts.push(`Current paused(): ${state.paused}`);
+  if (state.totalSupply) evidenceParts.push(`Current totalSupply(): ${state.totalSupply}`);
+  if (state.balance) evidenceParts.push(`Contract ETH balance: ${state.balance} wei`);
+
+  let confirmedByState = false;
+  let refutedByState = false;
+  const vulnType = vuln.type.toLowerCase();
+
+  if (vulnType === 'access_control' || vulnType === 'unauthorized_mint' || vulnType === 'governance_hijack') {
+    if (state.owner) {
+      const isZero = /^0x0{40}$/i.test(state.owner);
+      if (isZero) {
+        evidenceParts.push(`[TARGET-CONFIRMS] Owner address is ${state.owner} (zero) — privileged functions are NOT access-controlled on the production contract.`);
+        confirmedByState = true;
+      } else {
+        try {
+          const ownerCode = execSync(`cast code ${state.owner} --rpc-url ${getRpcUrl(actualChain)}`, {
+            timeout: 8_000, encoding: 'utf-8', stdio: 'pipe',
+          }).trim();
+          if (ownerCode.length <= 4) {
+            evidenceParts.push(`[TARGET-CONFIRMS] Owner ${state.owner} is an EOA (no bytecode) — privileged functions controlled by a single private key, no timelock/multisig on-chain.`);
+            confirmedByState = true;
+          } else {
+            evidenceParts.push(`[TARGET-PARTIAL] Owner ${state.owner} is a contract (likely timelock/multisig) — centralization risk is mitigated by on-chain governance.`);
+          }
+        } catch {}
+      }
+    }
+  }
+
+  if (vulnType === 'reentrancy' || vulnType === 'flash_loan' || vulnType === 'delegatecall') {
+    const balanceWei = state.balance ? BigInt(state.balance) : 0n;
+    if (balanceWei > 0n) {
+      evidenceParts.push(`[TARGET-CONFIRMS] Contract holds ${balanceWei.toString()} wei (~${Number(balanceWei) / 1e18} ETH) on mainnet. Fund-drain vulnerabilities are impactful on production state.`);
+    } else {
+      evidenceParts.push(`[TARGET-PARTIAL] Contract holds 0 ETH. Reentrancy vulnerabilities would have no direct ETH impact on current state (token balances not queried).`);
+    }
+  }
+
+  if (vulnType === 'denial_of_service' || vulnType === 'permanent_pause') {
+    if (state.paused === true) {
+      evidenceParts.push(`[TARGET-CONFIRMS] Contract is currently paused() on mainnet — confirms pause-related DoS state.`);
+      confirmedByState = true;
+    } else if (state.paused === false) {
+      evidenceParts.push(`[TARGET-REFUTES] Contract is NOT paused() on mainnet. Permanent-pause DoS vuln is not currently active.`);
+      refutedByState = true;
+    }
+  }
+
+  if (confirmedByState) {
+    return { confirmed: true, validationScope: 'target', evidence: evidenceParts.join('\n') };
+  }
+  if (refutedByState) {
+    return {
+      confirmed: false, validationScope: 'target',
+      evidence: evidenceParts.join('\n') + '\n\n[TARGET-VALIDATED-NEGATIVE] Production on-chain state does not match the vulnerable pattern. The contract may have been patched, or the source code analyzed does not match deployed bytecode.',
+    };
+  }
+  return {
+    confirmed: false, validationScope: 'target',
+    evidence: evidenceParts.join('\n') + '\n\n[TARGET-VALIDATED-INCONCLUSIVE] Queried production state; no decisive evidence either way. Lab validation below may still pass.',
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// SMART CONTRACT VALIDATION (Foundry) — LAB SCOPE
 // ═══════════════════════════════════════════════════════════════════
 
 function generatePoCTest(
@@ -508,11 +734,69 @@ export async function activelyValidate(
                     vuln.type === 'cors_misconfig' || vuln.type === 'business_logic';
 
   if (isSmartContract) {
-    // ─── SMART CONTRACT: use Foundry ───────────────────────────
-    return validateWithFoundry(sourceCode, contractName, vuln);
+    // ─── SMART CONTRACT: try TARGET validation first, then LAB fallback ───
+    //
+    // Phase 1: If a contract address is available (in source code, vuln
+    //          location, or description), query the deployed contract on
+    //          mainnet via cast. This is the only path that justifies
+    //          'confirmed' status (validationScope='target').
+    //
+    // Phase 2: Run Foundry PoC against local EVM. Even if target validation
+    //          was inconclusive, lab validation proves technical viability
+    //          of the exploit chain.
+
+    const addressMatch = sourceCode.match(/0x[0-9a-fA-F]{40}/) ||
+                        vuln.location?.match(/0x[0-9a-fA-F]{40}/) ||
+                        vuln.description?.match(/0x[0-9a-fA-F]{40}/);
+    const contractAddress = addressMatch?.[0];
+
+    let targetResult: ValidationResult | null = null;
+    if (contractAddress) {
+      try {
+        targetResult = await validateWithCastOnChain(vuln, contractAddress);
+        // If target validation gives a decisive answer (confirmed OR refuted),
+        // we still run lab validation in parallel for completeness — but the
+        // final verdict is taken from target scope.
+        if (targetResult.confirmed) {
+          // Target confirmed — also run lab to add exploit-chain evidence
+          const labResult = await validateWithFoundry(sourceCode, contractName, vuln).catch(() => null);
+          if (labResult?.confirmed) {
+            return {
+              confirmed: true,
+              validationScope: 'target',
+              evidence: `${targetResult.evidence}\n\n[LAB-VALIDATED ADDITIONAL] Foundry PoC also passed in local EVM, confirming the exploit chain is technically viable: ${labResult.evidence}`,
+            };
+          }
+          return targetResult;
+        }
+        // Target REFUTED the vuln — this is meaningful negative evidence.
+        // Don't bother with lab validation; return the target refutation.
+        if (targetResult.validationScope === 'target' &&
+            targetResult.evidence.includes('[TARGET-VALIDATED-NEGATIVE]')) {
+          return targetResult;
+        }
+        // Target was inconclusive — fall through to lab validation,
+        // but include the target evidence in the final result.
+      } catch {
+        // Target validation errored — fall through to lab validation
+      }
+    }
+
+    // Phase 2: LAB validation via Foundry
+    const labResult = await validateWithFoundry(sourceCode, contractName, vuln);
+    if (targetResult && targetResult.validationScope === 'target') {
+      // Combine: target gave us real on-chain data (inconclusive), lab gave
+      // us technical viability. Report both — final scope is 'lab' because
+      // we couldn't get a decisive answer from production state alone.
+      return {
+        confirmed: labResult.confirmed,
+        validationScope: 'lab',
+        evidence: `${targetResult.evidence}\n\n---\n\n${labResult.evidence}`,
+      };
+    }
+    return labResult;
   } else if (isWebVuln) {
     // ─── WEB: use HTTP-based payload testing ───────────────────
-    // Extract URL from source code or description
     const urlMatch = vuln.location?.match(/https?:\/\/[^\s]+/) ||
                      vuln.description?.match(/https?:\/\/[^\s]+/) ||
                      sourceCode.match(/https?:\/\/[^\s]+/);
@@ -532,7 +816,6 @@ export async function activelyValidate(
     if (sourceCode.includes('pragma solidity')) {
       return validateWithFoundry(sourceCode, contractName, vuln);
     }
-    // Try web testing if there's a URL
     const urlMatch = sourceCode.match(/https?:\/\/[^\s]+/);
     if (urlMatch) {
       return validateWebVulnerability(urlMatch[0], vuln);

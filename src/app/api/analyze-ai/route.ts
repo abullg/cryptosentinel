@@ -528,8 +528,8 @@ export async function POST(req: NextRequest) {
                     { title: v.title, type: v.type, severity: v.severity, description: v.description, location: v.location },
                     apiKey, model
                   ),
-                  45_000,
-                  'Active EVM validation'
+                  120_000,
+                  'Active validation (target+lab)'
                 );
                 if (verification.confirmed) {
                   // PASS — boost confidence, but amount depends on validation scope.
@@ -956,7 +956,7 @@ async function runAIOnlyPhase(
                   contractName || 'Contract',
                   { title: v.title, type: v.type, severity: v.severity, description: v.description, location: v.location },
                 ),
-                45_000, 'Active EVM validation'
+                120_000, 'Active validation (target+lab)'  
               );
               if (verification.confirmed) {
                 const scope = verification.validationScope || 'lab';
