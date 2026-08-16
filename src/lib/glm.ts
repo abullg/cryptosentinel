@@ -129,15 +129,14 @@ export async function callGLM(
     throw new Error('API key is required for GLM analysis');
   }
 
-  // VPS KVM 2 (Hostinger, 8GB RAM) — no serverless timeout limits.
-  // Allow GLM 5.2 to reason for the full 5 minutes when needed. This is
-  // essential for:
-  //   - Multi-pass vulnerability analysis on large codebases
-  //   - Deep reasoning chains that build PoCs for complex DeFi protocols
-  //   - On-chain verification with multiple RPC round-trips
-  // Previous 90s timeout was cutting off deep analysis — the model was
-  // forced to return a shallow result before completing its reasoning.
-  const callTimeout = config.timeoutMs || 300_000; // 5 min
+  // VPS KVM 2 (Hostinger, 8GB RAM) — no serverless timeout limits, BUT
+  // GLM 5.2 with unlimited reasoning can enter infinite loops. Cap at
+  // 120s (2 min) — this is enough for deep analysis of even large
+  // codebases; if it takes longer, the model is stuck in a reasoning
+  // loop and should be aborted.
+  // 5 min timeout (previous setting) caused the '40 min hang' — each
+  // retry waited 5 min, and with multiple findings × retries it stacked.
+  const callTimeout = config.timeoutMs || 120_000; // 2 min
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), callTimeout);
   let response: Response;

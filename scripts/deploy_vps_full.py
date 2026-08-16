@@ -51,6 +51,11 @@ print("\n=== Step 7: prisma generate ===", flush=True)
 run(f"cd {PROJECT_DIR} && npx prisma generate 2>&1 | tail -5", t=60)
 
 print("\n=== Step 8: npm run build ===", flush=True)
+# IMPORTANT: clear .next/standalone + turbopack cache before build, otherwise
+# Next.js may serve stale chunks that don't include the latest code changes.
+# This was the root cause of the '40 min hang' — source code had the fix
+# but the standalone bundle still had the old buggy version.
+run(f"cd {PROJECT_DIR} && rm -rf .next/standalone .next/cache 2>&1 | tail -3", t=30)
 ec, _, _ = run(f"cd {PROJECT_DIR} && NODE_OPTIONS=--max-old-space-size=2048 npm run build 2>&1 | tail -50", t=600)
 if ec != 0:
     print(f"ERROR: build failed (exit {ec})", file=sys.stderr)
