@@ -31,6 +31,29 @@ export interface ValidationResult {
   responseStatus?: number;
   responseBody?: string;
   payload?: string;
+  /**
+   * Validation scope — CRITICAL for honest reporting.
+   *
+   * 'target'   — The exploit was tested against the ACTUAL production target
+   *              (e.g. a real HTTP request to www.example.com returned a
+   *              reflected XSS payload in its body). This is the only scope
+   *              that justifies the word "CONFIRMED" in the user-facing
+   *              description.
+   *
+   * 'lab'      — The exploit was tested in a CONTROLLED LOCAL environment
+   *              (e.g. Foundry/forge test on a local EVM, or a local HTTP
+   *              mock). This proves the exploit chain is technically viable,
+   *              NOT that the target is exploitable. Findings with scope='lab'
+   *              MUST be reported as "exploit viable in lab conditions"
+   *              and MUST NOT be prefixed with "[ACTIVE VALIDATION PASSED]"
+   *              or "Exploit confirmed" — those phrases imply target-level
+   *              confirmation and would mislead the reader.
+   *
+   * 'theoretical' — No runtime validation was performed. The finding is
+   *              based on static analysis / pattern matching / AI reasoning
+   *              only.
+   */
+  validationScope?: 'target' | 'lab' | 'theoretical';
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -153,11 +176,26 @@ async function validateWithFoundry(
     const gasMatch = result.match(/(\d+)\s+gas/);
 
     return passed
-      ? { confirmed: true, evidence: `Foundry PoC PASSED — exploit executed successfully. Gas: ${gasMatch?.[1] || 'n/a'}. The vulnerability was confirmed by running a real exploit on the EVM.`, testOutput: result.slice(0, 2000), gasUsed: gasMatch ? parseInt(gasMatch[1]) : undefined }
-      : { confirmed: false, evidence: `Foundry PoC FAILED — exploit did not succeed. Likely a false positive.`, testOutput: result.slice(0, 2000) };
+      ? {
+          confirmed: true,
+          validationScope: 'lab',
+          evidence: `Foundry PoC PASSED in LOCAL EVM — exploit chain is technically viable. Gas: ${gasMatch?.[1] || 'n/a'}. NOTE: this confirms the exploit works in a controlled local Foundry environment, NOT that the deployed target is exploitable. The contract on-chain may have different bytecode, additional admin controls, or be deployed at a different address than the source code analyzed.`,
+          testOutput: result.slice(0, 2000),
+          gasUsed: gasMatch ? parseInt(gasMatch[1]) : undefined,
+        }
+      : {
+          confirmed: false,
+          validationScope: 'lab',
+          evidence: `Foundry PoC FAILED in local EVM — exploit did not succeed under lab conditions. Likely a false positive, OR the exploit requires on-chain state not reproduced locally.`,
+          testOutput: result.slice(0, 2000),
+        };
   } catch (e: any) {
     const msg = String(e.message || e).slice(0, 500);
-    return { confirmed: false, evidence: msg.includes('not found') ? 'Foundry (forge) not installed' : `Foundry error: ${msg}` };
+    return {
+      confirmed: false,
+      validationScope: 'theoretical',
+      evidence: msg.includes('not found') ? 'Foundry (forge) not installed — validation skipped' : `Foundry error: ${msg}`,
+    };
   } finally {
     try { rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
@@ -387,7 +425,8 @@ async function validateWebVulnerability(
           if (suite.check(resp, payload)) {
             return {
               confirmed: true,
-              evidence: suite.evidence(resp, payload),
+              validationScope: 'target' as const,
+              evidence: `[TARGET-VALIDATED] ${suite.evidence(resp, payload)} — exploit was confirmed by sending a real HTTP request to the production target ${targetUrl} and observing the payload reflected/executed in the response.`,
               requestUrl: targetUrl,
               responseStatus: resp.status,
               responseBody: resp.body.slice(0, 500),
@@ -399,7 +438,9 @@ async function validateWebVulnerability(
     }
     return {
       confirmed: false,
-      evidence: `Web vulnerability test completed — no exploits succeeded against ${targetUrl}. All payloads (XSS, SQLi, SSRF, redirect, cmd injection, path traversal) were tested without success.`,
+      validationScope: 'target' as const,
+      evidence: `[TARGET-VALIDATED] Web vulnerability test completed — ${XSS_PAYLOADS.payloads.length + SQLI_PAYLOADS.payloads.length + SSRF_PAYLOADS.payloads.length + REDIRECT_PAYLOADS.payloads.length + CMDI_PAYLOADS.payloads.length + PATH_TRAVERSAL_PAYLOADS.payloads.length} payloads were sent to ${targetUrl}. None succeeded. This is a real test against the production target; the absence of a confirmed exploit here is meaningful (unlike a lab test, which only proves technical viability).`,
+      requestUrl: targetUrl,
     };
   }
 
@@ -417,7 +458,8 @@ async function validateWebVulnerability(
       if (testSuite.check(resp, payload)) {
         return {
           confirmed: true,
-          evidence: testSuite.evidence(resp, payload),
+          validationScope: 'target' as const,
+          evidence: `[TARGET-VALIDATED] ${testSuite.evidence(resp, payload)} — exploit was confirmed by sending a real HTTP request to the production target ${targetUrl} and observing the payload reflected/executed in the response (HTTP ${resp.status}).`,
           requestUrl: targetUrl,
           responseStatus: resp.status,
           responseBody: resp.body.slice(0, 500),
@@ -429,7 +471,8 @@ async function validateWebVulnerability(
 
   return {
     confirmed: false,
-    evidence: `${testSuite.name} test completed — ${testSuite.payloads.length} payloads tested against ${targetUrl}. No vulnerability confirmed.`,
+    validationScope: 'target' as const,
+    evidence: `[TARGET-VALIDATED] ${testSuite.name} test completed — ${testSuite.payloads.length} payloads were sent to ${targetUrl}. None confirmed the vulnerability. This is a real test against the production target.`,
     requestUrl: targetUrl,
   };
 }
@@ -478,7 +521,8 @@ export async function activelyValidate(
     if (!targetUrl.startsWith('http')) {
       return {
         confirmed: false,
-        evidence: `Web vulnerability test skipped — no valid URL found in the vulnerability location or description. Need a target URL to test against.`,
+        validationScope: 'theoretical',
+        evidence: `Web vulnerability test skipped — no valid URL found in the vulnerability location or description. Need a target URL to test against. Finding remains at THEORETICAL validation level (static analysis / AI reasoning only).`,
       };
     }
 
@@ -495,7 +539,8 @@ export async function activelyValidate(
     }
     return {
       confirmed: false,
-      evidence: `Could not determine test type for vulnerability "${vuln.type}". Neither Solidity source nor web URL found.`,
+      validationScope: 'theoretical',
+      evidence: `Could not determine test type for vulnerability "${vuln.type}". Neither Solidity source nor web URL found. Finding remains at THEORETICAL validation level.`,
     };
   }
 }

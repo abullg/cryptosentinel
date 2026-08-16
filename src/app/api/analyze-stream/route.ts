@@ -403,13 +403,27 @@ export async function POST(req: NextRequest) {
                   apiKey, model
                 );
                 if (verification.confirmed) {
-                  const newConfidence = Math.min(vuln.confidence + 0.15, 0.99);
-                  const newStatus = newConfidence >= 0.90 ? 'confirmed' : 'validated';
+                  const scope = verification.validationScope || 'lab';
+                  // IMPORTANT: lab validation only proves technical viability,
+                  // NOT that the production target is exploitable. Adjust
+                  // confidence accordingly: target=+0.15, lab=+0.05, theoretical=+0.
+                  const confidenceBoost = scope === 'target' ? 0.15 : scope === 'lab' ? 0.05 : 0;
+                  const newConfidence = Math.min(vuln.confidence + confidenceBoost, 0.99);
+                  // 'confirmed' status requires target-level validation; lab-only
+                  // findings stay at 'validated' to avoid misrepresenting them
+                  // as production-confirmed exploits.
+                  const newStatus = scope === 'target' && newConfidence >= 0.90
+                    ? 'confirmed'
+                    : newConfidence >= 0.80 ? 'validated' : 'candidate';
+                  const scopeLabel =
+                    scope === 'target' ? '[TARGET-VALIDATED] Exploit confirmed by sending a real request to the production target.' :
+                    scope === 'lab'      ? '[LAB-VALIDATED] Exploit chain is technically viable in a controlled local environment. This does NOT confirm the production target is exploitable — only that the exploit logic works under lab conditions.' :
+                                          '[THEORETICAL] No runtime validation performed; based on static analysis / AI reasoning only.';
                   await db.vulnerability.update({
                     where: { id: vuln.id },
                     data: {
                       confidence: newConfidence, status: newStatus,
-                      description: vuln.description + `\n\n[ACTIVE EVM VALIDATION PASSED] Exploit succeeded on local EVM. ${verification.evidence}`,
+                      description: vuln.description + `\n\n${scopeLabel}\n${verification.evidence}`,
                     },
                   });
                   vuln.confidence = newConfidence;
@@ -418,11 +432,16 @@ export async function POST(req: NextRequest) {
                 } else {
                   const newConfidence = Math.max(vuln.confidence - 0.20, 0);
                   const newStatus = newConfidence >= 0.90 ? 'validated' : 'candidate';
+                  const scope = verification.validationScope || 'theoretical';
+                  const scopeLabel =
+                    scope === 'target' ? '[TARGET-VALIDATED] Exploit did NOT succeed against the production target — this is meaningful negative evidence.' :
+                    scope === 'lab'      ? '[LAB-VALIDATED] Exploit did NOT succeed under lab conditions — likely a false positive, or the exploit requires on-chain state not reproduced locally.' :
+                                          '[THEORETICAL] No runtime validation performed.';
                   await db.vulnerability.update({
                     where: { id: vuln.id },
                     data: {
                       confidence: newConfidence, status: newStatus,
-                      description: vuln.description + `\n\n[ACTIVE EVM VALIDATION FAILED] Exploit did NOT succeed on local EVM. ${verification.evidence}`,
+                      description: vuln.description + `\n\n${scopeLabel}\n${verification.evidence}`,
                     },
                   });
                   vuln.confidence = newConfidence;
