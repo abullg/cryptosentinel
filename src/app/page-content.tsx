@@ -99,34 +99,24 @@ export default function CryptoSentinelDashboard() {
   const [vulns, setVulns] = usePersistedState<Vulnerability[]>('cs_vulns', []);
   /** CRITICAL: Only show vulnerabilities with confidence >= 90%
    *  Applied to EVERY place findings enter the UI. No exceptions. */
-  const MIN_CONFIDENCE = 0.90;
-  const onlyHighConfidence = (findings: any[]): any[] => findings.filter(f => (f.confidence || 0) >= MIN_CONFIDENCE);
+  const MIN_CONFIDENCE = 0;
+  const onlyHighConfidence = (findings: any[]): any[] => findings;
 
 
-  /** Filter: only show vulnerabilities with confidence >= 90%.
-   *  Findings without active validation are SHOWN but with a "Needs validation"
-   *  badge in the UI. The user can click "Re-validate" to run active testing. */
-  const filterHighConfidence = (vulns: Vulnerability[]): Vulnerability[] => {
-    return vulns.filter(v => (v.confidence || 0) >= 0.90);
-  };
+  /** Filter: show ALL vulnerabilities. Confidence is displayed in the UI
+   *  as a percentage badge so the user can judge quality themselves.
+   *  No artificial threshold hiding results. */
+  const filterHighConfidence = (vulns: Vulnerability[]): Vulnerability[] => vulns;
 
-  /** SAFETY NET: After every vulns state change, sweep and drop anything
-   *  below 90% confidence. */
-  useEffect(() => {
-    setVulns(prev => {
-      const filtered = prev.filter(v => (v.confidence || 0) >= 0.90);
-      return filtered.length === prev.length ? prev : filtered;
-    });
-  }, [vulns]);
+  /** SAFETY NET: no filtering — show everything. */
+  useEffect(() => {}, [vulns]);
 
   /** Helper: check if a finding has active validation. */
   const hasActiveValidation = (v: any): boolean =>
     v.validationScope === 'target' || v.validationScope === 'lab';
 
-  /** Filter: confidence >= 90% (validation status is shown as badge, not filter). */
-  const onlyValidated = (findings: any[]): any[] => findings.filter(f =>
-    (f.confidence || 0) >= 0.90
-  );
+  /** No filtering — show all findings. */
+  const onlyValidated = (findings: any[]): any[] => findings;
 
   const [patterns, setPatterns] = usePersistedState<MemoryPattern[]>('cs_patterns', []);
   const [loading, setLoading] = useState(false);
