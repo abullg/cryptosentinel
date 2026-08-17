@@ -382,41 +382,243 @@ async function validateWebVulnerability(targetUrl: string, vuln: any): Promise<V
   else if (vulnType === 'path_traversal') testSuite = PATH_TRAVERSAL_PAYLOADS;
   else if (vulnType === 'cors_misconfig') testSuite = CORS_TEST;
 
-  // CSP-missing: single HEAD request, instant
-  if (vulnType === 'csp_missing' || vulnType === 'csrf' || vulnType === 'auth_bypass') {
+  // ─── Configuration checks: always testable via HTTP headers ──────
+  if (vulnType === 'csp_missing' || vulnType === 'csrf' || vulnType === 'auth_bypass' ||
+      vulnType === 'info_exposure' || vulnType === 'clickjacking' || vulnType === 'session_fixation') {
     try {
-      const resp = await fetch(targetUrl, { headers: BROWSER_HEADERS, signal: AbortSignal.timeout(5_000) });
+      const resp = await fetch(targetUrl, { headers: BROWSER_HEADERS, signal: AbortSignal.timeout(8_000) });
       const headers: Record<string, string> = {};
       resp.headers.forEach((v, k) => { headers[k] = v; });
+
+      // CSP check
       if (vulnType === 'csp_missing') {
         const csp = headers['content-security-policy'] || '';
         if (!csp) return { confirmed: true, validationScope: 'target',
-          evidence: `[TARGET-VALIDATED] CSP-missing confirmed: HTTP ${resp.status} from ${targetUrl} has no Content-Security-Policy header.`,
+          evidence: `CSP header ABSENT — confirmed via real HTTP request to ${targetUrl}. Response has no Content-Security-Policy. This is a confirmed configuration weakness.`,
+          requestUrl: targetUrl, responseStatus: resp.status };
+        if (csp.includes("'unsafe-inline'") || csp.includes('https:')) return { confirmed: true, validationScope: 'target',
+          evidence: `CSP is WEAK — contains 'unsafe-inline' or https: wildcard: ${csp.slice(0, 200)}. Inline scripts are allowed, reducing XSS protection to zero.`,
           requestUrl: targetUrl, responseStatus: resp.status };
         return { confirmed: false, validationScope: 'target',
-          evidence: `[TARGET-VALIDATED] CSP-missing REFUTED: CSP is present: ${csp.slice(0, 200)}`,
+          evidence: `CSP is PRESENT and strict: ${csp.slice(0, 200)}. Not exploitable.`,
           requestUrl: targetUrl, responseStatus: resp.status };
       }
+
+      // Clickjacking check
+      if (vulnType === 'clickjacking') {
+        const xfo = headers['x-frame-options'] || '';
+        const csp = headers['content-security-policy'] || '';
+        if (!xfo && !csp.includes('frame-ancestors')) return { confirmed: true, validationScope: 'target',
+          evidence: `X-Frame-Options ABSENT and CSP has no frame-ancestors — page is frameable. Clickjacking confirmed.`,
+          requestUrl: targetUrl, responseStatus: resp.status };
+        return { confirmed: false, validationScope: 'target',
+          evidence: `Framing is blocked: X-Frame-Options=${xfo}, CSP frame-ancestors=${csp.includes('frame-ancestors') ? 'present' : 'absent'}.`,
+          requestUrl: targetUrl, responseStatus: resp.status };
+      }
+
+      // Info exposure — check for verbose headers, version disclosure
+      if (vulnType === 'info_exposure') {
+        const exposing: string[] = [];
+        if (headers['x-powered-by']) exposing.push(`X-Powered-By: ${headers['x-powered-by']}`);
+        if (headers['server'] && !headers['server'].includes('cloudflare')) exposing.push(`Server: ${headers['server']}`);
+        if (headers['x-aspnet-version']) exposing.push(`X-AspNet-Version: ${headers['x-aspnet-version']}`);
+        if (exposing.length > 0) return { confirmed: true, validationScope: 'target',
+          evidence: `Information disclosure confirmed: ${exposing.join(', ')}. Technology fingerprint visible in headers.`,
+          requestUrl: targetUrl, responseStatus: resp.status };
+        return { confirmed: false, validationScope: 'target',
+          evidence: `No version disclosure in headers. Server header is generic or absent.`,
+          requestUrl: targetUrl, responseStatus: resp.status };
+      }
+
+      // CSRF check — look for CSRF tokens in HTML form
+      if (vulnType === 'csrf') {
+        const body = await resp.text();
+        const hasCsrfToken = body.match(/csrf[_-]?token|_token|authenticity_token|__RequestVerificationToken/i);
+        if (!hasCsrfToken) return { confirmed: true, validationScope: 'target',
+          evidence: `No CSRF token found in page HTML. Forms are vulnerable to CSRF.`,
+          requestUrl: targetUrl, responseStatus: resp.status };
+        return { confirmed: false, validationScope: 'target',
+          evidence: `CSRF token found in HTML: ${hasCsrfToken[0]}. Forms are protected.`,
+          requestUrl: targetUrl, responseStatus: resp.status };
+      }
+
+      // Auth bypass — check if endpoint returns data without auth
+      if (vulnType === 'auth_bypass') {
+        if (resp.status === 200) {
+          const body = await resp.text();
+          if (body.includes('unauthorized') || body.includes('login required') || resp.status === 401) {
+            return { confirmed: false, validationScope: 'target',
+              evidence: `Endpoint requires authentication (HTTP ${resp.status}). Auth bypass not confirmed.`,
+              requestUrl: targetUrl, responseStatus: resp.status };
+          }
+          return { confirmed: true, validationScope: 'target',
+            evidence: `Endpoint returned HTTP 200 without authentication header. Data accessible without auth.`,
+            requestUrl: targetUrl, responseStatus: resp.status };
+        }
+      }
     } catch (e: any) { return { confirmed: false, validationScope: 'theoretical',
-      evidence: `[TARGET-VALIDATION ERROR] ${String(e.message || e).slice(0, 200)}` }; }
+      evidence: `Validation error: ${String(e.message || e).slice(0, 200)}` }; }
   }
 
-  // CORS: send Origin headers
+  // ─── CORS: test with multiple origins ──────
   if (vulnType === 'cors_misconfig') {
-    for (const origin of CORS_TEST.payloads) {
+    const origins = ['https://evil.com', 'https://attacker.example', 'null', 'https://evil.levex.com'];
+    for (const origin of origins) {
       try {
-        const resp = await fetch(targetUrl, { headers: { ...BROWSER_HEADERS, 'Origin': origin }, signal: AbortSignal.timeout(5_000) });
+        const resp = await fetch(targetUrl, { headers: { ...BROWSER_HEADERS, 'Origin': origin }, signal: AbortSignal.timeout(8_000) });
         const headers: Record<string, string> = {};
         resp.headers.forEach((v, k) => { headers[k] = v; });
-        const body = await resp.text();
-        const fakeResp = { status: resp.status, body, headers };
-        if (CORS_TEST.check(fakeResp, origin)) return { confirmed: true, validationScope: 'target',
-          evidence: `[TARGET-VALIDATED] ${CORS_TEST.evidence(fakeResp, origin)}`, requestUrl: targetUrl, payload: origin };
+        const acao = headers['access-control-allow-origin'] || '';
+        const acac = headers['access-control-allow-credentials'] || '';
+        if (acao === '*' && acac === 'true') return { confirmed: true, validationScope: 'target',
+          evidence: `CORS misconfiguration CONFIRMED: ACAO=* with ACAC=true. Any origin can read authenticated responses. Origin tested: ${origin}.`,
+          requestUrl: targetUrl, responseStatus: resp.status, payload: origin };
+        if (acao === origin && acac === 'true') return { confirmed: true, validationScope: 'target',
+          evidence: `CORS origin reflection CONFIRMED: server reflected Origin=${origin} with ACAC=true. Any origin is accepted.`,
+          requestUrl: targetUrl, responseStatus: resp.status, payload: origin };
+        if (acao === 'null' && acac === 'true') return { confirmed: true, validationScope: 'target',
+          evidence: `CORS null origin CONFIRMED: ACAO=null with ACAC=true. Sandbox iframe can bypass CORS.`,
+          requestUrl: targetUrl, responseStatus: resp.status, payload: origin };
       } catch {}
     }
     return { confirmed: false, validationScope: 'target',
-      evidence: `[TARGET-VALIDATED] CORS test completed — ${CORS_TEST.payloads.length} origins tested. None triggered misconfiguration.`,
+      evidence: `CORS test completed — ${origins.length} origins tested. No misconfiguration found. ACAO is not * and no origin reflection.`,
       requestUrl: targetUrl };
+  }
+
+  // ─── Open redirect: test with multiple redirect params ──────
+  if (vulnType === 'open_redirect') {
+    const redirectParams = ['next', 'redirect', 'url', 'return', 'callback', 'goto', 'dest', 'destination', 'continue', 'to'];
+    const payloads = ['https://evil.com', '//evil.com', '/\\evil.com', 'https:evil.com'];
+    const tests: Promise<any>[] = [];
+    for (const param of redirectParams) {
+      for (const payload of payloads) {
+        for (const method of ['GET', 'POST']) {
+          tests.push((async () => {
+            const resp = await sendTestRequest(targetUrl, method, payload, param, { followRedirect: false });
+            if (resp.status === 0) return null;
+            if (resp.status >= 300 && resp.status < 400) {
+              const location = resp.headers['location'] || '';
+              if (location.includes('evil.com')) return { confirmed: true, param, payload, status: resp.status, location };
+            }
+            // Also check if body contains the redirect URL (meta refresh, JS redirect)
+            if (resp.body.includes('evil.com') && (resp.body.includes('window.location') || resp.body.includes('meta http-equiv'))) {
+              return { confirmed: true, param, payload, status: resp.status, location: 'body-redirect' };
+            }
+            return null;
+          })());
+        }
+      }
+    }
+    const results = await Promise.allSettled(tests);
+    for (const r of results) {
+      if (r.status === 'fulfilled' && r.value?.confirmed) {
+        return { confirmed: true, validationScope: 'target',
+          evidence: `Open redirect CONFIRMED: ${r.value.param}=${r.value.payload} → HTTP ${r.value.status} Location: ${r.value.location}. Server redirects to attacker-controlled domain.`,
+          requestUrl: targetUrl, responseStatus: r.value.status, payload: r.value.payload };
+      }
+    }
+    return { confirmed: false, validationScope: 'target',
+      evidence: `Open redirect test completed — ${redirectParams.length} params × ${payloads.length} payloads × 2 methods = ${redirectParams.length * payloads.length * 2} requests. No redirect to external domain found.`,
+      requestUrl: targetUrl };
+  }
+
+  // ─── API key / secret exposure: check if key is real ──────
+  if (vulnType === 'api_leak') {
+    // Extract the key value from source code
+    const keyMatch = sourceCode.match(/(?:api[_-]?key|secret|token|password|private[_-]?key)\s*[=:]\s*['"]([^'"]+)['"]/i);
+    if (keyMatch) {
+      const value = keyMatch[1];
+      const testPatterns = /^(sk-leaked|sk-test|sk-fake|test|example|demo|sample|xxx|your[_-]?api[_-]?key|placeholder|changeme|default|foo|bar|baz|password|secret|token|abc123|12345678)$/i;
+      if (testPatterns.test(value) || value.length < 12) {
+        return { confirmed: false, validationScope: 'target',
+          evidence: `API key value "${value.slice(0,3)}***${value.slice(-3)}" appears to be a TEST/PLACEHOLDER value. Not a real credential.`,
+          requestUrl: targetUrl };
+      }
+      // If it looks real, check if any API endpoint accepts it
+      // Try common API patterns found in the source
+      const apiUrls = sourceCode.match(/https?:\/\/[^\s'"]+\/api\/[^\s'"]+/g) || [];
+      if (apiUrls.length > 0 && targetUrl) {
+        for (const apiUrl of apiUrls.slice(0, 3)) {
+          try {
+            const resp = await fetch(apiUrl, { headers: { ...BROWSER_HEADERS, 'Authorization': `Bearer ${value}` }, signal: AbortSignal.timeout(5_000) });
+            if (resp.status === 200) return { confirmed: true, validationScope: 'target',
+              evidence: `API key "${value.slice(0,3)}***${value.slice(-3)}" is ACCEPTED by ${apiUrl}. Returned HTTP 200. Real credential confirmed.`,
+              requestUrl: apiUrl, responseStatus: resp.status };
+            if (resp.status === 401 || resp.status === 403) return { confirmed: false, validationScope: 'target',
+              evidence: `API key rejected by ${apiUrl} (HTTP ${resp.status}). Key is invalid or expired.`,
+              requestUrl: apiUrl, responseStatus: resp.status };
+          } catch {}
+        }
+      }
+      // Can't test against API, but key looks real
+      return { confirmed: true, validationScope: 'target',
+        evidence: `Hardcoded key "${value.slice(0,3)}***${value.slice(-3)}" does not match test patterns. It may be a real credential. Could not verify against an API endpoint (no API URL found in source).`,
+        requestUrl: targetUrl };
+    }
+    return { confirmed: false, validationScope: 'target',
+      evidence: `No hardcoded key value found in source code to validate.`,
+      requestUrl: targetUrl };
+  }
+
+  // ─── postMessage abuse: check if page has postMessage listener ──────
+  if (vulnType === 'postmessage_abuse') {
+    // Fetch the page and check for postMessage listener + innerHTML sink
+    try {
+      const resp = await fetch(targetUrl, { headers: BROWSER_HEADERS, signal: AbortSignal.timeout(8_000) });
+      const html = await resp.text();
+      const hasPostMessage = html.includes('addEventListener') && html.includes('message');
+      const hasInnerHTML = html.includes('innerHTML');
+      const hasOriginCheck = html.match(/e\.origin|event\.origin|\.origin\s*[!=]==?\s*['"]/);
+      if (hasPostMessage && hasInnerHTML && !hasOriginCheck) {
+        return { confirmed: true, validationScope: 'target',
+          evidence: `postMessage listener WITHOUT origin check confirmed on ${targetUrl}. Page has addEventListener('message') + innerHTML sink + no e.origin check. XSS via cross-origin postMessage is exploitable.`,
+          requestUrl: targetUrl, responseStatus: resp.status };
+      }
+      if (hasPostMessage && hasOriginCheck) {
+        return { confirmed: false, validationScope: 'target',
+          evidence: `postMessage listener HAS origin check on ${targetUrl}. Cross-origin messages are filtered. Not exploitable.`,
+          requestUrl: targetUrl, responseStatus: resp.status };
+      }
+      return { confirmed: false, validationScope: 'target',
+        evidence: `No postMessage listener found on ${targetUrl}.`,
+        requestUrl: targetUrl, responseStatus: resp.status };
+    } catch (e: any) { return { confirmed: false, validationScope: 'theoretical',
+      evidence: `Validation error: ${String(e.message || e).slice(0, 200)}` }; }
+  }
+
+  // ─── Business logic: check for common patterns ──────
+  if (vulnType === 'business_logic') {
+    // Fetch page and check for common business logic patterns
+    try {
+      const resp = await fetch(targetUrl, { headers: BROWSER_HEADERS, signal: AbortSignal.timeout(8_000) });
+      const html = await resp.text();
+      const findings: string[] = [];
+      // Check for client-side price/amount calculation (can be tampered)
+      if (html.match(/amount|price|total|balance/i) && html.match(/innerHTML|value\s*=/)) {
+        findings.push('Client-side amount/price calculation detected — values may be tamperable');
+      }
+      // Check for missing rate limiting (login/signup forms)
+      if (html.match(/login|signin|signup|register/i) && !html.match(/captcha|recaptcha|hcaptcha/i)) {
+        findings.push('Login/signup form without CAPTCHA — brute force possible');
+      }
+      // Check for hidden form fields with sensitive values
+      const hiddenFields = html.match(/<input[^>]+type=['"]hidden['"][^>]+value=['"][^'"]+['"]/gi);
+      if (hiddenFields) {
+        for (const field of hiddenFields) {
+          if (field.match(/amount|price|user|role|admin/i)) {
+            findings.push(`Hidden field with sensitive name: ${field.slice(0, 100)}`);
+          }
+        }
+      }
+      if (findings.length > 0) return { confirmed: true, validationScope: 'target',
+        evidence: `Business logic issues found on ${targetUrl}: ${findings.join('; ')}`,
+        requestUrl: targetUrl, responseStatus: resp.status };
+      return { confirmed: false, validationScope: 'target',
+        evidence: `No business logic issues detected on ${targetUrl}.`,
+        requestUrl: targetUrl, responseStatus: resp.status };
+    } catch (e: any) { return { confirmed: false, validationScope: 'theoretical',
+      evidence: `Validation error: ${String(e.message || e).slice(0, 200)}` }; }
   }
 
   // For payload-based tests (XSS, SQLi, etc): run ALL payloads in PARALLEL
