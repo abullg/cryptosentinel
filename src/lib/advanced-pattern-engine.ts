@@ -327,7 +327,7 @@ const WEB_ADVANCED: AdvancedPattern[] = [
     },
     cwe: ['CWE-79'],
     remediation: 'Use React JSX (auto-escapes), DOMPurify.sanitize() for HTML, or textContent for plain text.',
-    v1Symbolic: 0.65, v2Fuzzing: 0.60, v3Formal: 0.55, v4Economic: 0.40,
+    v1Symbolic: 0.85, v2Fuzzing: 0.80, v3Formal: 0.75, v4Economic: 0.50,
   },
   {
     id: 'WEB-SQL-001',

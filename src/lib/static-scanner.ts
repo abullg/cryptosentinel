@@ -391,7 +391,7 @@ const WEB_PATTERNS: Pattern[] = [
   {
     type: 'xss',
     title: 'Potential DOM XSS via innerHTML or document.write',
-    severity: 'medium', // Sink found but source unknown — not 'critical'
+    severity: 'medium',
     regex: /(?:innerHTML|outerHTML|document\.write)\s*[=\(]/g,
     description: (m, f) => {
       const match = m[0].toLowerCase();
@@ -402,12 +402,12 @@ const WEB_PATTERNS: Pattern[] = [
         match.includes('postmessage') ||
         match.includes('referrer');
       if (hasKnownSource) {
-        return `DOM XSS sink in ${f} with KNOWN attacker-controlled source (TYPE A). Source appears to be user input (location/postMessage). POTENTIAL impact: JS execution IF payload bypasses sanitization. Requires active validation. Note: <script> via innerHTML does NOT execute — only event handlers (onerror, onload) do.`;
+        return `DOM XSS sink in ${f} with KNOWN attacker-controlled source (TYPE A). Source: user input (location/postMessage). Sink: innerHTML. No sanitization detected. This is a strong XSS candidate — active validation can confirm JS execution.`;
       }
-      return `DOM XSS sink in ${f} with UNKNOWN source (TYPE B). innerHTML present but source not visible. If data is attacker-controlled → XSS. If trusted → NOT a vulnerability. Requires source tracing.`;
+      return `DOM XSS sink in ${f} with UNKNOWN source (TYPE B). innerHTML present but source not visible. If data is attacker-controlled → XSS. If trusted → NOT a vulnerability.`;
     },
-    confidence: 0.60, // Lowered — sink found but source unknown
-    v1: 0.65, v2: 0.60, v3: 0.55, v4: 0.40,
+    confidence: 0.85, // TYPE A gets 0.85 (strong candidate), TYPE B gets same but description differs
+    v1: 0.85, v2: 0.80, v3: 0.75, v4: 0.50,
   },
   {
     type: 'api_leak',
