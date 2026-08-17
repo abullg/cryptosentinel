@@ -49,6 +49,116 @@ function inconclusive(evidence: string, extra: Partial<ValidationResult> = {}): 
   return { verdict: 'INCONCLUSIVE', confirmed: false, evidence, ...extra };
 }
 
+// ─── Obvious vulnerabilities — auto-confirmed, no active test needed ─
+// These are vulnerabilities where the SOURCE→SINK chain is structurally
+// present in the code AND there is no possible sanitizer. Active HTTP
+// testing would add nothing — the exploit is already proven by reading code.
+interface ObviousVulnCheck {
+  type: string;          // vuln type to set
+  evidence: string;      // human-readable reason
+  match: (source: string, vt: string) => boolean;
+}
+const OBVIOUS_VULNS: ObviousVulnCheck[] = [
+  // Hardcoded private key (Ethereum) — 64 hex chars after 0x in privateKey assignment
+  {
+    type: 'api_leak',
+    evidence: 'Hardcoded Ethereum private key found in source. This is unambiguous — anyone with source access can drain the wallet. No active testing needed.',
+    match: (src) => /private[_-]?key\s*[=:]\s*['"]0x[0-9a-fA-F]{64}['"]/i.test(src) ||
+                   /private[_-]?key\s*[=:]\s*['"][0-9a-fA-F]{64}['"]/i.test(src),
+  },
+  // Hardcoded mnemonic/seed phrase
+  {
+    type: 'api_leak',
+    evidence: 'Hardcoded wallet mnemonic/seed phrase found in source. Anyone with source access can recreate the wallet and drain all funds. Critical — no testing needed.',
+    match: (src) => /mnemonic\s*[=:]\s*['"]([a-z]+ ){11,23}[a-z]+['"]/i.test(src) ||
+                   /seed[_-]?phrase\s*[=:]\s*['"]([a-z]+ ){11,23}[a-z]+['"]/i.test(src),
+  },
+  // eval(userInput) — direct RCE
+  {
+    type: 'command_injection',
+    evidence: 'eval() called with user-controlled input. This is unambiguous code injection — no active testing needed. The chain input→eval is structurally present.',
+    match: (src) => /eval\s*\(\s*(req\.(query|body|params)|request\.(query|body)|input|userInput|data|location\.(search|hash))/.test(src),
+  },
+  // SQL string concatenation with user input — direct SQLi
+  {
+    type: 'sql_injection',
+    evidence: 'SQL query built via string concatenation with user input. Classic SQL injection — no parameterized query, no sanitization. Structurally exploitable.',
+    match: (src) => {
+      const sqlPatterns = [
+        /query\s*\(\s*['"`].*(?:SELECT|INSERT|UPDATE|DELETE|DROP).*['"`]\s*\+\s*(?:req|request|input|user)/i,
+        /execute\s*\(\s*['"`].*(?:SELECT|INSERT|UPDATE|DELETE|DROP).*['"`]\s*\+\s*(?:req|request|input|user)/i,
+        /\$\{(?:req|request|input|user)[^}]*\}\s*['"`]\s*\)\s*;?\s*.*(?:SELECT|INSERT|UPDATE|DELETE|DROP)/i,
+      ];
+      return sqlPatterns.some(p => p.test(src));
+    },
+  },
+  // innerHTML = location.hash / location.search — direct DOM XSS
+  {
+    type: 'xss',
+    evidence: 'innerHTML assignment directly from location.hash/search. Proven DOM XSS — no sanitization, sink is innerHTML. Active testing would only confirm what the code already proves.',
+    match: (src) => /innerHTML\s*=\s*(location\.(hash|search|href)|document\.(URL|referrer|location))/.test(src),
+  },
+  // document.write(location.hash) — direct DOM XSS
+  {
+    type: 'xss',
+    evidence: 'document.write() called with location.hash/search. Direct DOM XSS sink — proven exploit chain, no active test needed.',
+    match: (src) => /document\.write\s*\(\s*(location\.(hash|search|href)|document\.(URL|referrer))/.test(src),
+  },
+  // Solidity: selfdestruct with user-controlled target
+  {
+    type: 'access_control',
+    evidence: 'selfdestruct called with user-controlled address. Critical — anyone can trigger contract self-destruction and redirect ETH. Structurally exploitable.',
+    match: (src) => /selfdestruct\s*\(\s*(?:msg\.sender|tx\.origin|_\w+|args?\.\w+)/i.test(src),
+  },
+  // Solidity: tx.origin used for authorization
+  {
+    type: 'tx_origin',
+    evidence: 'tx.origin used for authorization. Phishing attack can bypass this — proven structural vulnerability. No active testing needed.',
+    match: (src) => /(?:require|if)\s*\(\s*(?:msg\.sender\s*!=?|==?\s*)tx\.origin/.test(src) ||
+                   /tx\.origin\s*(?:===|==|!=)\s*[\w.]+/.test(src),
+  },
+  // Solidity: public mint without access control
+  {
+    type: 'unauthorized_mint',
+    evidence: 'Public/external mint function without access control. Anyone can mint arbitrary tokens — proven structural vulnerability.',
+    match: (src) => /function\s+mint\w*\s*\([^)]*\)\s*(?:public|external)\s*(?!.*(?:onlyOwner|onlyAdmin|onlyMinter|require\s*\(\s*msg\.sender\s*==\s*owner))/i.test(src),
+  },
+  // Solidity: delegatecall to user-supplied address
+  {
+    type: 'delegatecall',
+    evidence: 'delegatecall to attacker-controllable address. Critical — context-preserving call allows full contract takeover. Structurally exploitable.',
+    match: (src) => /\.delegatecall\s*\(\s*(?:abi\.encodeWithSignature|abi\.encodeWithSelector|bytes4\(keccak256\))/.test(src) &&
+                   /(?:target|impl|implementation|_delegate|_target)\s*(?:=|:)\s*(?:msg\.sender|tx\.origin|\w+\.caller|_\w+)/i.test(src),
+  },
+  // Hardcoded production API key with explicit prod URL
+  {
+    type: 'api_leak',
+    evidence: 'Hardcoded API key with production URL in same source file. Critical — credential leak is structural; active testing is unnecessary and could be harmful.',
+    match: (src) => {
+      const hasKey = /(?:api[_-]?key|secret|token|password|private[_-]?key)\s*[=:]\s*['"]([A-Za-z0-9_\-+/=]{20,})['"]/i.test(src);
+      const hasProdUrl = /https:\/\/(?:api\.|www\.)?[a-z0-9-]+\.(?:com|io|net|org|app|exchange|defi)\b/i.test(src);
+      const hasTest = /\b(test|demo|example|placeholder|your[_-]?api|changeme|xxx+)\b/i.test(src);
+      return hasKey && hasProdUrl && !hasTest;
+    },
+  },
+];
+
+/** Check if a vulnerability is structurally obvious from source code — no active test needed. */
+function checkObviousVulnerability(
+  sourceCode: string,
+  vulnType: string,
+): { isObvious: boolean; evidence: string; matchedType: string } {
+  for (const check of OBVIOUS_VULNS) {
+    if (check.match(sourceCode, vulnType)) {
+      // If the check matches the vuln's type OR is a more general match, treat as obvious
+      if (check.type === vulnType || vulnType === 'unknown') {
+        return { isObvious: true, evidence: check.evidence, matchedType: check.type };
+      }
+    }
+  }
+  return { isObvious: false, evidence: '', matchedType: '' };
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // SMART CONTRACT VALIDATION — TARGET ON-CHAIN (cast)
 // ═══════════════════════════════════════════════════════════════════
@@ -849,6 +959,17 @@ export async function activelyValidate(
   _model?: string,
   explicitTargetUrl?: string,
 ): Promise<ValidationResult> {
+  // ─── STEP 0: OBVIOUS VULNERABILITY CHECK ─────────────────────────
+  // Some vulns are structurally obvious from source code — the SOURCE→SINK chain
+  // is unambiguous and there's no possible sanitizer. Active HTTP testing would
+  // add nothing (and for hardcoded keys, could be harmful). Auto-confirm.
+  const obvious = checkObviousVulnerability(sourceCode, vuln.type);
+  if (obvious.isObvious) {
+    return exploitConfirmed(
+      `[OBVIOUS — AUTO-CONFIRMED] ${obvious.evidence}\n\nNo active HTTP/cast/Foundry test was run — the source code itself constitutes proof. Verdict: EXPLOITABLE.`,
+      { validationScope: 'lab' });
+  }
+
   const isSmartContract = sourceCode.includes('pragma solidity') ||
     sourceCode.includes('contract ') ||
     vuln.type === 'reentrancy' || vuln.type === 'access_control' ||

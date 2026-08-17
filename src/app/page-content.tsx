@@ -132,6 +132,8 @@ export default function CryptoSentinelDashboard() {
   const [newProject, setNewProject] = useState({ name: '', chain: 'ethereum', language: 'solidity', address: '' });
   const [sourceCode, setSourceCode] = useState('');
   const [apiKey, setApiKey] = useState('');
+  // Severity filter — default ON (show medium/high/critical only, hide low/info noise)
+  const [hideLowSeverity, setHideLowSeverity] = usePersistedState<boolean>('cs_hideLow', true);
 
   /**
    * Ensure a project is selected — if not, auto-create or pick the first one.
@@ -1287,9 +1289,16 @@ export default function CryptoSentinelDashboard() {
 
   // Only show vulnerabilities that have been ACTIVELY VALIDATED
   // A vuln is "validated" if it has validationSteps (AI ran active exploitation) OR status is confirmed/validated/refuted
+  // Severity filter: hide `low`/`info` unless user toggled it off (hideLowSeverity default: true)
   const validatedVulns = vulns.filter(v =>
+    (v.validationSteps || v.status === 'confirmed' || v.status === 'validated' || v.status === 'refuted') &&
+    (!hideLowSeverity || (v.severity !== 'low' && v.severity !== 'info'))
+  );
+  // Three-state verdict counts (computed on FULL list, ignoring severity filter, for honest reporting)
+  const allValidatedVulns = vulns.filter(v =>
     v.validationSteps || v.status === 'confirmed' || v.status === 'validated' || v.status === 'refuted'
   );
+  const lowSeverityHidden = allValidatedVulns.filter(v => v.severity === 'low' || v.severity === 'info').length;
   // Three-state verdict counts
   const exploitableVulns = validatedVulns.filter(v => v.status === 'confirmed' || v.status === 'validated');
   const notExploitableVulns = validatedVulns.filter(v => v.status === 'refuted');
@@ -1808,6 +1817,15 @@ export default function CryptoSentinelDashboard() {
                     <Badge className="bg-emerald-100 text-emerald-800 border-0">{exploitableVulns.length} Exploitable</Badge>
                     <Badge className="bg-red-100 text-red-800 border-0">{notExploitableVulns.length} Not Exploitable</Badge>
                     <Badge className="bg-yellow-100 text-yellow-800 border-0">{inconclusiveVulns.length} Inconclusive</Badge>
+                    <Button
+                      size="sm"
+                      variant={hideLowSeverity ? 'default' : 'outline'}
+                      onClick={() => setHideLowSeverity(!hideLowSeverity)}
+                      title={hideLowSeverity ? 'Currently hiding low/info findings. Click to show all.' : 'Showing all findings. Click to hide low/info.'}
+                      className="text-[11px] h-7 px-2"
+                    >
+                      {hideLowSeverity ? `Hide Low${lowSeverityHidden > 0 ? ` (${lowSeverityHidden})` : ''}` : 'Show All'}
+                    </Button>
                     <Badge className="bg-slate-100 text-slate-600 border-0">{vulns.length - validatedVulns.length} pending</Badge>
                     {vulns.length > 0 && (
                       <Button size="sm" variant="outline" className="text-red-600 border-red-200 hover:bg-red-50" onClick={clearAllFindings}>

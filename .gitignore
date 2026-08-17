@@ -2,3 +2,4 @@ skills/
 node_modules/
 tool-results/
 tsconfig.tsbuildinfo
+.next/

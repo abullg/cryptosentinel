@@ -88,7 +88,7 @@ async function runAnalysisInBackground(jobId: string, config: {
   hackenproofContext: any; apiKey: string; model: string;
   projectId: string; contractId: string; auditId: string;
 }) {
-  const { sourceCode, contractName, targetType, apiKey, model, contractId, auditId } = config;
+  const { sourceCode, contractName, targetType, targetUrl, apiKey, model, contractId, auditId } = config;
   const isWeb = targetType === 'exchange' || contractName.endsWith('.html');
 
   const updateJob = async (progress: number, message: string) => {
@@ -150,7 +150,23 @@ async function runAnalysisInBackground(jobId: string, config: {
     await updateJob(60, `AI found ${aiVulns.length} potential vulnerabilities`);
 
     const savedAi: any[] = [];
+    let droppedLowSeverity = 0;
     for (const v of aiVulns) {
+      // ─── SEVERITY FLOOR ──────────────────────────────────────────
+      // Discard `low` / `info` severity findings UNLESS the type is one that
+      // the obvious-vuln detector or active validator can promote to higher.
+      // This implements the user's requirement: "find at least medium/high/critical".
+      // Low-severity config noise (missing HSTS, verbose Server header, etc.) is
+      // filtered out unless the description contains a concrete exploit chain.
+      const sev = (v.severity || 'medium').toLowerCase();
+      const isLow = sev === 'low' || sev === 'info';
+      const allowedLowTypes = new Set(['api_leak', 'info_exposure']); // these can be promoted by obvious-check
+      const hasConcreteChain = /(\bRCE\b|data exfiltrat|fund theft|wallet drain|credential leak|private key|mnemonic)/i.test(v.description || '');
+      if (isLow && !allowedLowTypes.has((v.type || '').toLowerCase()) && !hasConcreteChain) {
+        droppedLowSeverity++;
+        continue;
+      }
+
       const hashSig = makeVulnHash(contractId, v.type, v.title);
       try {
         const existing = await db.vulnerability.findFirst({ where: { hashSignature: hashSig } });
@@ -171,6 +187,10 @@ async function runAnalysisInBackground(jobId: string, config: {
         });
         savedAi.push({ vuln, rawFinding: v });
       } catch {}
+    }
+
+    if (droppedLowSeverity > 0) {
+      await updateJob(70, `Filtered out ${droppedLowSeverity} low-severity findings without concrete exploit chain. Saving ${savedAi.length} medium+ findings...`);
     }
 
     await updateJob(75, `Saved ${savedAi.length} AI findings. Starting validation...`);

@@ -1,3 +1,0 @@
-module.exports=[27572,a=>{"use strict";var b=a.i(7997);a.s(["default",0,function({children:a}){return(0,b.jsxs)("html",{lang:"en",suppressHydrationWarning:!0,children:[(0,b.jsx)("head",{children:(0,b.jsx)("link",{rel:"preconnect",href:"https://fonts.googleapis.com"})}),(0,b.jsx)("body",{className:"antialiased bg-background text-foreground font-sans",children:a})]})},"metadata",0,{title:"CryptoSentinel — AI Vulnerability Scanner",description:"Autonomous AI-powered smart contract and crypto exchange vulnerability scanner with OpenRouter GLM models."}])},50645,function(a){a.n(a.i(27572))}];
-
-//# sourceMappingURL=src_app_layout_tsx_0r5yz5t._.js.map

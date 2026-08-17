@@ -1,3 +1,0 @@
-module.exports=[63021,(r,e,t)=>{e.exports=r.x("@prisma/client-2c3a283f134fdcb6",()=>require("@prisma/client-2c3a283f134fdcb6"))},22734,(r,e,t)=>{e.exports=r.x("fs",()=>require("fs"))},43793,r=>{"use strict";var e=r.i(63021),t=r.i(22734);try{(0,t.existsSync)("/data")||(0,t.mkdirSync)("/data",{recursive:!0})}catch(r){console.warn("Could not create /data directory:",r)}let a=globalThis.prisma??new e.PrismaClient({log:["error"]});r.s(["db",0,a])}];
-
-//# sourceMappingURL=%5Broot-of-the-server%5D__1pvv2_1._.js.map
