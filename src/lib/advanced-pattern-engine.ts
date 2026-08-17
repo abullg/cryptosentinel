@@ -309,16 +309,25 @@ const WEB_ADVANCED: AdvancedPattern[] = [
   {
     id: 'WEB-XSS-001',
     type: 'xss',
-    title: 'XSS via innerHTML/dangerouslySetInnerHTML',
-    severity: 'high',
-    confidenceTier: 'HIGH',
+    title: 'Potential DOM XSS via innerHTML/dangerouslySetInnerHTML',
+    severity: 'medium',
+    confidenceTier: 'MEDIUM',
     languages: ['typescript', 'javascript', 'web'],
     pattern: /(?:innerHTML|outerHTML|document\.write|dangerouslySetInnerHTML)\s*[=\(]/g,
     mitigations: [/DOMPurify\.sanitize/gi, /sanitize\(/g, /textContent/g, /innerText/g],
-    description: (c, f) => `DOM injection in ${f}. If user input reaches this sink without sanitization, arbitrary JavaScript can be injected, enabling session theft and wallet hijacking.`,
+    description: (c, f) => {
+      const code = c.toLowerCase();
+      const hasKnownSource = code.includes('location.hash') || code.includes('location.search') ||
+        code.includes('e.data') || code.includes('event.data') || code.includes('postmessage') ||
+        code.includes('referrer') || code.includes('req.query') || code.includes('req.body');
+      if (hasKnownSource) {
+        return `DOM XSS sink in ${f} with KNOWN attacker-controlled source (TYPE A). Source appears to be user input (location/postMessage/request). DETECTION: sink + source identified. IMPACT: not assessed — requires active validation to confirm JavaScript execution. Note: <script> tags via innerHTML do NOT execute in modern browsers; only event handlers (onerror, onload) execute. POTENTIAL impact (if confirmed): JavaScript execution in page context — specific consequences (session theft, wallet access) require separate proof of accessible sensitive data.`;
+      }
+      return `DOM XSS sink in ${f} with UNKNOWN source (TYPE B). innerHTML present but source not visible in matched code. If data is attacker-controlled → potential XSS. If trusted → not a vulnerability. Requires source tracing to determine. IMPACT: not assessed.`;
+    },
     cwe: ['CWE-79'],
     remediation: 'Use React JSX (auto-escapes), DOMPurify.sanitize() for HTML, or textContent for plain text.',
-    v1Symbolic: 0.85, v2Fuzzing: 0.80, v3Formal: 0.75, v4Economic: 0.60,
+    v1Symbolic: 0.65, v2Fuzzing: 0.60, v3Formal: 0.55, v4Economic: 0.40,
   },
   {
     id: 'WEB-SQL-001',
@@ -408,15 +417,23 @@ const WEB_ADVANCED: AdvancedPattern[] = [
     id: 'WEB-SECRET-001',
     type: 'api_leak',
     title: 'Hardcoded secret or API key',
-    severity: 'critical',
-    confidenceTier: 'HIGH',
+    severity: 'low',
+    confidenceTier: 'LOW',
     languages: ['typescript', 'javascript', 'python', 'solidity', 'web'],
     pattern: /(?:api[_-]?key|secret[_-]?key|secret-?token|password|private[_-]?key)\s*[=:]\s*['"][^'"]{8,}['"]/gi,
     mitigations: [/process\.env/g, /config\.get/g, /secrets\./g, /vault\./g],
-    description: (c, f) => `Hardcoded secret in ${f} is visible in source code, enabling unauthorized access or fund theft.`,
+    description: (c, f) => {
+      const valueMatch = c.match(/['"]([^'"]+)['"]/);
+      const value = valueMatch?.[1] || '';
+      const testPatterns = /^(sk-leaked|sk-test|sk-fake|test|example|demo|sample|xxx|your[_-]?api[_-]?key|placeholder|changeme|default|foo|bar|baz|password|secret|token|abc123|12345678)$/i;
+      if (testPatterns.test(value) || value.length < 12) {
+        return `OBSERVATION: Hardcoded string matching API key pattern in ${f}: "${value.slice(0,3)}***${value.slice(-3)}". Value appears to be TEST/PLACEHOLDER. If this is a real production key, severity should be HIGH. Marking as LOW pending confirmation.`;
+      }
+      return `Hardcoded secret in ${f}: "${value.slice(0,3)}***${value.slice(-3)}". Value does not match test patterns — may be real. POTENTIAL impact: unauthorized access IF key is valid and grants permissions. Requires validation: (1) is key accepted by API? (2) what permissions? (3) is it active?`;
+    },
     cwe: ['CWE-798'],
     remediation: 'Use environment variables or secret management services.',
-    v1Symbolic: 0.95, v2Fuzzing: 0.90, v3Formal: 0.95, v4Economic: 0.80,
+    v1Symbolic: 0.50, v2Fuzzing: 0.50, v3Formal: 0.50, v4Economic: 0.30,
   },
   {
     id: 'WEB-CORS-001',
