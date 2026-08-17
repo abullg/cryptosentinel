@@ -3,7 +3,7 @@ export const maxDuration = 900;
 export const dynamic = 'force-dynamic';
 
 import { db } from '@/lib/db';
-import { analyzeWithGLM, analyzeWebWithGLM, DEFAULT_MODEL } from '@/lib/glm';
+import { analyzeWithGLM, analyzeWebWithGLM, analyzeWithGLMDeep, analyzeWebWithGLMDeep, DEFAULT_MODEL } from '@/lib/glm';
 import { activelyValidate } from '@/lib/active-validator';
 import { runStaticScan } from '@/lib/static-scanner';
 import { runAdvancedScan } from '@/lib/advanced-pattern-engine';
@@ -130,24 +130,49 @@ async function runAnalysisInBackground(jobId: string, config: {
 
     await updateJob(20, `Static analysis: ${savedStatic.length} findings`);
 
-    // Phase 2: AI (with 90s hard timeout — if GLM hangs, continue with static)
-    await updateJob(30, 'Starting AI deep analysis...');
+    // Phase 2: MULTI-PASS AI ANALYSIS
+    //   Pass 1 (surface): find obvious vulnerabilities (XSS, SQLi, reentrancy, etc.)
+    //   Pass 2 (deep):    find non-obvious, multi-step, cross-function vulns
+    //   Merge: dedupe by hash, surface + deep findings proceed to validation
+    await updateJob(30, 'Starting AI surface analysis (pass 1/2)...');
     let aiVulns: any[] = [];
     try {
-      // Race GLM against 90s timeout — if it loses, we still have static results
+      // Pass 1 — surface scan (240s timeout per callGLM)
       const aiPromise = isWeb
         ? analyzeWebWithGLM(sourceCode.slice(0, 30000), contractName, { apiKey, model })
         : analyzeWithGLM(sourceCode, contractName, { apiKey, model }, undefined);
       const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('AI timeout after 150s')), 150_000)
+        setTimeout(() => reject(new Error('AI pass 1 timeout after 260s')), 260_000)
       );
       aiVulns = await Promise.race([aiPromise, timeoutPromise]);
     } catch (err: any) {
-      await updateJob(50, `AI error (continuing with static): ${String(err).slice(0, 100)}`);
-      // Don't throw — continue with static findings only
+      await updateJob(40, `AI pass 1 error (continuing): ${String(err).slice(0, 100)}`);
+      // Don't throw — continue with static findings + try pass 2
     }
 
-    await updateJob(60, `AI found ${aiVulns.length} potential vulnerabilities`);
+    await updateJob(50, `AI pass 1 found ${aiVulns.length} surface vulnerabilities. Starting deep analysis (pass 2/2)...`);
+
+    // Pass 2 — DEEP analysis (finds non-obvious, multi-step vulnerabilities)
+    let deepVulns: any[] = [];
+    try {
+      const firstPassSummary = aiVulns.map(v => ({
+        title: v.title, type: v.type, severity: v.severity, description: (v.description || '').slice(0, 200),
+      }));
+      const deepPromise = isWeb
+        ? analyzeWebWithGLMDeep(sourceCode.slice(0, 30000), contractName, { apiKey, model }, firstPassSummary)
+        : analyzeWithGLMDeep(sourceCode, contractName, { apiKey, model }, firstPassSummary);
+      const deepTimeout = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('AI pass 2 (deep) timeout after 260s')), 260_000)
+      );
+      deepVulns = await Promise.race([deepPromise, deepTimeout]);
+    } catch (err: any) {
+      await updateJob(60, `AI pass 2 (deep) error (continuing with pass 1 only): ${String(err).slice(0, 100)}`);
+    }
+
+    // Merge surface + deep findings
+    aiVulns = [...aiVulns, ...deepVulns];
+
+    await updateJob(65, `AI total: ${aiVulns.length} findings (${deepVulns.length} deep)`);
 
     const savedAi: any[] = [];
     let droppedLowSeverity = 0;

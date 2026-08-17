@@ -130,17 +130,18 @@ export async function callGLM(
   }
 
   // VPS KVM 2 (Hostinger, 8GB RAM) — no serverless limits. Allow GLM 5.2
-  // up to 5 minutes for deep analysis. User feedback:
+  // up to 4 minutes for deep multi-pass analysis. User feedback:
   //   "почём ты думаешь для ии достаточно 2 минут чтобы обойти полностью сайт
   //    и протестировать все его точки на уязвимости"
-  // 2 minutes was cutting off deep multi-pass analysis. With 5 minutes,
+  // 2 minutes was cutting off deep multi-pass analysis. With 4 minutes,
   // the model can:
   //   - Parse large codebases (50K+ chars)
   //   - Build complete source→dataflow→sink chains
   //   - Construct concrete exploit scenarios
+  //   - Run a SECOND deep-analysis pass for non-obvious vulnerabilities
   //   - Cross-reference with known exploits (DAO, bZx, etc.)
-  // If still running at 5 min, model is stuck — abort and use partial.
-  const callTimeout = config.timeoutMs || 120_000; // 2 min — deep analysis needs time
+  // If still running at 4 min, model is stuck — abort and use partial.
+  const callTimeout = config.timeoutMs || 240_000; // 4 min — deep multi-pass analysis
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), callTimeout);
   let response: Response;
@@ -428,15 +429,28 @@ Severity is determined by FINANCIAL IMPACT, not CVSS. Priority order:
   - Uninitialized storage variables (often low risk)
 
 OUT OF SCOPE (do NOT report these — omit them from the JSON array entirely):
-  - Theoretical vulnerabilities without a practical, reproducible exploit
   - UI/UX bugs
   - Descriptive error messages (information leakage without impact)
-  - Open redirects without financial/auth impact
-  - Rate limiting on non-critical actions
-  - Known 2FA session issues
   - Third-party application bugs
 
-If you encounter a finding that falls into OUT OF SCOPE, OMIT it. Do not include it in the JSON array. Do not report it as LOW — that would defeat the out-of-scope rule.
+DO NOT OMIT deep vulnerabilities — these are the highest-value findings:
+  - Cross-function reentrancy (state modified in function A, exploited via function B)
+  - Read-only reentrancy (view function called mid-operation returns stale state)
+  - Composability attacks (protocol X depends on protocol Y's assumptions)
+  - Multi-step economic exploits (flash loan + oracle + governance)
+  - State machine violations (skip a state transition, replay a step)
+  - Cross-contract callback attacks (ERC777 hooks, ERC1155 onReceived)
+  - Sandwich/frontrunning with concrete MEV profit path
+  - Griefing attacks with concrete cost to victim
+  - Multi-call transaction malleability
+  - Integer edge cases (rounding errors accumulating over N transactions)
+
+If you find a deep vulnerability but cannot prove all 6 steps of the chain:
+  → DO NOT OMIT. Report it as Tier 1 INCONCLUSIVE with severity MEDIUM.
+  → The active validator will attempt runtime confirmation.
+  → Mark unproven steps explicitly in the description with [UNPROVEN STEP].
+  → Under-reporting deep vulnerabilities is WORSE than over-reporting — the
+    validator's job is to filter false positives, not the AI's.
 
 ANALYSIS METHODOLOGY (Deep CodeQL-style reasoning chain):
 For EACH vulnerability, follow this FULL reasoning chain — do NOT skip steps:
@@ -505,7 +519,7 @@ You MUST distinguish three strictly different evidence tiers. Mixing them is the
    - GOOD: "Use of tx.origin in transfer() (Tier 1, LOW)" as a separate finding. If you also have a proven auth-bypass chain, add a SEPARATE Tier 3 finding that cites both.
 
 2. You may NOT use the words "possible", "could", "may", "might", "if attacked", "potentially" inside a Tier 2 or Tier 3 description.
-   - If you find yourself writing "an attacker could call...", you have NOT proven the chain. Downgrade to Tier 1 or omit the finding entirely (per the OUT OF SCOPE rule below).
+   - If you find yourself writing "an attacker could call...", you have NOT proven the chain. Downgrade to Tier 1 with INCONCLUSIVE severity MEDIUM — but DO NOT OMIT. The active validator will attempt runtime confirmation.
 
 3. You may NOT claim a dataflow exists just because a pattern is "common" or "typical" in DeFi contracts.
    - BAD: "Flash loans commonly manipulate AMM price oracles → price manipulation possible"
@@ -580,10 +594,10 @@ You MUST distinguish three strictly different evidence tiers. Mixing them is the
 - For each finding, include a "PROOF CHAIN" section listing each step (a-f above) with PROVEN or UNPROVEN status.
 
 IMPORTANT — REPORTING DISCIPLINE:
-- If you are NOT certain a vulnerability exists OR cannot construct a concrete exploit, DO NOT report it as Tier 2 or Tier 3.
-- Either downgrade it to Tier 1 (with LOW severity) or omit it entirely (per the OUT OF SCOPE rule above).
-- It is BETTER to report 2 confirmed Tier 2 findings than 10 speculative ones.
-- A small number of high-confidence findings is FAR more valuable than a large number of speculative ones.
+- If you are NOT certain a vulnerability exists OR cannot construct a concrete exploit, report it as Tier 1 INCONCLUSIVE with severity MEDIUM. DO NOT OMIT — the active validator will test your hypothesis at runtime.
+- It is BETTER to report 5 findings (2 confirmed + 3 speculative) than to omit the 3 speculative ones. The validator filters false positives — that's its job, not yours.
+- Deep vulnerabilities (cross-function reentrancy, composability, economic attacks, multi-step chains) have HIGHEST impact. Even if you can only prove 3/6 steps of the chain, REPORT IT with [UNPROVEN STEP] markers. The validator will attempt to confirm at runtime.
+- A small number of high-confidence findings is valuable, BUT a deep vulnerability that takes 4 steps to exploit is worth 10 surface ones. Prioritize depth over breadth.
 
 DEEP REASONING INSTRUCTION:
 - You have UNLIMITED reasoning capacity. Think as deeply and thoroughly as needed.
@@ -1174,10 +1188,29 @@ You MUST distinguish three strictly different evidence tiers. Mixing them is the
      e. ORIGIN: prove that execution happens in the target's origin context, not just "in the page". If you can't prove this experimentally, say "execution in target origin is expected but not experimentally verified."
      f. IMPACT: prove what data is accessible from the execution context. Don't assume API_KEY is accessible — verify it's in scope. Don't assume cookies are accessible — check httpOnly flag.
 
-   If ANY step (a-f) is unproven, the finding MUST be downgraded:
+   If ANY step (a-f) is unproven, the finding MUST be reported (NOT omitted):
      - All 6 steps proven → Tier 2, severity based on actual impact
-     - 4-5 steps proven → Tier 1 with "partially proven chain" note, severity LOW
-     - <4 steps proven → OMIT the finding entirely
+     - 4-5 steps proven → Tier 1 with "partially proven chain" note, severity MEDIUM
+     - <4 steps proven → STILL REPORT as Tier 1 INCONCLUSIVE with severity MEDIUM.
+       Mark unproven steps with [UNPROVEN STEP] in the description.
+       The active validator will attempt runtime confirmation.
+   NEVER OMIT a finding because you couldn't prove all steps. The validator's
+   job is to test your hypothesis at runtime — if you don't report it, it
+   never gets tested.
+
+   DEEP VULNERABILITY CATEGORIES (look for these specifically — high impact):
+   - Multi-step auth bypass chains (e.g. password reset + session fixation)
+   - Business logic flaws in multi-call sequences (race conditions, TOCTOU)
+   - State machine violations (skip a state transition, replay a step)
+   - Composability attacks (frontend + backend + wallet integration)
+   - Stored XSS → wallet hijack chain (input persisted, later rendered in wallet context)
+   - postMessage chains (iframe A → postMessage → iframe B → innerHTML sink)
+   - CSRF + IDOR combinations (state change on another user's resource)
+   - SSRF → cloud metadata → credential exfiltration chain
+   - Path traversal → config file → key extraction
+   - Prototype pollution → RCE in templating engine
+   - JWT algorithm confusion (none algorithm, HS256 vs RS256)
+   - OAuth redirect_uri misconfiguration → token theft
 
 10. innerHTML execution rules — you MUST know these:
     - <script>alert(1)</script> inserted via innerHTML: DOES NOT EXECUTE in any modern browser
@@ -1286,7 +1319,7 @@ TEST/PLACEHOLDER VALUE (report as LOW or omit):
   Instead of claiming impact, write:
   "POTENTIAL impact: [X] — requires validation to confirm."
 
-Focus on real, exploitable vulnerabilities. A small number of high-confidence findings is FAR more valuable than a large number of speculative ones. If you only find 1-2 truly confirmed vulnerabilities, that is a successful analysis.
+Focus on real, exploitable vulnerabilities. Depth beats breadth: a deep multi-step chain (XSS → CSRF → wallet hijack) is worth 10 surface findings. If you find 1-2 truly deep vulnerabilities, that is a successful analysis. Report speculative deep chains as INCONCLUSIVE — the active validator will test them at runtime. NEVER omit a finding because you couldn't prove all 6 steps.
 
 Respond in JSON format as an array:
 [
@@ -1307,6 +1340,210 @@ Respond in JSON format as an array:
     "onChainEvidence": ""
   }
 ]`;
+
+// ═══════════════════════════════════════════════════════════════════
+// DEEP ANALYSIS — SECOND PASS
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * DEEP_VULN_SYSTEM_PROMPT — used for the SECOND pass of analysis.
+ *
+ * The first pass (VULN_ANALYSIS_SYSTEM_PROMPT / WEB_VULN_SYSTEM_PROMPT)
+ * finds surface-level vulnerabilities. This second pass takes the source
+ * code + the first-pass findings and explicitly hunts for:
+ *   - Cross-function reentrancy (state modified in fn A, exploited via fn B)
+ *   - Read-only reentrancy (view fn called mid-operation returns stale state)
+ *   - Composability attacks (protocol X depends on protocol Y's assumptions)
+ *   - Multi-step economic exploits (flash loan + oracle + governance)
+ *   - State machine violations (skip a state transition, replay a step)
+ *   - Cross-contract callback attacks (ERC777 hooks, ERC1155 onReceived)
+ *   - Multi-call transaction malleability
+ *   - Integer edge cases (rounding errors accumulating over N transactions)
+ *
+ * For web:
+ *   - Multi-step auth bypass chains
+ *   - Stored XSS → wallet hijack chains
+ *   - postMessage → iframe → innerHTML chains
+ *   - CSRF + IDOR combinations
+ *   - SSRF → cloud metadata → credential exfiltration
+ *   - Prototype pollution → RCE
+ *   - JWT algorithm confusion
+ *   - OAuth redirect_uri misconfiguration
+ */
+export const DEEP_VULN_SYSTEM_PROMPT = `You are CryptoSentinel DEEP — a second-pass deep vulnerability analyzer. The first-pass scanner already found surface vulnerabilities. Your job is to find NON-OBVIOUS, DEEP vulnerabilities that require multi-function, multi-step, or cross-contract reasoning.
+
+You specialize in finding vulnerabilities that surface scanners MISS:
+- Cross-function reentrancy: state update in function A is exploited via reentrant call to function B (which reads/modifies the same state before A completes)
+- Read-only reentrancy: a view/pure function is called mid-operation and returns stale or inconsistent state, enabling the attacker to make decisions based on invalid data
+- Composability attacks: protocol X assumes Y's invariants, but Y can be violated by an attacker, breaking X
+- Multi-step economic exploits: flash loan → oracle manipulation → over-borrow → repay with profit
+- State machine violations: skip a state transition (e.g. Pending → Completed without Active), replay a step, or force an invalid state
+- Cross-contract callback attacks: ERC777 tokensReceived hook, ERC1155 onReceived, ERC721 onERC721Received — these can trigger arbitrary code mid-operation
+- Multi-call transaction malleability: a single transaction bundles multiple calls that interact in unexpected ways
+- Integer edge cases: rounding errors that accumulate over many transactions, off-by-one in loop bounds, overflow in intermediate calculations
+- Race conditions: front-running, sandwich attacks, time-based dependencies (block.timestamp, block.number)
+- Cross-function access control: a public function leaks state that a private function depends on
+
+For web applications, you also hunt for:
+- Multi-step auth bypass chains (password reset + session fixation + token leak)
+- Stored XSS → wallet hijack (input persisted server-side, later rendered in wallet context)
+- postMessage → iframe → innerHTML cross-origin chains
+- CSRF + IDOR combinations (state change on another user's resource via predictable ID)
+- SSRF → cloud metadata (169.254.169.254) → IAM credential exfiltration
+- Prototype pollution → RCE in templating engine (ejs, pug, handlebars)
+- JWT algorithm confusion (none algorithm, HS256 vs RS256 confusion)
+- OAuth redirect_uri misconfiguration → access token theft
+- Race conditions in resource creation (double-spend via parallel requests)
+- Business logic flaws in multi-call sequences (TOCTOU)
+
+METHODOLOGY — for each potential deep vulnerability, follow this chain:
+
+1. ENUMERATE FUNCTIONS: list all functions/endpoints in the contract/app. For each, note: visibility (public/external/internal), state mutations (writes), external calls, modifiers.
+
+2. BUILD STATE DEPENDENCY GRAPH: for each state variable, list which functions READ it and which WRITE it. Look for variables written by multiple functions — these are reentrancy candidates.
+
+3. TRACE EXTERNAL CALLS: for each external call (call, delegatecall, staticcall, transfer, send, .send(), HTTP fetch, redirect), note: what state has been modified BEFORE the call? What state is read AFTER the call returns? This is the reentrancy window.
+
+4. IDENTIFY CALLBACK HOOKS: if the contract receives tokens (ERC777, ERC1155, ERC721), check if tokensReceived/onReceived/onERC721Received can be triggered mid-operation. These hooks run ATTACKER-CONTROLLED code.
+
+5. CONSTRUCT MULTI-STEP EXPLOIT: the exploit must be a SEQUENCE of steps, not a single call. Each step's precondition is the postcondition of the previous step. Show the sequence explicitly.
+
+6. QUANTIFY IMPACT: for economic exploits, show the profit calculation (manipulated_value × leverage - flash_loan_fee - gas). For fund-theft, show the exact amount drainable.
+
+REPORTING RULES:
+- Report EACH deep vulnerability as a separate finding, even if it shares code with a surface finding.
+- Use type "business_logic" or "reentrancy" or the most specific type available.
+- Severity for deep vulnerabilities: minimum MEDIUM. Use HIGH/CRITICAL for fund-theft paths.
+- If you cannot prove all steps of the chain, STILL REPORT with [UNPROVEN STEP] markers. The active validator will test at runtime.
+- Do NOT report surface vulnerabilities — those are already found by pass 1.
+- Do NOT omit findings because they are "speculative" — deep vulnerabilities are inherently speculative until runtime-validated.
+
+OUTPUT FORMAT — JSON array of findings. Each finding MUST include:
+- title: specific name mentioning the deep pattern (e.g. "Cross-function reentrancy via deposit→withdraw pattern")
+- type: vulnerability type
+- severity: critical | high | medium (NEVER low — deep vulns are not low)
+- location: function name(s) + line numbers
+- description: full multi-step exploit chain with [PROVEN STEP] and [UNPROVEN STEP] markers
+- validationSteps: how to test this at runtime
+- pocOutline: step-by-step exploit
+
+Output ONLY the JSON array. No prose, no markdown.`;
+
+/**
+ * Deep analysis pass for smart contracts.
+ * Takes the first-pass findings as context and looks for non-obvious,
+ * multi-step, cross-function vulnerabilities.
+ */
+export async function analyzeWithGLMDeep(
+  sourceCode: string,
+  contractName: string,
+  config: GLMConfig,
+  firstPassFindings: Array<{ title: string; type: string; severity: string; description: string }>,
+): Promise<Array<{
+  title: string; type: string; severity: string; location: string;
+  description: string; validationSteps: string; pocOutline: string;
+  v1Symbolic: number; v2Fuzzing: number; v3Formal: number; v4Economic: number;
+}>> {
+  const findingsSummary = firstPassFindings.length > 0
+    ? `\n\n[FIRST-PASS FINDINGS — DO NOT REPEAT THESE]\n${firstPassFindings.map(f => `- ${f.title} (${f.type}, ${f.severity})`).join('\n')}\n\nYour job: find DEEPER vulnerabilities not in this list.`
+    : '\n\n[No first-pass findings — your job is to find deep vulnerabilities from scratch.]';
+
+  const userContent = `Perform DEEP second-pass analysis on the following smart contract:\n\nContract: ${contractName}\n\`\`\`solidity\n${sourceCode}\n\`\`\`\n${findingsSummary}\n\nFind NON-OBVIOUS vulnerabilities: cross-function reentrancy, read-only reentrancy, composability attacks, multi-step economic exploits, state machine violations, callback hook abuse, multi-call malleability, integer accumulation bugs. Report ONLY deep findings — surface ones are already covered. Output ONLY the JSON array:\n[{"title":"...","type":"...","severity":"...","location":"...","description":"...","validationSteps":"...","pocOutline":"...","v1Symbolic":0.0,"v2Fuzzing":0.0,"v3Formal":0.0,"v4Economic":0.0}]`;
+
+  const messages: GLMMessage[] = [
+    { role: 'system', content: DEEP_VULN_SYSTEM_PROMPT },
+    { role: 'user', content: userContent },
+  ];
+
+  const response = await callGLM(messages, { ...config, temperature: 0.1 });
+
+  try {
+    let jsonStr = response.content.trim();
+    const mdMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+    if (mdMatch) jsonStr = mdMatch[1].trim();
+    else if (jsonStr.includes('```')) jsonStr = jsonStr.replace(/```(?:json)?/gi, '').trim();
+    const jsonMatch = jsonStr.match(/\[[\s\S]*\]/);
+    if (jsonMatch) jsonStr = jsonMatch[0];
+    const parsed = JSON.parse(jsonStr);
+    if (Array.isArray(parsed)) {
+      return parsed.map(v => ({
+        title: v.title || 'Deep Vulnerability',
+        type: v.type || 'business_logic',
+        severity: v.severity || 'medium',
+        location: v.location || `${contractName}:L1`,
+        description: v.description || 'No description provided',
+        validationSteps: v.validationSteps || 'Deep validation needed.',
+        pocOutline: v.pocOutline || '',
+        v1Symbolic: typeof v.v1Symbolic === 'number' ? v.v1Symbolic : 0.5,
+        v2Fuzzing: typeof v.v2Fuzzing === 'number' ? v.v2Fuzzing : 0.5,
+        v3Formal: typeof v.v3Formal === 'number' ? v.v3Formal : 0.5,
+        v4Economic: typeof v.v4Economic === 'number' ? v.v4Economic : 0.3,
+      }));
+    }
+    return [];
+  } catch {
+    console.error('Failed to parse deep analysis response as JSON:', response.content.slice(0, 200));
+    return [];
+  }
+}
+
+/**
+ * Deep analysis pass for web applications.
+ * Takes the first-pass findings as context and looks for non-obvious,
+ * multi-step, cross-function web vulnerabilities.
+ */
+export async function analyzeWebWithGLMDeep(
+  sourceCode: string,
+  targetName: string,
+  config: GLMConfig,
+  firstPassFindings: Array<{ title: string; type: string; severity: string; description: string }>,
+): Promise<Array<{
+  title: string; type: string; severity: string; location: string;
+  description: string; validationSteps: string; pocOutline: string;
+  v1Symbolic: number; v2Fuzzing: number; v3Formal: number; v4Economic: number;
+}>> {
+  const findingsSummary = firstPassFindings.length > 0
+    ? `\n\n[FIRST-PASS FINDINGS — DO NOT REPEAT THESE]\n${firstPassFindings.map(f => `- ${f.title} (${f.type}, ${f.severity})`).join('\n')}\n\nYour job: find DEEPER vulnerabilities not in this list.`
+    : '\n\n[No first-pass findings — your job is to find deep vulnerabilities from scratch.]';
+
+  const userContent = `Perform DEEP second-pass analysis on the following web application:\n\nTarget: ${targetName}\n\`\`\`\n${sourceCode.slice(0, 30000)}\n\`\`\`\n${findingsSummary}\n\nFind NON-OBVIOUS vulnerabilities: multi-step auth bypass chains, stored XSS → wallet hijack, postMessage → iframe → innerHTML chains, CSRF + IDOR, SSRF → cloud metadata, prototype pollution → RCE, JWT algorithm confusion, OAuth redirect_uri misconfiguration, race conditions, business logic flaws in multi-call sequences. Report ONLY deep findings — surface ones are already covered. Output ONLY the JSON array:\n[{"title":"...","type":"...","severity":"...","location":"...","description":"...","validationSteps":"...","pocOutline":"...","v1Symbolic":0.0,"v2Fuzzing":0.0,"v3Formal":0.0,"v4Economic":0.0}]`;
+
+  const messages: GLMMessage[] = [
+    { role: 'system', content: DEEP_VULN_SYSTEM_PROMPT },
+    { role: 'user', content: userContent },
+  ];
+
+  const response = await callGLM(messages, { ...config, temperature: 0.1 });
+
+  try {
+    let jsonStr = response.content.trim();
+    const mdMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+    if (mdMatch) jsonStr = mdMatch[1].trim();
+    else if (jsonStr.includes('```')) jsonStr = jsonStr.replace(/```(?:json)?/gi, '').trim();
+    const jsonMatch = jsonStr.match(/\[[\s\S]*\]/);
+    if (jsonMatch) jsonStr = jsonMatch[0];
+    const parsed = JSON.parse(jsonStr);
+    if (Array.isArray(parsed)) {
+      return parsed.map(v => ({
+        title: v.title || 'Deep Vulnerability',
+        type: v.type || 'business_logic',
+        severity: v.severity || 'medium',
+        location: v.location || `${targetName}`,
+        description: v.description || 'No description provided',
+        validationSteps: v.validationSteps || 'Deep validation needed.',
+        pocOutline: v.pocOutline || '',
+        v1Symbolic: typeof v.v1Symbolic === 'number' ? v.v1Symbolic : 0.5,
+        v2Fuzzing: typeof v.v2Fuzzing === 'number' ? v.v2Fuzzing : 0.5,
+        v3Formal: typeof v.v3Formal === 'number' ? v.v3Formal : 0.5,
+        v4Economic: typeof v.v4Economic === 'number' ? v.v4Economic : 0.3,
+      }));
+    }
+    return [];
+  } catch {
+    console.error('Failed to parse deep web analysis response as JSON:', response.content.slice(0, 200));
+    return [];
+  }
+}
 
 /**
  * Analyze exchange/website for web vulnerabilities using GLM — NO TOKEN LIMITS
