@@ -371,7 +371,7 @@ function extractParamFromVuln(vuln: { location: string; description: string }): 
   return null;
 }
 
-async function validateWebVulnerability(targetUrl: string, vuln: any): Promise<ValidationResult> {
+async function validateWebVulnerability(targetUrl: string, vuln: any, sourceCode: string = ''): Promise<ValidationResult> {
   const vulnType = vuln.type.toLowerCase();
   let testSuite: WebTestPayload | null = null;
   if (vulnType === 'xss') testSuite = XSS_PAYLOADS;
@@ -732,13 +732,13 @@ export async function activelyValidate(
       return { confirmed: false, validationScope: 'theoretical',
         evidence: `[UNTESTED] No valid URL found. explicitTargetUrl=${explicitTargetUrl || 'undefined'}, desc=${vuln.description?.slice(0,100)}` };
     }
-    return validateWebVulnerability(targetUrl, vuln);
+    return validateWebVulnerability(targetUrl, vuln, sourceCode);
   }
 
   // Fallback: try both
   if (sourceCode.includes('pragma solidity')) return validateWithFoundry(sourceCode, contractName, vuln);
   const fallbackUrl = explicitTargetUrl || sourceCode.match(/https?:\/\/[^\s"'<>]+/)?.[0] || '';
-  if (fallbackUrl.startsWith('http')) return validateWebVulnerability(fallbackUrl, vuln);
+  if (fallbackUrl.startsWith('http')) return validateWebVulnerability(fallbackUrl, vuln, sourceCode);
   return { confirmed: false, validationScope: 'theoretical',
     evidence: `Could not determine test type for "${vuln.type}".` };
 }
