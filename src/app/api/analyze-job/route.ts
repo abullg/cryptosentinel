@@ -139,7 +139,7 @@ async function runAnalysisInBackground(jobId: string, config: {
         ? analyzeWebWithGLM(sourceCode.slice(0, 30000), contractName, { apiKey, model })
         : analyzeWithGLM(sourceCode, contractName, { apiKey, model }, undefined);
       const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('AI timeout after 90s')), 90_000)
+        setTimeout(() => reject(new Error('AI timeout after 150s')), 150_000)
       );
       aiVulns = await Promise.race([aiPromise, timeoutPromise]);
     } catch (err: any) {
