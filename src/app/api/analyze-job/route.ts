@@ -187,8 +187,9 @@ async function runAnalysisInBackground(jobId: string, config: {
 
           const verification = await activelyValidate(
             sourceCode, contractName,
-            { title: v.title, type: v.type, severity: v.severity, description: vulnDesc, location: vulnLoc },
-            apiKey, model
+            { title: v.title, type: v.type, severity: v.severity, description: v.description, location: v.location },
+            apiKey, model,
+            targetUrl || undefined  // Pass targetUrl DIRECTLY, not hidden in description
           );
           const scope = verification.validationScope || 'theoretical';
 

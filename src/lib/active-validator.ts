@@ -690,6 +690,7 @@ export async function activelyValidate(
   vuln: { type: string; title: string; severity: string; description: string; location: string },
   _apiKey?: string,
   _model?: string,
+  explicitTargetUrl?: string,
 ): Promise<ValidationResult> {
   const isSmartContract = sourceCode.includes('pragma solidity') ||
     sourceCode.includes('contract ') ||
@@ -721,21 +722,23 @@ export async function activelyValidate(
   }
 
   if (isWebVuln) {
-    const urlMatch = vuln.location?.match(/https?:\/\/[^\s]+/) ||
-      vuln.description?.match(/https?:\/\/[^\s]+/) ||
-      sourceCode.match(/https?:\/\/[^\s]+/);
-    const targetUrl = urlMatch?.[0] || sourceCode;
+    // Use explicit target URL if provided (from analyze-job), otherwise try to extract from description
+    const targetUrl = explicitTargetUrl ||
+      vuln.location?.match(/https?:\/\/[^\s"'<>]+/)?.[0] ||
+      vuln.description?.match(/https?:\/\/[^\s"'<>]+/)?.[0] ||
+      sourceCode.match(/https?:\/\/[^\s"'<>]+/)?.[0] ||
+      '';
     if (!targetUrl.startsWith('http')) {
       return { confirmed: false, validationScope: 'theoretical',
-        evidence: `Web vulnerability test skipped — no valid URL found. Finding remains at THEORETICAL validation level.` };
+        evidence: `[UNTESTED] No valid URL found. explicitTargetUrl=${explicitTargetUrl || 'undefined'}, desc=${vuln.description?.slice(0,100)}` };
     }
     return validateWebVulnerability(targetUrl, vuln);
   }
 
   // Fallback: try both
   if (sourceCode.includes('pragma solidity')) return validateWithFoundry(sourceCode, contractName, vuln);
-  const urlMatch = sourceCode.match(/https?:\/\/[^\s]+/);
-  if (urlMatch) return validateWebVulnerability(urlMatch[0], vuln);
+  const fallbackUrl = explicitTargetUrl || sourceCode.match(/https?:\/\/[^\s"'<>]+/)?.[0] || '';
+  if (fallbackUrl.startsWith('http')) return validateWebVulnerability(fallbackUrl, vuln);
   return { confirmed: false, validationScope: 'theoretical',
-    evidence: `Could not determine test type for "${vuln.type}". Finding remains at THEORETICAL validation level.` };
+    evidence: `Could not determine test type for "${vuln.type}".` };
 }

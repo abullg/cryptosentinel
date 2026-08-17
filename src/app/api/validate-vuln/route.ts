@@ -32,7 +32,8 @@ export async function POST(req: NextRequest) {
     const apiKey = process.env.OPENROUTER_API_KEY || settings?.apiKey || '';
     const model = settings?.model || 'z-ai/glm-5.2';
     
-    // Run active validation
+    // Run active validation — pass targetUrl if available
+    const targetUrl = body.targetUrl || vuln.location?.match(/https?:\/\/[^\s"'<>]+/)?.[0] || '';
     const result = await activelyValidate(
       vuln.contract?.sourceCode || body.sourceCode || '',
       vuln.contract?.name || 'Contract',
@@ -45,6 +46,7 @@ export async function POST(req: NextRequest) {
       },
       apiKey,
       model,
+      targetUrl || undefined,
     );
     
     // Update vulnerability based on validation result.
