@@ -560,6 +560,8 @@ async function sendTestRequest(url: string, method: string, payload: string, par
 async function discoverTargetParameters(targetUrl: string): Promise<string[]> {
   const discovered = new Set<string>();
   try { const u = new URL(targetUrl); u.searchParams.forEach((_, key) => discovered.add(key)); } catch {}
+
+  // Fetch the page HTML — extract params from forms and links
   try {
     const resp = await fetch(targetUrl, { headers: BROWSER_HEADERS, signal: AbortSignal.timeout(5_000) });
     const html = await resp.text();
@@ -568,22 +570,75 @@ async function discoverTargetParameters(targetUrl: string): Promise<string[]> {
     const hrefMatches = html.matchAll(/<a[^>]+href=["']([^"']+)["']/gi);
     for (const m of hrefMatches) { try { const url = m[1].startsWith('http') ? new URL(m[1]) : new URL(m[1], targetUrl);
       url.searchParams.forEach((_, key) => discovered.add(key)); } catch {} }
+    // Extract params from inline JS (Nuxt.js SPAs use URLSearchParams)
+    const jsParamMatches = html.matchAll(/(?:URLSearchParams|location\.search|location\.hash|\.get\(\s*['"]([^'"]+)['"]\s*\))/g);
+    for (const m of jsParamMatches) { if (m[1]) discovered.add(m[1]); }
   } catch {}
+
+  // Fetch robots.txt — disallow rules often reveal parameter names
+  // e.g. "Disallow: /?ref=" or "Disallow: /*?utm_source="
+  try {
+    const robotsUrl = new URL('/robots.txt', targetUrl).toString();
+    const resp = await fetch(robotsUrl, { headers: BROWSER_HEADERS, signal: AbortSignal.timeout(5_000) });
+    if (resp.ok) {
+      const robots = await resp.text();
+      // Match patterns like: ?param= or /*?param= or /path?param=
+      const paramMatches = robots.matchAll(/[?&]([A-Za-z_][A-Za-z0-9_]*)=/g);
+      for (const m of paramMatches) { discovered.add(m[1]); }
+      // Also match wildcard params: /*?utm_*
+      const wildcardMatches = robots.matchAll(/Disallow:\s*\/\*?\??([A-Za-z_][A-Za-z0-9_]*)/g);
+      for (const m of wildcardMatches) { discovered.add(m[1]); }
+    }
+  } catch {}
+
   const skip = /^(csrf|_token|__|authenticity_token|nonce|session|sid)$/i;
   const filtered = [...discovered].filter(p => !skip.test(p));
-  if (filtered.length === 0) filtered.push('q', 'search', 'query', 'id', 'url', 'redirect', 'next', 'return');
-  return filtered.slice(0, 3);
+  // Expanded default list — includes crypto-exchange-common params
+  if (filtered.length === 0) filtered.push('q', 'search', 'query', 'id', 'url', 'redirect', 'next', 'return',
+    'ref', 'source', 'utm_source', 'inviteCode', 'vipCode', 'callback', 'goto', 'dest');
+  return filtered.slice(0, 6); // Test up to 6 params (was 3)
 }
 
-function extractParamFromVuln(vuln: { location: string; description: string }): string | null {
+function extractParamFromVuln(vuln: { location: string; description: string }): string[] {
   const text = `${vuln.location || ''} ${vuln.description || ''}`;
+  const params = new Set<string>();
+
+  // Pattern 1: param= or parameter= followed by name
   const m1 = text.match(/param(?:eter)?[=:]\s*([A-Za-z_][A-Za-z0-9_]*)/i);
-  if (m1) return m1[1];
-  const m2 = text.match(/[?&]([A-Za-z_][A-Za-z0-9_]*)=/);
-  if (m2) return m2[1];
+  if (m1) params.add(m1[1]);
+
+  // Pattern 2: ?param= or &param= in URLs
+  const m2matches = text.matchAll(/[?&]([A-Za-z_][A-Za-z0-9_]*)=/g);
+  for (const m of m2matches) params.add(m[1]);
+
+  // Pattern 3: "via ?param" or "in the ?param"
   const m3 = text.match(/(?:via|in the)\s*\?([A-Za-z_][A-Za-z0-9_]*)/i);
-  if (m3) return m3[1];
-  return null;
+  if (m3) params.add(m3[1]);
+
+  // Pattern 4: "ref= or source= URL parameters" (AI often writes this)
+  const m4matches = text.matchAll(/([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:or|\/)/g);
+  for (const m of m4matches) {
+    const name = m[1];
+    // Filter out common false positives
+    if (!['http', 'https', 'true', 'false', 'null', 'undefined'].includes(name.toLowerCase())) {
+      params.add(name);
+    }
+  }
+
+  // Pattern 5: "?param or ?param2" or "?param, ?param2"
+  const m5matches = text.matchAll(/\?([A-Za-z_][A-Za-z0-9_]*)(?:\s+or\s+|\s*,\s*)\?([A-Za-z_][A-Za-z0-9_]*)/gi);
+  for (const m of m5matches) { params.add(m[1]); params.add(m[2]); }
+
+  // Pattern 6: explicit mention like "ref parameter" or "source parameter"
+  const m6matches = text.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s+parameter/gi);
+  for (const m of m6matches) {
+    const name = m[1];
+    if (!['a', 'the', 'this', 'url', 'id', 'user'].includes(name.toLowerCase())) {
+      params.add(name);
+    }
+  }
+
+  return [...params];
 }
 
 async function validateWebVulnerability(targetUrl: string, vuln: any, sourceCode: string = ''): Promise<ValidationResult> {
@@ -727,7 +782,13 @@ async function validateWebVulnerability(targetUrl: string, vuln: any, sourceCode
 
   // ─── Open redirect: test with multiple redirect params ──────
   if (vulnType === 'open_redirect') {
-    const redirectParams = ['next', 'redirect', 'url', 'return', 'callback', 'goto', 'dest', 'destination', 'continue', 'to'];
+    // Expanded list — includes crypto-exchange-common params (ref, source, utm_source)
+    // and params that AI often identifies from robots.txt disallow rules
+    const redirectParams = [
+      'next', 'redirect', 'url', 'return', 'callback', 'goto', 'dest', 'destination', 'continue', 'to',
+      'ref', 'source', 'utm_source', 'origin', 'back', 'redirect_to', 'redirect_url', 'return_to',
+      'return_url', 'returnurl', 'redirecturl', 'goto_page', 'redir', 'rurl', 'target',
+    ];
     const payloads = ['https://evil.com', '//evil.com', '/\\evil.com', 'https:evil.com'];
     const tests: Promise<any>[] = [];
     for (const param of redirectParams) {
@@ -897,11 +958,68 @@ async function validateWebVulnerability(targetUrl: string, vuln: any, sourceCode
     }
   }
 
+  // ─── IDOR: enumerate common API endpoints without auth ──────
+  // We can't test true IDOR (needs two authenticated sessions), but we CAN
+  // test if sensitive endpoints return data without ANY auth — that's an
+  // auth bypass, which is even worse than IDOR.
+  if (vulnType === 'idor' || vulnType === 'auth_bypass') {
+    const baseUrl = (() => {
+      try { const u = new URL(targetUrl); return `${u.protocol}//${u.host}`; } catch { return targetUrl; }
+    })();
+    // Common API endpoints that should require auth
+    const probePaths = [
+      '/api/v1/user', '/api/v1/users', '/api/v1/users/1', '/api/v1/account', '/api/v1/account/balance',
+      '/api/v1/orders', '/api/v1/orders/1', '/api/v1/wallet', '/api/v1/wallet/balance',
+      '/api/v2/user', '/api/v2/users/1', '/api/v2/account', '/api/v2/account/balance',
+      '/api/v2/orders', '/api/v2/orders/1', '/api/v2/wallet', '/api/v2/wallet/balance',
+      '/api/user', '/api/user/profile', '/api/account', '/api/orders',
+      '/api/v1/kyc', '/api/v1/kyc/documents', '/api/v2/kyc/documents',
+      '/api/v1/withdrawal', '/api/v1/withdrawal/address', '/api/v2/withdrawal',
+    ];
+    const probes: Promise<{ path: string; status: number; bodyLen: number; hasData: boolean }>[] = [];
+    for (const path of probePaths) {
+      probes.push((async () => {
+        try {
+          const resp = await fetch(`${baseUrl}${path}`, { headers: BROWSER_HEADERS, signal: AbortSignal.timeout(5_000) });
+          const body = await resp.text();
+          // Check if response looks like user data (not just an error page)
+          const hasUserData = /("userId"|"email"|"balance"|"account"|"orders"|"kyc"|"withdrawal"|"deposit")/i.test(body);
+          const isError = /(unauthorized|forbidden|login required|sign in|401|403|not found|not_found)/i.test(body) ||
+                          resp.status === 401 || resp.status === 403 || resp.status === 404;
+          return { path, status: resp.status, bodyLen: body.length, hasData: hasUserData && !isError };
+        } catch { return { path, status: 0, bodyLen: 0, hasData: false }; }
+      })());
+    }
+    const results = await Promise.allSettled(probes);
+    const accessibleEndpoints: string[] = [];
+    for (const r of results) {
+      if (r.status === 'fulfilled' && r.value.hasData) {
+        accessibleEndpoints.push(`${r.value.path} (HTTP ${r.value.status}, ${r.value.bodyLen} bytes, user data detected)`);
+      }
+    }
+    if (accessibleEndpoints.length > 0) {
+      return exploitConfirmed(
+        `IDOR/Auth bypass CONFIRMED: ${accessibleEndpoints.length} API endpoint(s) returned user data without authentication:\n${accessibleEndpoints.join('\n')}\n\nThis is worse than IDOR — these endpoints don't require ANY auth, exposing user data to anonymous attackers.`,
+        { validationScope: 'target', requestUrl: baseUrl });
+    }
+    // No unauthenticated access — IDOR might still exist between authenticated users,
+    // but we can't test that without two sessions. Return INCONCLUSIVE.
+    return inconclusive(
+      `[IDOR] Probed ${probePaths.length} common API endpoints on ${baseUrl} without authentication. None returned user data (all returned 401/403/404 or error messages). IDOR between authenticated users CANNOT be tested without two sessions — needs manual verification. Verdict: INCONCLUSIVE.`,
+      { validationScope: 'target', requestUrl: baseUrl });
+  }
+
   // For payload-based tests (XSS, SQLi, etc): run ALL payloads in PARALLEL
-  const mentionedParam = extractParamFromVuln(vuln);
+  const mentionedParams = extractParamFromVuln(vuln);
   let candidateParams: string[] = [];
-  if (mentionedParam) candidateParams = [mentionedParam];
-  else candidateParams = await discoverTargetParameters(targetUrl);
+  if (mentionedParams.length > 0) {
+    // Use params extracted from the vuln description, PLUS discovered params
+    // (AI might mention ref= but the target might also accept source=, url=, etc.)
+    const discovered = await discoverTargetParameters(targetUrl);
+    candidateParams = [...new Set([...mentionedParams, ...discovered])].slice(0, 6);
+  } else {
+    candidateParams = await discoverTargetParameters(targetUrl);
+  }
 
   // ─── AGGRESSIVE FALLBACK (STRICT CLASS-MATCHING) ─────────────────
   // This runs when no specific test suite exists for the claimed vuln type
@@ -1082,7 +1200,8 @@ export async function activelyValidate(
     vuln.type === 'csp_missing' || vuln.type === 'api_leak' ||
     vuln.type === 'csrf' || vuln.type === 'auth_bypass' ||
     vuln.type === 'postmessage_abuse' || vuln.type === 'clickjacking' ||
-    vuln.type === 'info_exposure' || vuln.type === 'session_fixation';
+    vuln.type === 'info_exposure' || vuln.type === 'session_fixation' ||
+    vuln.type === 'idor' || vuln.type === 'mass_assignment';
 
   if (isSmartContract) {
     const addressMatch = sourceCode.match(/0x[0-9a-fA-F]{40}/) ||
