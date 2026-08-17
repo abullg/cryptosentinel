@@ -49,13 +49,15 @@ export async function POST(req: NextRequest) {
       targetUrl || undefined,
     );
     
-    // BINARY model: confirmed or refuted. No percentages.
+    // THREE-STATE VERDICT: EXPLOITABLE / NOT_EXPLOITABLE / INCONCLUSIVE
     const scope = result.validationScope || 'theoretical';
-    if (result.confirmed) {
+    const verdict = result.verdict || (result.confirmed ? 'EXPLOITABLE' : 'INCONCLUSIVE');
+
+    if (verdict === 'EXPLOITABLE') {
       const newStatus = scope === 'target' ? 'confirmed' : 'validated';
       const label = scope === 'target'
-        ? '[EXPLOIT CONFIRMED ON PRODUCTION] Real HTTP request sent, exploit confirmed.'
-        : '[EXPLOIT CONFIRMED IN LAB] Foundry test passed.';
+        ? '[EXPLOITABLE] Exploit confirmed against production target via real HTTP request.'
+        : '[EXPLOITABLE] Exploit confirmed in lab (Foundry test passed).';
       await db.vulnerability.update({
         where: { id: vulnerabilityId },
         data: {
@@ -66,13 +68,13 @@ export async function POST(req: NextRequest) {
         },
       }).catch(() => {});
       return NextResponse.json({
-        valid: true, confidence: 1, status: newStatus,
+        valid: true, confidence: 1, status: newStatus, verdict,
         validationScope: scope, evidence: result.evidence,
       });
-    } else {
+    } else if (verdict === 'NOT_EXPLOITABLE') {
       const label = scope === 'target'
-        ? '[NOT EXPLOITABLE] Tested against production — exploit failed.'
-        : '[NOT EXPLOITABLE] Lab test failed.';
+        ? '[NOT_EXPLOITABLE] Exploit tested against production target and did NOT succeed.'
+        : '[NOT_EXPLOITABLE] Lab test failed — exploit does not work.';
       await db.vulnerability.update({
         where: { id: vulnerabilityId },
         data: {
@@ -83,7 +85,26 @@ export async function POST(req: NextRequest) {
         },
       }).catch(() => {});
       return NextResponse.json({
-        valid: false, confidence: 0, status: 'refuted',
+        valid: false, confidence: 0, status: 'refuted', verdict,
+        validationScope: scope, evidence: result.evidence,
+      });
+    } else {
+      // INCONCLUSIVE — leave as candidate, do not claim exploit works or doesn't
+      const label = '[INCONCLUSIVE] Validation ran but could not determine exploitability. ' +
+        (scope === 'theoretical'
+          ? 'Test could not execute (no URL, network error, or no test suite for this vuln type).'
+          : 'Test executed but result was ambiguous. Manual verification needed.');
+      await db.vulnerability.update({
+        where: { id: vulnerabilityId },
+        data: {
+          confidence: 0,
+          status: 'candidate',
+          validationScope: scope,
+          description: vuln.description + `\n\n${label}\n${result.evidence}`,
+        },
+      }).catch(() => {});
+      return NextResponse.json({
+        valid: false, confidence: 0, status: 'candidate', verdict,
         validationScope: scope, evidence: result.evidence,
       });
     }

@@ -1,11 +1,18 @@
 /**
  * Active Vulnerability Validator — REAL exploit testing
  *
+ * THREE-STATE VERDICT MODEL (honest reporting):
+ *   EXPLOITABLE     — active test confirmed the exploit works (HTTP payload reflected,
+ *                     Foundry PoC passed, key accepted by API, etc.)
+ *   NOT_EXPLOITABLE — active test ran and REFUTED the finding (CSP present, key rejected,
+ *                     redirect didn't happen, Foundry test failed)
+ *   INCONCLUSIVE    — could not determine (no URL to test, no test suite for vuln type,
+ *                     network error, key found but no API endpoint to verify against)
+ *
  * THREE engines for smart contracts (in order, fail-fast):
  * 1. TARGET ON-CHAIN VALIDATION (cast) — call the deployed contract on mainnet
  * 2. LAB VALIDATION (Foundry/forge) — run the PoC against a local EVM
- * 3. THEORETICAL — fallback when no contract address is available and Foundry
- *    fails. No runtime validation.
+ * 3. AGGRESSIVE FALLBACK — try multiple HTTP test suites against targetUrl
  *
  * WEB/MOBILE: HTTP-based payload testing against the production target.
  * ALL requests run in PARALLEL for speed.
@@ -15,7 +22,11 @@ import { writeFileSync, mkdirSync, rmSync, existsSync, symlinkSync } from 'fs';
 import { join } from 'path';
 import { execSync } from 'child_process';
 
+export type Verdict = 'EXPLOITABLE' | 'NOT_EXPLOITABLE' | 'INCONCLUSIVE';
+
 export interface ValidationResult {
+  verdict: Verdict;
+  /** @deprecated Use `verdict` instead. true === (verdict === 'EXPLOITABLE'). Kept for backward compat. */
   confirmed: boolean;
   evidence: string;
   testOutput?: string;
@@ -25,6 +36,17 @@ export interface ValidationResult {
   responseBody?: string;
   payload?: string;
   validationScope?: 'target' | 'lab' | 'theoretical';
+}
+
+// ─── Verdict constructors — single source of truth ─────────────────
+function exploitConfirmed(evidence: string, extra: Partial<ValidationResult> = {}): ValidationResult {
+  return { verdict: 'EXPLOITABLE', confirmed: true, evidence, ...extra };
+}
+function exploitRefuted(evidence: string, extra: Partial<ValidationResult> = {}): ValidationResult {
+  return { verdict: 'NOT_EXPLOITABLE', confirmed: false, evidence, ...extra };
+}
+function inconclusive(evidence: string, extra: Partial<ValidationResult> = {}): ValidationResult {
+  return { verdict: 'INCONCLUSIVE', confirmed: false, evidence, ...extra };
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -139,20 +161,21 @@ async function validateWithCastOnChain(
   if (!actualChain) {
     actualChain = (await detectChain(contractAddress)) || '';
     if (!actualChain) {
-      return { confirmed: false, validationScope: 'theoretical',
-        evidence: `[TARGET-VALIDATION SKIPPED] Could not detect chain for ${contractAddress}.` };
+      return inconclusive(`[TARGET-VALIDATION SKIPPED] Could not detect chain for ${contractAddress}.`,
+        { validationScope: 'theoretical' });
     }
   }
   let state: OnChainState;
   try { state = await queryOnChainState(contractAddress, actualChain); }
-  catch (e: any) { return { confirmed: false, validationScope: 'theoretical',
-    evidence: `[TARGET-VALIDATION ERROR] ${String(e.message || e).slice(0, 200)}` }; }
+  catch (e: any) { return inconclusive(`[TARGET-VALIDATION ERROR] ${String(e.message || e).slice(0, 200)}`,
+    { validationScope: 'theoretical' }); }
   const ev: string[] = [`[TARGET-VALIDATED] Queried ${contractAddress} on ${actualChain}. Bytecode: ${state.bytecodeSize} bytes.`];
   if (state.owner) ev.push(`owner(): ${state.owner}`);
   if (state.paused !== null) ev.push(`paused(): ${state.paused}`);
   if (state.totalSupply) ev.push(`totalSupply(): ${state.totalSupply}`);
   if (state.balance) ev.push(`ETH balance: ${state.balance} wei`);
   let confirmed = false;
+  let refuted = false;
   const vt = vuln.type.toLowerCase();
   if ((vt === 'access_control' || vt === 'unauthorized_mint' || vt === 'governance_hijack') && state.owner) {
     if (/^0x0{40}$/i.test(state.owner)) { ev.push(`[TARGET-CONFIRMS] Owner is zero address.`); confirmed = true; }
@@ -165,9 +188,13 @@ async function validateWithCastOnChain(
   }
   if ((vt === 'denial_of_service' || vt === 'permanent_pause') && state.paused !== null) {
     if (state.paused) { ev.push(`[TARGET-CONFIRMS] Contract is paused.`); confirmed = true; }
-    else { ev.push(`[TARGET-REFUTES] Contract is NOT paused.`); }
+    else { ev.push(`[TARGET-REFUTES] Contract is NOT paused.`); refuted = true; }
   }
-  return { confirmed, validationScope: 'target', evidence: ev.join('\n') };
+  if (confirmed) return exploitConfirmed(ev.join('\n'), { validationScope: 'target' });
+  if (refuted) return exploitRefuted(ev.join('\n'), { validationScope: 'target' });
+  // Queried on-chain state but no clear verdict — INCONCLUSIVE, not "confirmed: false"
+  return inconclusive(ev.join('\n') + `\n[INCONCLUSIVE] On-chain state queried but does not clearly confirm or refute the vuln.`,
+    { validationScope: 'target' });
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -207,14 +234,17 @@ async function validateWithFoundry(sourceCode: string, contractName: string, vul
     const result = execSync('forge test -vvv 2>&1', { cwd: tmpDir, timeout: 30_000, encoding: 'utf-8', stdio: 'pipe' });
     const passed = result.includes('[PASS]') || result.includes('SUCCESS');
     const gasMatch = result.match(/(\d+)\s+gas/);
-    return passed ? { confirmed: true, validationScope: 'lab',
-      evidence: `Foundry PoC PASSED. Gas: ${gasMatch?.[1] || 'n/a'}. This confirms the exploit works in a local EVM, NOT that the deployed contract is exploitable.`,
-      testOutput: result.slice(0, 2000), gasUsed: gasMatch ? parseInt(gasMatch[1]) : undefined }
-      : { confirmed: false, validationScope: 'lab',
-        evidence: `Foundry PoC FAILED — exploit did not succeed under lab conditions.`,
-        testOutput: result.slice(0, 2000) };
-  } catch (e: any) { return { confirmed: false, validationScope: 'theoretical',
-    evidence: `Foundry error: ${String(e.message || e).slice(0, 300)}` }; }
+    if (passed) return exploitConfirmed(
+      `Foundry PoC PASSED. Gas: ${gasMatch?.[1] || 'n/a'}. This confirms the exploit works in a local EVM, NOT that the deployed contract is exploitable.`,
+      { validationScope: 'lab', testOutput: result.slice(0, 2000), gasUsed: gasMatch ? parseInt(gasMatch[1]) : undefined });
+    // Foundry ran but PoC failed — exploit REFUTED under lab conditions
+    return exploitRefuted(`Foundry PoC FAILED — exploit did not succeed under lab conditions.`,
+      { validationScope: 'lab', testOutput: result.slice(0, 2000) });
+  } catch (e: any) {
+    // Foundry crashed (compile error, missing deps, timeout) — INCONCLUSIVE, not "refuted"
+    return inconclusive(`Foundry error: ${String(e.message || e).slice(0, 300)}`,
+      { validationScope: 'theoretical' });
+  }
   finally { try { rmSync(tmpDir, { recursive: true, force: true }); } catch {} }
 }
 
@@ -393,27 +423,27 @@ async function validateWebVulnerability(targetUrl: string, vuln: any, sourceCode
       // CSP check
       if (vulnType === 'csp_missing') {
         const csp = headers['content-security-policy'] || '';
-        if (!csp) return { confirmed: true, validationScope: 'target',
-          evidence: `CSP header ABSENT — confirmed via real HTTP request to ${targetUrl}. Response has no Content-Security-Policy. This is a confirmed configuration weakness.`,
-          requestUrl: targetUrl, responseStatus: resp.status };
-        if (csp.includes("'unsafe-inline'") || csp.includes('https:')) return { confirmed: true, validationScope: 'target',
-          evidence: `CSP is WEAK — contains 'unsafe-inline' or https: wildcard: ${csp.slice(0, 200)}. Inline scripts are allowed, reducing XSS protection to zero.`,
-          requestUrl: targetUrl, responseStatus: resp.status };
-        return { confirmed: false, validationScope: 'target',
-          evidence: `CSP is PRESENT and strict: ${csp.slice(0, 200)}. Not exploitable.`,
-          requestUrl: targetUrl, responseStatus: resp.status };
+        if (!csp) return exploitConfirmed(
+          `CSP header ABSENT — confirmed via real HTTP request to ${targetUrl}. Response has no Content-Security-Policy. This is a confirmed configuration weakness.`,
+          { validationScope: 'target', requestUrl: targetUrl, responseStatus: resp.status });
+        if (csp.includes("'unsafe-inline'") || csp.includes('https:')) return exploitConfirmed(
+          `CSP is WEAK — contains 'unsafe-inline' or https: wildcard: ${csp.slice(0, 200)}. Inline scripts are allowed, reducing XSS protection to zero.`,
+          { validationScope: 'target', requestUrl: targetUrl, responseStatus: resp.status });
+        // CSP present and strict — refuted
+        return exploitRefuted(`CSP is PRESENT and strict: ${csp.slice(0, 200)}. Not exploitable.`,
+          { validationScope: 'target', requestUrl: targetUrl, responseStatus: resp.status });
       }
 
       // Clickjacking check
       if (vulnType === 'clickjacking') {
         const xfo = headers['x-frame-options'] || '';
         const csp = headers['content-security-policy'] || '';
-        if (!xfo && !csp.includes('frame-ancestors')) return { confirmed: true, validationScope: 'target',
-          evidence: `X-Frame-Options ABSENT and CSP has no frame-ancestors — page is frameable. Clickjacking confirmed.`,
-          requestUrl: targetUrl, responseStatus: resp.status };
-        return { confirmed: false, validationScope: 'target',
-          evidence: `Framing is blocked: X-Frame-Options=${xfo}, CSP frame-ancestors=${csp.includes('frame-ancestors') ? 'present' : 'absent'}.`,
-          requestUrl: targetUrl, responseStatus: resp.status };
+        if (!xfo && !csp.includes('frame-ancestors')) return exploitConfirmed(
+          `X-Frame-Options ABSENT and CSP has no frame-ancestors — page is frameable. Clickjacking confirmed.`,
+          { validationScope: 'target', requestUrl: targetUrl, responseStatus: resp.status });
+        return exploitRefuted(
+          `Framing is blocked: X-Frame-Options=${xfo}, CSP frame-ancestors=${csp.includes('frame-ancestors') ? 'present' : 'absent'}.`,
+          { validationScope: 'target', requestUrl: targetUrl, responseStatus: resp.status });
       }
 
       // Info exposure — check for verbose headers, version disclosure
@@ -422,68 +452,92 @@ async function validateWebVulnerability(targetUrl: string, vuln: any, sourceCode
         if (headers['x-powered-by']) exposing.push(`X-Powered-By: ${headers['x-powered-by']}`);
         if (headers['server'] && !headers['server'].includes('cloudflare')) exposing.push(`Server: ${headers['server']}`);
         if (headers['x-aspnet-version']) exposing.push(`X-AspNet-Version: ${headers['x-aspnet-version']}`);
-        if (exposing.length > 0) return { confirmed: true, validationScope: 'target',
-          evidence: `Information disclosure confirmed: ${exposing.join(', ')}. Technology fingerprint visible in headers.`,
-          requestUrl: targetUrl, responseStatus: resp.status };
-        return { confirmed: false, validationScope: 'target',
-          evidence: `No version disclosure in headers. Server header is generic or absent.`,
-          requestUrl: targetUrl, responseStatus: resp.status };
+        if (exposing.length > 0) return exploitConfirmed(
+          `Information disclosure confirmed: ${exposing.join(', ')}. Technology fingerprint visible in headers.`,
+          { validationScope: 'target', requestUrl: targetUrl, responseStatus: resp.status });
+        return exploitRefuted(`No version disclosure in headers. Server header is generic or absent.`,
+          { validationScope: 'target', requestUrl: targetUrl, responseStatus: resp.status });
       }
 
       // CSRF check — look for CSRF tokens in HTML form
       if (vulnType === 'csrf') {
         const body = await resp.text();
         const hasCsrfToken = body.match(/csrf[_-]?token|_token|authenticity_token|__RequestVerificationToken/i);
-        if (!hasCsrfToken) return { confirmed: true, validationScope: 'target',
-          evidence: `No CSRF token found in page HTML. Forms are vulnerable to CSRF.`,
-          requestUrl: targetUrl, responseStatus: resp.status };
-        return { confirmed: false, validationScope: 'target',
-          evidence: `CSRF token found in HTML: ${hasCsrfToken[0]}. Forms are protected.`,
-          requestUrl: targetUrl, responseStatus: resp.status };
+        if (!hasCsrfToken) return exploitConfirmed(
+          `No CSRF token found in page HTML. Forms are vulnerable to CSRF.`,
+          { validationScope: 'target', requestUrl: targetUrl, responseStatus: resp.status });
+        return exploitRefuted(`CSRF token found in HTML: ${hasCsrfToken[0]}. Forms are protected.`,
+          { validationScope: 'target', requestUrl: targetUrl, responseStatus: resp.status });
       }
 
       // Auth bypass — check if endpoint returns data without auth
       if (vulnType === 'auth_bypass') {
         if (resp.status === 200) {
           const body = await resp.text();
-          if (body.includes('unauthorized') || body.includes('login required') || resp.status === 401) {
-            return { confirmed: false, validationScope: 'target',
-              evidence: `Endpoint requires authentication (HTTP ${resp.status}). Auth bypass not confirmed.`,
-              requestUrl: targetUrl, responseStatus: resp.status };
+          // Strict check: 200 alone is NOT enough. Body must contain data that should be auth-protected.
+          // Public pages (login form, marketing, 404 page) returning 200 is NOT an auth bypass.
+          const looksProtected = body.includes('unauthorized') || body.includes('login required') ||
+            body.includes('please log in') || body.includes('signin required') ||
+            body.match(/"userId"|"email"|"balance"|"account"|"private"|"secret"/i);
+          if (looksProtected) {
+            // Sensitive data returned without auth — real auth bypass
+            return exploitConfirmed(
+              `Endpoint returned HTTP 200 with sensitive-looking data (userId/email/balance) without auth header. Auth bypass confirmed.`,
+              { validationScope: 'target', requestUrl: targetUrl, responseStatus: resp.status });
           }
-          return { confirmed: true, validationScope: 'target',
-            evidence: `Endpoint returned HTTP 200 without authentication header. Data accessible without auth.`,
-            requestUrl: targetUrl, responseStatus: resp.status };
+          // 200 but no sensitive data — INCONCLUSIVE (might be a public page, can't tell)
+          return inconclusive(
+            `Endpoint returned HTTP 200 without auth, but response body does not contain obviously sensitive data. Could be a public page or a real bypass — needs manual verification.`,
+            { validationScope: 'target', requestUrl: targetUrl, responseStatus: resp.status });
         }
+        if (resp.status === 401 || resp.status === 403) {
+          return exploitRefuted(`Endpoint requires authentication (HTTP ${resp.status}). Auth bypass not possible.`,
+            { validationScope: 'target', requestUrl: targetUrl, responseStatus: resp.status });
+        }
+        // 404, 500, etc. — can't tell
+        return inconclusive(`Endpoint returned HTTP ${resp.status}. Cannot determine auth behavior.`,
+          { validationScope: 'target', requestUrl: targetUrl, responseStatus: resp.status });
       }
-    } catch (e: any) { return { confirmed: false, validationScope: 'theoretical',
-      evidence: `Validation error: ${String(e.message || e).slice(0, 200)}` }; }
+    } catch (e: any) {
+      // Network error — INCONCLUSIVE, not "refuted"
+      return inconclusive(`Validation error (network): ${String(e.message || e).slice(0, 200)}`,
+        { validationScope: 'theoretical' });
+    }
   }
 
   // ─── CORS: test with multiple origins ──────
   if (vulnType === 'cors_misconfig') {
     const origins = ['https://evil.com', 'https://attacker.example', 'null', 'https://evil.levex.com'];
+    let requestsAttempted = 0;
+    let requestsSucceeded = 0;
     for (const origin of origins) {
       try {
+        requestsAttempted++;
         const resp = await fetch(targetUrl, { headers: { ...BROWSER_HEADERS, 'Origin': origin }, signal: AbortSignal.timeout(8_000) });
+        requestsSucceeded++;
         const headers: Record<string, string> = {};
         resp.headers.forEach((v, k) => { headers[k] = v; });
         const acao = headers['access-control-allow-origin'] || '';
         const acac = headers['access-control-allow-credentials'] || '';
-        if (acao === '*' && acac === 'true') return { confirmed: true, validationScope: 'target',
-          evidence: `CORS misconfiguration CONFIRMED: ACAO=* with ACAC=true. Any origin can read authenticated responses. Origin tested: ${origin}.`,
-          requestUrl: targetUrl, responseStatus: resp.status, payload: origin };
-        if (acao === origin && acac === 'true') return { confirmed: true, validationScope: 'target',
-          evidence: `CORS origin reflection CONFIRMED: server reflected Origin=${origin} with ACAC=true. Any origin is accepted.`,
-          requestUrl: targetUrl, responseStatus: resp.status, payload: origin };
-        if (acao === 'null' && acac === 'true') return { confirmed: true, validationScope: 'target',
-          evidence: `CORS null origin CONFIRMED: ACAO=null with ACAC=true. Sandbox iframe can bypass CORS.`,
-          requestUrl: targetUrl, responseStatus: resp.status, payload: origin };
+        if (acao === '*' && acac === 'true') return exploitConfirmed(
+          `CORS misconfiguration CONFIRMED: ACAO=* with ACAC=true. Any origin can read authenticated responses. Origin tested: ${origin}.`,
+          { validationScope: 'target', requestUrl: targetUrl, responseStatus: resp.status, payload: origin });
+        if (acao === origin && acac === 'true') return exploitConfirmed(
+          `CORS origin reflection CONFIRMED: server reflected Origin=${origin} with ACAC=true. Any origin is accepted.`,
+          { validationScope: 'target', requestUrl: targetUrl, responseStatus: resp.status, payload: origin });
+        if (acao === 'null' && acac === 'true') return exploitConfirmed(
+          `CORS null origin CONFIRMED: ACAO=null with ACAC=true. Sandbox iframe can bypass CORS.`,
+          { validationScope: 'target', requestUrl: targetUrl, responseStatus: resp.status, payload: origin });
       } catch {}
     }
-    return { confirmed: false, validationScope: 'target',
-      evidence: `CORS test completed — ${origins.length} origins tested. No misconfiguration found. ACAO is not * and no origin reflection.`,
-      requestUrl: targetUrl };
+    // All requests failed — INCONCLUSIVE
+    if (requestsSucceeded === 0) return inconclusive(
+      `CORS test could not run — all ${requestsAttempted} requests to ${targetUrl} failed (network error or timeout).`,
+      { validationScope: 'theoretical', requestUrl: targetUrl });
+    // Tests ran, none confirmed misconfig — NOT_EXPLOITABLE
+    return exploitRefuted(
+      `CORS test completed — ${origins.length} origins tested. No misconfiguration found. ACAO is not * and no origin reflection.`,
+      { validationScope: 'target', requestUrl: targetUrl });
   }
 
   // ─── Open redirect: test with multiple redirect params ──────
@@ -496,74 +550,104 @@ async function validateWebVulnerability(targetUrl: string, vuln: any, sourceCode
         for (const method of ['GET', 'POST']) {
           tests.push((async () => {
             const resp = await sendTestRequest(targetUrl, method, payload, param, { followRedirect: false });
-            if (resp.status === 0) return null;
+            if (resp.status === 0) return { state: 'failed' };
             if (resp.status >= 300 && resp.status < 400) {
               const location = resp.headers['location'] || '';
-              if (location.includes('evil.com')) return { confirmed: true, param, payload, status: resp.status, location };
+              if (location.includes('evil.com')) return { state: 'confirmed', param, payload, status: resp.status, location };
             }
             // Also check if body contains the redirect URL (meta refresh, JS redirect)
             if (resp.body.includes('evil.com') && (resp.body.includes('window.location') || resp.body.includes('meta http-equiv'))) {
-              return { confirmed: true, param, payload, status: resp.status, location: 'body-redirect' };
+              return { state: 'confirmed', param, payload, status: resp.status, location: 'body-redirect' };
             }
-            return null;
+            return { state: 'no-redirect', status: resp.status };
           })());
         }
       }
     }
     const results = await Promise.allSettled(tests);
+    let succeeded = 0;
     for (const r of results) {
-      if (r.status === 'fulfilled' && r.value?.confirmed) {
-        return { confirmed: true, validationScope: 'target',
-          evidence: `Open redirect CONFIRMED: ${r.value.param}=${r.value.payload} → HTTP ${r.value.status} Location: ${r.value.location}. Server redirects to attacker-controlled domain.`,
-          requestUrl: targetUrl, responseStatus: r.value.status, payload: r.value.payload };
+      if (r.status === 'fulfilled' && r.value?.state === 'confirmed') {
+        return exploitConfirmed(
+          `Open redirect CONFIRMED: ${r.value.param}=${r.value.payload} → HTTP ${r.value.status} Location: ${r.value.location}. Server redirects to attacker-controlled domain.`,
+          { validationScope: 'target', requestUrl: targetUrl, responseStatus: r.value.status, payload: r.value.payload });
       }
+      if (r.status === 'fulfilled' && r.value?.state !== 'failed') succeeded++;
     }
-    return { confirmed: false, validationScope: 'target',
-      evidence: `Open redirect test completed — ${redirectParams.length} params × ${payloads.length} payloads × 2 methods = ${redirectParams.length * payloads.length * 2} requests. No redirect to external domain found.`,
-      requestUrl: targetUrl };
+    if (succeeded === 0) return inconclusive(
+      `Open redirect test could not run — all ${tests.length} requests to ${targetUrl} failed (network error or timeout).`,
+      { validationScope: 'theoretical', requestUrl: targetUrl });
+    return exploitRefuted(
+      `Open redirect test completed — ${redirectParams.length} params × ${payloads.length} payloads × 2 methods = ${redirectParams.length * payloads.length * 2} requests. No redirect to external domain found.`,
+      { validationScope: 'target', requestUrl: targetUrl });
   }
 
-  // ─── API key / secret exposure: check if key is real ──────
+  // ─── API key / secret exposure: 4 distinct verdicts ──────
   if (vulnType === 'api_leak') {
     // Extract the key value from source code
     const keyMatch = sourceCode.match(/(?:api[_-]?key|secret|token|password|private[_-]?key)\s*[=:]\s*['"]([^'"]+)['"]/i);
-    if (keyMatch) {
-      const value = keyMatch[1];
-      const testPatterns = /^(sk-leaked|sk-test|sk-fake|test|example|demo|sample|xxx|your[_-]?api[_-]?key|placeholder|changeme|default|foo|bar|baz|password|secret|token|abc123|12345678)$/i;
-      if (testPatterns.test(value) || value.length < 12) {
-        return { confirmed: false, validationScope: 'target',
-          evidence: `API key value "${value.slice(0,3)}***${value.slice(-3)}" appears to be a TEST/PLACEHOLDER value. Not a real credential.`,
-          requestUrl: targetUrl };
-      }
-      // If it looks real, check if any API endpoint accepts it
-      // Try common API patterns found in the source
-      const apiUrls = sourceCode.match(/https?:\/\/[^\s'"]+\/api\/[^\s'"]+/g) || [];
-      if (apiUrls.length > 0 && targetUrl) {
-        for (const apiUrl of apiUrls.slice(0, 3)) {
-          try {
-            const resp = await fetch(apiUrl, { headers: { ...BROWSER_HEADERS, 'Authorization': `Bearer ${value}` }, signal: AbortSignal.timeout(5_000) });
-            if (resp.status === 200) return { confirmed: true, validationScope: 'target',
-              evidence: `API key "${value.slice(0,3)}***${value.slice(-3)}" is ACCEPTED by ${apiUrl}. Returned HTTP 200. Real credential confirmed.`,
-              requestUrl: apiUrl, responseStatus: resp.status };
-            if (resp.status === 401 || resp.status === 403) return { confirmed: false, validationScope: 'target',
-              evidence: `API key rejected by ${apiUrl} (HTTP ${resp.status}). Key is invalid or expired.`,
-              requestUrl: apiUrl, responseStatus: resp.status };
-          } catch {}
-        }
-      }
-      // Can't test against API — NOT CONFIRMED, just observed
-      return { confirmed: false, validationScope: 'target',
-        evidence: `Hardcoded key "${value.slice(0,3)}***${value.slice(-3)}" does not match test patterns — may be real. However, could not verify against an API endpoint (no API URL found in source). SECRET FOUND: YES. CREDENTIAL VALIDATED: NO. EXPLOIT CONFIRMED: NO. Verdict: NOT_CONFIRMED.`,
-        requestUrl: targetUrl };
+    if (!keyMatch) {
+      // No key literal found in source — INCONCLUSIVE (can't test what we can't see)
+      return inconclusive(`No hardcoded key value found in source code to validate. AI flagged this as api_leak but no credential literal was extracted — needs manual review.`,
+        { validationScope: 'target', requestUrl: targetUrl });
     }
-    return { confirmed: false, validationScope: 'target',
-      evidence: `No hardcoded key value found in source code to validate.`,
-      requestUrl: targetUrl };
+    const value = keyMatch[1];
+    const maskedValue = `${value.slice(0, 3)}***${value.slice(-3)}`;
+    const testPatterns = /^(sk-leaked|sk-test|sk-fake|test|example|demo|sample|xxx|your[_-]?api[_-]?key|placeholder|changeme|default|foo|bar|baz|password|secret|token|abc123|12345678)$/i;
+    if (testPatterns.test(value) || value.length < 12) {
+      // Value matches test/placeholder patterns — NOT_EXPLOITABLE (not a real credential)
+      return exploitRefuted(
+        `API key value "${maskedValue}" appears to be a TEST/PLACEHOLDER value. Not a real credential — not exploitable.`,
+        { validationScope: 'target', requestUrl: targetUrl });
+    }
+    // Value looks real — try to verify against any API URL found in source
+    const apiUrls = sourceCode.match(/https?:\/\/[^\s'"]+\/api\/[^\s'"]+/g) || [];
+    if (apiUrls.length === 0) {
+      // Key looks real BUT we have no API endpoint to test it against.
+      // We CANNOT claim EXPLOITABLE — we never sent an authenticated request that succeeded.
+      // We also CANNOT claim NOT_EXPLOITABLE — the key may still be valid.
+      // HONEST VERDICT: INCONCLUSIVE.
+      return inconclusive(
+        `Hardcoded key "${maskedValue}" does not match test patterns — may be real. However, could not verify against an API endpoint (no API URL found in source). SECRET FOUND: YES. CREDENTIAL VALIDATED: NO. EXPLOIT CONFIRMED: NO. Verdict: INCONCLUSIVE — manual verification needed (try the key against the production API).`,
+        { validationScope: 'target', requestUrl: targetUrl });
+    }
+    // Try each API URL
+    let anyRequestSucceeded = false;
+    for (const apiUrl of apiUrls.slice(0, 3)) {
+      try {
+        const resp = await fetch(apiUrl, { headers: { ...BROWSER_HEADERS, 'Authorization': `Bearer ${value}` }, signal: AbortSignal.timeout(5_000) });
+        anyRequestSucceeded = true;
+        if (resp.status === 200) {
+          // Key accepted by real API — EXPLOITABLE
+          return exploitConfirmed(
+            `API key "${maskedValue}" is ACCEPTED by ${apiUrl}. Returned HTTP 200. Real credential confirmed — unauthorized access possible.`,
+            { validationScope: 'target', requestUrl: apiUrl, responseStatus: resp.status });
+        }
+        if (resp.status === 401 || resp.status === 403) {
+          // Key rejected by API — NOT_EXPLOITABLE (key is invalid or expired)
+          return exploitRefuted(
+            `API key "${maskedValue}" was rejected by ${apiUrl} (HTTP ${resp.status}). Key is invalid, expired, or scoped to a different endpoint — not exploitable via this API.`,
+            { validationScope: 'target', requestUrl: apiUrl, responseStatus: resp.status });
+        }
+        // 404, 500, 429, etc. — try next URL
+      } catch {}
+    }
+    // Key looks real, API URLs exist, but none of the requests succeeded
+    if (!anyRequestSucceeded) {
+      return inconclusive(
+        `Hardcoded key "${maskedValue}" may be real, but all ${apiUrls.length} API URL(s) found in source were unreachable (network error or timeout). Cannot determine if key is valid. Verdict: INCONCLUSIVE.`,
+        { validationScope: 'theoretical', requestUrl: targetUrl });
+    }
+    // Requests succeeded but returned non-definitive statuses (404, 500, etc.)
+    return inconclusive(
+      `Hardcoded key "${maskedValue}" was tested against ${apiUrls.length} API URL(s). Requests succeeded but returned non-definitive statuses (not 200/401/403). Cannot determine if key is valid. Verdict: INCONCLUSIVE.`,
+      { validationScope: 'target', requestUrl: targetUrl });
   }
 
-  // ─── postMessage abuse: check if page has postMessage listener ──────
+  // ─── postMessage abuse: code pattern detection ──────
+  // Note: detecting a listener + sink pattern is NOT the same as exploiting it.
+  // We never sent a postMessage and observed XSS execution — so positive findings are INCONCLUSIVE.
   if (vulnType === 'postmessage_abuse') {
-    // Fetch the page and check for postMessage listener + innerHTML sink
     try {
       const resp = await fetch(targetUrl, { headers: BROWSER_HEADERS, signal: AbortSignal.timeout(8_000) });
       const html = await resp.text();
@@ -571,25 +655,28 @@ async function validateWebVulnerability(targetUrl: string, vuln: any, sourceCode
       const hasInnerHTML = html.includes('innerHTML');
       const hasOriginCheck = html.match(/e\.origin|event\.origin|\.origin\s*[!=]==?\s*['"]/);
       if (hasPostMessage && hasInnerHTML && !hasOriginCheck) {
-        return { confirmed: true, validationScope: 'target',
-          evidence: `postMessage listener WITHOUT origin check confirmed on ${targetUrl}. Page has addEventListener('message') + innerHTML sink + no e.origin check. XSS via cross-origin postMessage is exploitable.`,
-          requestUrl: targetUrl, responseStatus: resp.status };
+        // Suspicious pattern detected, but NOT actively exploited — INCONCLUSIVE
+        return inconclusive(
+          `postMessage listener WITHOUT origin check detected on ${targetUrl}. Page has addEventListener('message') + innerHTML sink + no e.origin check. Pattern is EXPLOITABLE IN THEORY, but no postMessage was actually sent to confirm XSS fires. Verdict: INCONCLUSIVE — manual PoC needed (window.open + postMessage with XSS payload).`,
+          { validationScope: 'target', requestUrl: targetUrl, responseStatus: resp.status });
       }
       if (hasPostMessage && hasOriginCheck) {
-        return { confirmed: false, validationScope: 'target',
-          evidence: `postMessage listener HAS origin check on ${targetUrl}. Cross-origin messages are filtered. Not exploitable.`,
-          requestUrl: targetUrl, responseStatus: resp.status };
+        return exploitRefuted(
+          `postMessage listener HAS origin check on ${targetUrl}. Cross-origin messages are filtered. Not exploitable.`,
+          { validationScope: 'target', requestUrl: targetUrl, responseStatus: resp.status });
       }
-      return { confirmed: false, validationScope: 'target',
-        evidence: `No postMessage listener found on ${targetUrl}.`,
-        requestUrl: targetUrl, responseStatus: resp.status };
-    } catch (e: any) { return { confirmed: false, validationScope: 'theoretical',
-      evidence: `Validation error: ${String(e.message || e).slice(0, 200)}` }; }
+      return exploitRefuted(`No postMessage listener found on ${targetUrl}.`,
+        { validationScope: 'target', requestUrl: targetUrl, responseStatus: resp.status });
+    } catch (e: any) {
+      return inconclusive(`Validation error (network): ${String(e.message || e).slice(0, 200)}`,
+        { validationScope: 'theoretical' });
+    }
   }
 
-  // ─── Business logic: check for common patterns ──────
+  // ─── Business logic: heuristic pattern detection ──────
+  // Note: these are SUSPICIOUS PATTERNS, not active exploits.
+  // Positive findings are INCONCLUSIVE — they need manual PoC to confirm.
   if (vulnType === 'business_logic') {
-    // Fetch page and check for common business logic patterns
     try {
       const resp = await fetch(targetUrl, { headers: BROWSER_HEADERS, signal: AbortSignal.timeout(8_000) });
       const html = await resp.text();
@@ -611,14 +698,18 @@ async function validateWebVulnerability(targetUrl: string, vuln: any, sourceCode
           }
         }
       }
-      if (findings.length > 0) return { confirmed: true, validationScope: 'target',
-        evidence: `Business logic issues found on ${targetUrl}: ${findings.join('; ')}`,
-        requestUrl: targetUrl, responseStatus: resp.status };
-      return { confirmed: false, validationScope: 'target',
-        evidence: `No business logic issues detected on ${targetUrl}.`,
-        requestUrl: targetUrl, responseStatus: resp.status };
-    } catch (e: any) { return { confirmed: false, validationScope: 'theoretical',
-      evidence: `Validation error: ${String(e.message || e).slice(0, 200)}` }; }
+      if (findings.length > 0) {
+        // Suspicious patterns found, but NOT actively exploited — INCONCLUSIVE
+        return inconclusive(
+          `Business logic issues detected on ${targetUrl}: ${findings.join('; ')}. These are HEURISTIC patterns — no exploit was actually executed. Verdict: INCONCLUSIVE — manual PoC needed (e.g. tamper the hidden field, replay the request).`,
+          { validationScope: 'target', requestUrl: targetUrl, responseStatus: resp.status });
+      }
+      return exploitRefuted(`No business logic issues detected on ${targetUrl}.`,
+        { validationScope: 'target', requestUrl: targetUrl, responseStatus: resp.status });
+    } catch (e: any) {
+      return inconclusive(`Validation error (network): ${String(e.message || e).slice(0, 200)}`,
+        { validationScope: 'theoretical' });
+    }
   }
 
   // For payload-based tests (XSS, SQLi, etc): run ALL payloads in PARALLEL
@@ -627,15 +718,74 @@ async function validateWebVulnerability(targetUrl: string, vuln: any, sourceCode
   if (mentionedParam) candidateParams = [mentionedParam];
   else candidateParams = await discoverTargetParameters(targetUrl);
 
+  // ─── AGGRESSIVE FALLBACK ──────────────────────────────────────────
+  // If no specific test suite matches the vuln type, the user wants the validator
+  // to "actively test anything" — so we run ALL payload-based test suites in parallel
+  // against the target. If ANY of them confirms, we have EXPLOITABLE. If all run and
+  // none confirm, NOT_EXPLOITABLE. If all requests fail, INCONCLUSIVE.
   if (!testSuite) {
-    // Unknown type — return lab scope (AI reasoning only)
-    return { confirmed: false, validationScope: 'lab',
-      evidence: `[LAB-VALIDATED] No active test suite for "${vulnType}". Finding based on AI reasoning only.` };
+    const allSuites: { name: string; suite: WebTestPayload }[] = [
+      { name: 'XSS', suite: XSS_PAYLOADS },
+      { name: 'SQLi', suite: SQLI_PAYLOADS },
+      { name: 'SSRF', suite: SSRF_PAYLOADS },
+      { name: 'OpenRedirect', suite: REDIRECT_PAYLOADS },
+      { name: 'CommandInjection', suite: CMDI_PAYLOADS },
+      { name: 'PathTraversal', suite: PATH_TRAVERSAL_PAYLOADS },
+    ];
+    const fallbackTests: Promise<{ suiteName: string; confirmed: boolean; evidence: string; payload?: string; status?: number; body?: string }>[] = [];
+    for (const param of candidateParams) {
+      for (const { name, suite } of allSuites) {
+        for (const payload of suite.payloads) {
+          for (const method of ['GET', 'POST']) {
+            fallbackTests.push((async () => {
+              const resp = await sendTestRequest(targetUrl, method, payload, param, { followRedirect: true });
+              if (resp.status === 0) return { suiteName: name, confirmed: false, evidence: '' };
+              if (suite.check(resp, payload)) return {
+                suiteName: name, confirmed: true,
+                evidence: `[AGGRESSIVE-FALLBACK] ${name} CONFIRMED: ${suite.evidence(resp, payload)} — ${method} ${targetUrl}?${param}=${payload} (HTTP ${resp.status})`,
+                payload, status: resp.status, body: resp.body.slice(0, 500),
+              };
+              return { suiteName: name, confirmed: false, evidence: '' };
+            })());
+          }
+        }
+      }
+    }
+    const results = await Promise.allSettled(fallbackTests);
+    let anySucceeded = false;
+    for (const r of results) {
+      if (r.status === 'fulfilled') {
+        if (r.value.confirmed) {
+          return exploitConfirmed(r.value.evidence,
+            { validationScope: 'target', requestUrl: targetUrl, responseStatus: r.value.status, responseBody: r.value.body, payload: r.value.payload });
+        }
+        if (r.value.evidence !== '' || r.value.suiteName) anySucceeded = true;
+      }
+    }
+    // Check if ANY request actually succeeded (status !== 0)
+    // We can re-run a single probe to verify reachability if needed
+    if (!anySucceeded) {
+      // Re-verify with a single probe
+      try {
+        const probe = await fetch(targetUrl, { headers: BROWSER_HEADERS, signal: AbortSignal.timeout(5_000) });
+        anySucceeded = true;
+      } catch {
+        anySucceeded = false;
+      }
+    }
+    if (!anySucceeded) {
+      return inconclusive(
+        `[AGGRESSIVE-FALLBACK] All ${fallbackTests.length} payload tests to ${targetUrl} failed (network error or timeout). Cannot determine exploitability for "${vulnType}". Verdict: INCONCLUSIVE.`,
+        { validationScope: 'theoretical', requestUrl: targetUrl });
+    }
+    return exploitRefuted(
+      `[AGGRESSIVE-FALLBACK] Ran ${fallbackTests.length} payload tests across ${allSuites.length} suites (XSS/SQLi/SSRF/Redirect/CmdInjection/PathTraversal) × ${candidateParams.length} params × 2 methods against ${targetUrl}. None confirmed for vuln type "${vulnType}". Verdict: NOT_EXPLOITABLE — no payload-based vuln found via automated testing.`,
+      { validationScope: 'target', requestUrl: targetUrl });
   }
 
-  // Build ALL test combinations and run in PARALLEL
+  // ─── KNOWN TEST SUITE: run all payloads in parallel ──────────────
   const needsNoRedirect = vulnType === 'open_redirect';
-  const allTests: Promise<{ confirmed: boolean; evidence: string; payload?: string; status?: number; body?: string }>[] = [];
+  const allTests: Promise<{ confirmed: boolean; evidence: string; payload?: string; status?: number; body?: string; ran: boolean }>[] = [];
 
   for (const param of candidateParams) {
     for (const payload of testSuite.payloads) {
@@ -643,11 +793,11 @@ async function validateWebVulnerability(targetUrl: string, vuln: any, sourceCode
         allTests.push(
           (async () => {
             const resp = await sendTestRequest(targetUrl, method, payload, param, { followRedirect: !needsNoRedirect });
-            if (resp.status === 0) return { confirmed: false, evidence: '' };
+            if (resp.status === 0) return { confirmed: false, evidence: '', ran: false };
             if (testSuite!.check(resp, payload)) return {
               confirmed: true,
               evidence: `[TARGET-VALIDATED] ${testSuite!.evidence(resp, payload)} — ${method} ${targetUrl}?${param}=${payload} (HTTP ${resp.status})`,
-              payload, status: resp.status, body: resp.body.slice(0, 500),
+              payload, status: resp.status, body: resp.body.slice(0, 500), ran: true,
             };
             // Open redirect: check Location header
             if (needsNoRedirect && resp.status >= 300 && resp.status < 400) {
@@ -655,10 +805,10 @@ async function validateWebVulnerability(targetUrl: string, vuln: any, sourceCode
               if (location.includes('evil.com')) return {
                 confirmed: true,
                 evidence: `[TARGET-VALIDATED] OPEN REDIRECT CONFIRMED: ${method} ${targetUrl}?${param}=${payload} → HTTP ${resp.status} Location: ${location}`,
-                payload, status: resp.status, body: resp.body.slice(0, 500),
+                payload, status: resp.status, body: resp.body.slice(0, 500), ran: true,
               };
             }
-            return { confirmed: false, evidence: '' };
+            return { confirmed: false, evidence: '', ran: true };
           })()
         );
       }
@@ -667,17 +817,24 @@ async function validateWebVulnerability(targetUrl: string, vuln: any, sourceCode
 
   // Wait for ALL tests in parallel
   const results = await Promise.allSettled(allTests);
+  let anyRan = false;
   for (const r of results) {
     if (r.status === 'fulfilled' && r.value.confirmed) {
-      return { confirmed: true, validationScope: 'target',
-        evidence: r.value.evidence, requestUrl: targetUrl, responseStatus: r.value.status, responseBody: r.value.body, payload: r.value.payload };
+      return exploitConfirmed(r.value.evidence,
+        { validationScope: 'target', requestUrl: targetUrl, responseStatus: r.value.status, responseBody: r.value.body, payload: r.value.payload });
     }
+    if (r.status === 'fulfilled' && r.value.ran) anyRan = true;
   }
 
   const totalTests = allTests.length;
-  return { confirmed: false, validationScope: 'target',
-    evidence: `[TARGET-VALIDATED] ${testSuite.name} test completed — ${totalTests} HTTP requests sent to ${targetUrl} across ${candidateParams.length} params (${candidateParams.join(', ')}). None confirmed.`,
-    requestUrl: targetUrl };
+  if (!anyRan) {
+    return inconclusive(
+      `[TARGET-VALIDATION] ${testSuite.name} test could not run — all ${totalTests} requests to ${targetUrl} failed (network error or timeout). Verdict: INCONCLUSIVE.`,
+      { validationScope: 'theoretical', requestUrl: targetUrl });
+  }
+  return exploitRefuted(
+    `[TARGET-VALIDATED] ${testSuite.name} test completed — ${totalTests} HTTP requests sent to ${targetUrl} across ${candidateParams.length} params (${candidateParams.join(', ')}). None confirmed. Verdict: NOT_EXPLOITABLE.`,
+    { validationScope: 'target', requestUrl: targetUrl });
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -704,7 +861,9 @@ export async function activelyValidate(
     vuln.type === 'command_injection' || vuln.type === 'path_traversal' ||
     vuln.type === 'cors_misconfig' || vuln.type === 'business_logic' ||
     vuln.type === 'csp_missing' || vuln.type === 'api_leak' ||
-    vuln.type === 'csrf' || vuln.type === 'auth_bypass';
+    vuln.type === 'csrf' || vuln.type === 'auth_bypass' ||
+    vuln.type === 'postmessage_abuse' || vuln.type === 'clickjacking' ||
+    vuln.type === 'info_exposure' || vuln.type === 'session_fixation';
 
   if (isSmartContract) {
     const addressMatch = sourceCode.match(/0x[0-9a-fA-F]{40}/) ||
@@ -714,8 +873,11 @@ export async function activelyValidate(
     if (contractAddress) {
       try {
         const targetResult = await validateWithCastOnChain(vuln, contractAddress);
-        if (targetResult.confirmed) return targetResult;
-        if (targetResult.evidence.includes('[TARGET-REFUTES]') || targetResult.evidence.includes('REFUTED')) return targetResult;
+        // Three-state verdict: only continue to Foundry if INCONCLUSIVE
+        // EXPLOITABLE → return immediately
+        // NOT_EXPLOITABLE → return immediately (refuted on-chain, no need to lab-test)
+        // INCONCLUSIVE → fall through to Foundry lab test
+        if (targetResult.verdict !== 'INCONCLUSIVE') return targetResult;
       } catch {}
     }
     return validateWithFoundry(sourceCode, contractName, vuln);
@@ -729,8 +891,9 @@ export async function activelyValidate(
       sourceCode.match(/https?:\/\/[^\s"'<>]+/)?.[0] ||
       '';
     if (!targetUrl.startsWith('http')) {
-      return { confirmed: false, validationScope: 'theoretical',
-        evidence: `[UNTESTED] No valid URL found. explicitTargetUrl=${explicitTargetUrl || 'undefined'}, desc=${vuln.description?.slice(0,100)}` };
+      return inconclusive(
+        `[UNTESTED] No valid URL found. explicitTargetUrl=${explicitTargetUrl || 'undefined'}, desc=${vuln.description?.slice(0, 100)}. Verdict: INCONCLUSIVE — cannot test without a target URL.`,
+        { validationScope: 'theoretical' });
     }
     return validateWebVulnerability(targetUrl, vuln, sourceCode);
   }
@@ -739,6 +902,7 @@ export async function activelyValidate(
   if (sourceCode.includes('pragma solidity')) return validateWithFoundry(sourceCode, contractName, vuln);
   const fallbackUrl = explicitTargetUrl || sourceCode.match(/https?:\/\/[^\s"'<>]+/)?.[0] || '';
   if (fallbackUrl.startsWith('http')) return validateWebVulnerability(fallbackUrl, vuln, sourceCode);
-  return { confirmed: false, validationScope: 'theoretical',
-    evidence: `Could not determine test type for "${vuln.type}".` };
+  return inconclusive(
+    `Could not determine test type for "${vuln.type}". Verdict: INCONCLUSIVE — no Solidity code, no URL, no test suite matches.`,
+    { validationScope: 'theoretical' });
 }

@@ -51,6 +51,13 @@ const statusIcon: Record<string, React.ReactNode> = {
   candidate: <Clock className="w-4 h-4 text-yellow-600" />,
   refuted: <XCircle className="w-4 h-4 text-red-600" />,
 };
+// Verdict label map — three-state model (EXPLOITABLE / NOT_EXPLOITABLE / INCONCLUSIVE)
+const verdictLabel: Record<string, { text: string; color: string }> = {
+  confirmed: { text: 'EXPLOITABLE', color: 'bg-emerald-100 text-emerald-800 border-emerald-200' },
+  validated: { text: 'EXPLOITABLE (lab)', color: 'bg-blue-100 text-blue-800 border-blue-200' },
+  candidate: { text: 'INCONCLUSIVE', color: 'bg-yellow-100 text-yellow-800 border-yellow-200' },
+  refuted: { text: 'NOT EXPLOITABLE', color: 'bg-red-100 text-red-800 border-red-200' },
+};
 const chainLabel: Record<string, string> = {
   ethereum: 'Ethereum', bsc: 'BSC', polygon: 'Polygon', arbitrum: 'Arbitrum',
   solana: 'Solana', sui: 'Sui', starknet: 'StarkNet', optimism: 'Optimism',
@@ -382,8 +389,16 @@ export default function CryptoSentinelDashboard() {
       } : vn));
 
       const confPct = (newConfidence * 100).toFixed(0);
-      const statusLabel = result.status === 'confirmed' ? 'CONFIRMED' : result.status === 'validated' ? 'VALIDATED' : result.status || 'candidate';
-      addActivity('validation', `Validation: ${v.title} — ${statusLabel} (${confPct}%, ${scope})`, result.status === 'confirmed' ? 'success' : 'info', result.evidence?.slice(0, 200) || '', 100);
+      // Map status to verdict label (three-state model)
+      const verdictText = result.verdict ||
+        (result.status === 'confirmed' ? 'EXPLOITABLE' :
+         result.status === 'validated' ? 'EXPLOITABLE (lab)' :
+         result.status === 'refuted' ? 'NOT_EXPLOITABLE' : 'INCONCLUSIVE');
+      const statusLabel = verdictText;
+      addActivity('validation',
+        `Validation: ${v.title} — ${statusLabel} (${scope})`,
+        result.verdict === 'EXPLOITABLE' ? 'success' : result.verdict === 'NOT_EXPLOITABLE' ? 'error' : 'info',
+        result.evidence?.slice(0, 200) || '', 100);
     } catch (err: any) {
       const errMsg = String(err)?.slice(0, 100) || 'Network error';
       addActivity('validation', `Validation failed: ${v.title}`, 'error', errMsg, 0);
@@ -1275,7 +1290,11 @@ export default function CryptoSentinelDashboard() {
   const validatedVulns = vulns.filter(v =>
     v.validationSteps || v.status === 'confirmed' || v.status === 'validated' || v.status === 'refuted'
   );
-  const confirmedVulns = validatedVulns.filter(v => v.status === 'confirmed');
+  // Three-state verdict counts
+  const exploitableVulns = validatedVulns.filter(v => v.status === 'confirmed' || v.status === 'validated');
+  const notExploitableVulns = validatedVulns.filter(v => v.status === 'refuted');
+  const inconclusiveVulns = validatedVulns.filter(v => v.status === 'candidate');
+  const confirmedVulns = exploitableVulns; // alias for backward compat
   const criticalVulns = validatedVulns.filter(v => v.severity === 'critical');
   const avgConfidence = validatedVulns.length > 0 ? validatedVulns.reduce((s, v) => s + v.confidence, 0) / validatedVulns.length : 0;
 
@@ -1435,14 +1454,14 @@ export default function CryptoSentinelDashboard() {
       </header>
 
       <main className="max-w-7xl mx-auto px-4 py-6">
-        {/* Stats */}
+        {/* Stats — three-state verdict model */}
         <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-6">
           {[
             { label: 'Total Findings', value: validatedVulns.length, icon: Bug, color: 'text-amber-600' },
-            { label: 'Confirmed (90%+)', value: confirmedVulns.length, icon: CheckCircle2, color: 'text-emerald-600' },
+            { label: 'Exploitable', value: exploitableVulns.length, icon: CheckCircle2, color: 'text-emerald-600' },
+            { label: 'Not Exploitable', value: notExploitableVulns.length, icon: XCircle, color: 'text-red-600' },
+            { label: 'Inconclusive', value: inconclusiveVulns.length, icon: Clock, color: 'text-yellow-600' },
             { label: 'Critical', value: criticalVulns.length, icon: AlertTriangle, color: 'text-red-600' },
-            { label: 'Avg Confidence', value: `${(avgConfidence * 100).toFixed(1)}%`, icon: Target, color: 'text-blue-600' },
-            { label: 'Memory Entries', value: validatedVulns.length + patterns.length, icon: Brain, color: 'text-purple-600' },
           ].map((s, i) => (
             <Card key={i} className="border-slate-200">
               <CardContent className="p-4 flex items-center gap-3">
@@ -1786,7 +1805,9 @@ export default function CryptoSentinelDashboard() {
                     <Button size="sm" variant="outline" onClick={downloadZip} disabled={loading || validatedVulns.length === 0}>
                       <Download className="w-4 h-4 mr-1" /> PoC ZIP
                     </Button>
-                    <Badge className="bg-emerald-100 text-emerald-800 border-0">{confirmedVulns.length} Confirmed</Badge>
+                    <Badge className="bg-emerald-100 text-emerald-800 border-0">{exploitableVulns.length} Exploitable</Badge>
+                    <Badge className="bg-red-100 text-red-800 border-0">{notExploitableVulns.length} Not Exploitable</Badge>
+                    <Badge className="bg-yellow-100 text-yellow-800 border-0">{inconclusiveVulns.length} Inconclusive</Badge>
                     <Badge className="bg-slate-100 text-slate-600 border-0">{vulns.length - validatedVulns.length} pending</Badge>
                     {vulns.length > 0 && (
                       <Button size="sm" variant="outline" className="text-red-600 border-red-200 hover:bg-red-50" onClick={clearAllFindings}>
@@ -1810,18 +1831,23 @@ export default function CryptoSentinelDashboard() {
                           </div>
                           <div className="flex items-center gap-2">
                             <Badge className={severityColor[v.severity] || ''}>{v.severity}</Badge>
+                            <Badge className={verdictLabel[v.status]?.color || 'bg-slate-100 text-slate-700 border-slate-200'}>
+                              {verdictLabel[v.status]?.text || v.status}
+                            </Badge>
                             <Button
                               size="sm"
                               variant="outline"
-                              className={`text-[11px] h-7 px-2 ${validatingVulns.has(v.id) ? 'border-amber-300 text-amber-600' : v.status === 'confirmed' ? 'border-emerald-300 text-emerald-600 hover:bg-emerald-50' : 'border-blue-300 text-blue-600 hover:bg-blue-50'}`}
+                              className={`text-[11px] h-7 px-2 ${validatingVulns.has(v.id) ? 'border-amber-300 text-amber-600' : v.status === 'confirmed' || v.status === 'validated' ? 'border-emerald-300 text-emerald-600 hover:bg-emerald-50' : v.status === 'refuted' ? 'border-red-300 text-red-600 hover:bg-red-50' : 'border-blue-300 text-blue-600 hover:bg-blue-50'}`}
                               onClick={() => validateVuln(v)}
                               disabled={validatingVulns.has(v.id)}
-                              title="Deep validate with GLM AI"
+                              title="Re-run active validation"
                             >
                               {validatingVulns.has(v.id) ? (
                                 <><Loader2 className="w-3 h-3 mr-1 animate-spin" /> Validating</>
-                              ) : v.status === 'confirmed' ? (
+                              ) : v.status === 'confirmed' || v.status === 'validated' ? (
                                 <><CheckCircle2 className="w-3 h-3 mr-1" /> Re-validate</>
+                              ) : v.status === 'refuted' ? (
+                                <><XCircle className="w-3 h-3 mr-1" /> Re-validate</>
                               ) : (
                                 <><Play className="w-3 h-3 mr-1" /> Validate</>
                               )}

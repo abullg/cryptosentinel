@@ -175,16 +175,13 @@ async function runAnalysisInBackground(jobId: string, config: {
 
     await updateJob(75, `Saved ${savedAi.length} AI findings. Starting validation...`);
 
-    // Phase 3: BINARY VALIDATION — exploit works or it doesn't. No percentages.
-    //   confirmed = exploit WORKS (real HTTP payload reflected, or Foundry test passed)
-    //   refuted   = exploit DOES NOT WORK (tested, failed)
-    //   candidate = NOT TESTED (no URL, no Solidity, or validation error)
+    // Phase 3: THREE-STATE VERDICT VALIDATION
+    //   EXPLOITABLE     → status='confirmed' (target) or 'validated' (lab)
+    //   NOT_EXPLOITABLE → status='refuted' (tested, exploit doesn't work)
+    //   INCONCLUSIVE    → status='candidate' (couldn't determine — no URL, no API, network error, etc.)
     if (savedAi.length > 0) {
       const verifyPromises = savedAi.map(async ({ vuln, rawFinding: v }: any) => {
         try {
-          const vulnDesc = targetUrl ? `${v.description}\n\nTarget URL: ${targetUrl}` : v.description;
-          const vulnLoc = targetUrl ? `${v.location}\nURL: ${targetUrl}` : v.location;
-
           const verification = await activelyValidate(
             sourceCode, contractName,
             { title: v.title, type: v.type, severity: v.severity, description: v.description, location: v.location },
@@ -192,8 +189,9 @@ async function runAnalysisInBackground(jobId: string, config: {
             targetUrl || undefined  // Pass targetUrl DIRECTLY, not hidden in description
           );
           const scope = verification.validationScope || 'theoretical';
+          const verdict = verification.verdict || (verification.confirmed ? 'EXPLOITABLE' : 'INCONCLUSIVE');
 
-          if (verification.confirmed) {
+          if (verdict === 'EXPLOITABLE') {
             // EXPLOIT CONFIRMED — exploit works
             const newStatus = scope === 'target' ? 'confirmed' : 'validated';
             const label = scope === 'target'
@@ -203,38 +201,46 @@ async function runAnalysisInBackground(jobId: string, config: {
               data: { confidence: 1, status: newStatus, validationScope: scope,
                 description: vuln.description + `\n\n${label}\n${verification.evidence}` } }).catch(() => {});
             vuln.confidence = 1; vuln.status = newStatus; vuln.validationScope = scope;
-          } else if (scope === 'target' || scope === 'lab') {
-            // TESTED BUT NOT CONFIRMED — either NOT_EXPLOITABLE or NOT_CONFIRMED
-            // If evidence says "NOT_CONFIRMED" → couldn't verify (like API key without endpoint)
-            // If evidence says exploit failed → NOT_EXPLOITABLE
-            const isNotConfirmed = verification.evidence.includes('NOT_CONFIRMED') || verification.evidence.includes('could not verify');
-            const label = isNotConfirmed
-              ? '[NOT_CONFIRMED] Validation ran but could not verify exploit. Finding is suspicious but unproven.'
-              : '[NOT_EXPLOITABLE] Exploit tested and did NOT succeed.';
-            const newStatus = isNotConfirmed ? 'candidate' : 'refuted';
+          } else if (verdict === 'NOT_EXPLOITABLE') {
+            // TESTED AND REFUTED — exploit does NOT work
+            const label = scope === 'target'
+              ? '[NOT_EXPLOITABLE] Exploit tested against production target and did NOT succeed.'
+              : '[NOT_EXPLOITABLE] Exploit tested in lab and did NOT succeed.';
             await db.vulnerability.update({ where: { id: vuln.id },
-              data: { confidence: 0, status: newStatus,
-                validationScope: scope,
+              data: { confidence: 0, status: 'refuted', validationScope: scope,
                 description: vuln.description + `\n\n${label}\n${verification.evidence}` } }).catch(() => {});
-            vuln.confidence = 0; vuln.validationScope = scope; vuln.status = newStatus;
+            vuln.confidence = 0; vuln.validationScope = scope; vuln.status = 'refuted';
+          } else {
+            // INCONCLUSIVE — couldn't determine, leave as candidate
+            const label = '[INCONCLUSIVE] Validation ran but could not determine exploitability. ' +
+              (scope === 'theoretical'
+                ? 'Test could not execute (no URL, network error, or no test suite for this vuln type).'
+                : 'Test executed but result was ambiguous. Manual verification needed.');
+            await db.vulnerability.update({ where: { id: vuln.id },
+              data: { confidence: 0, status: 'candidate', validationScope: scope,
+                description: vuln.description + `\n\n${label}\n${verification.evidence}` } }).catch(() => {});
+            vuln.confidence = 0; vuln.validationScope = scope; vuln.status = 'candidate';
           }
         } catch {
           // VALIDATION ERROR — can't determine, leave as candidate
           await db.vulnerability.update({ where: { id: vuln.id },
             data: { validationScope: 'theoretical',
-              description: vuln.description + '\n\n[UNTESTED] Validation could not run — no URL or test suite available.' } }).catch(() => {});
+              description: vuln.description + '\n\n[INCONCLUSIVE] Validation could not run — exception during test execution. Manual verification needed.' } }).catch(() => {});
           vuln.validationScope = 'theoretical';
+          vuln.status = 'candidate';
         }
       });
       await Promise.allSettled(verifyPromises);
     }
 
     const allResults = [...savedStatic.map(s => s.vuln), ...savedAi.map(s => s.vuln)];
-    const confirmedCount = allResults.filter((r: any) => r.status === 'confirmed' || r.status === 'validated').length;
+    const exploitCount = allResults.filter((r: any) => r.status === 'confirmed' || r.status === 'validated').length;
+    const refutedCount = allResults.filter((r: any) => r.status === 'refuted').length;
+    const inconclusiveCount = allResults.filter((r: any) => r.status === 'candidate').length;
 
-    await updateJob(100, `Analysis complete: ${confirmedCount} confirmed exploits, ${allResults.length - confirmedCount} not confirmed`);
+    await updateJob(100, `Analysis complete: ${exploitCount} exploitable, ${refutedCount} not exploitable, ${inconclusiveCount} inconclusive (out of ${allResults.length})`);
     await db.audit.update({ where: { id: auditId }, data: { status: 'completed', findings: allResults.length, completedAt: new Date() } }).catch(() => {});
-    await db.analysisJob.update({ where: { id: jobId }, data: { status: 'completed', resultCount: confirmedCount } }).catch(() => {});
+    await db.analysisJob.update({ where: { id: jobId }, data: { status: 'completed', resultCount: exploitCount } }).catch(() => {});
 
   } catch (err: any) {
     // Fix bug #1: audit lifecycle — always mark as completed or failed
