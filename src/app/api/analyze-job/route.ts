@@ -216,6 +216,9 @@ async function runAnalysisInBackground(jobId: string, config: {
     await db.analysisJob.update({ where: { id: jobId }, data: { status: 'completed', resultCount } }).catch(() => {});
 
   } catch (err: any) {
+    // Fix bug #1: audit lifecycle — always mark as completed or failed
+    await db.audit.update({ where: { id: auditId },
+      data: { status: 'failed', completedAt: new Date() } }).catch(() => {});
     await db.analysisJob.update({ where: { id: jobId },
       data: { status: 'failed', error: String(err).slice(0, 500), progress: 100, message: 'Analysis failed' } }).catch(() => {});
   }

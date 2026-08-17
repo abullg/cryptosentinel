@@ -1069,9 +1069,79 @@ export default function CryptoSentinelDashboard() {
     }
   };
 
-  /** Download a professional .txt report for a single vulnerability */
+  /** Background analysis via polling — no SSE, no heartbeat, no timeout issues.
+   *  MUST be defined BEFORE analyzeContract and fetchUrlAndAnalyze (no hoisting for const).
+   *  1. POST /api/analyze-job → returns jobId
+   *  2. Poll GET /api/job-status/{jobId} every 5s
+   *  3. When status=completed → fetch results from /api/vulnerabilities
+   *  4. When status=failed → show error */
+  const startBackgroundAnalysis = async (sourceCode: string, contractName: string, targetType: string, targetUrl?: string) => {
+    addActivity('scan', 'Starting background analysis...', 'running', targetUrl || contractName, 5);
 
-const analyzeContract = async () => {
+    // Step 1: Start the job
+    const res = await fetch('/api/analyze-job', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sourceCode, contractName, targetType, targetUrl }),
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || `HTTP ${res.status}`);
+    }
+
+    const { jobId } = await res.json();
+    if (!jobId) throw new Error('No jobId returned');
+
+    addActivity('scan', `Job started: ${jobId}`, 'info', 'Polling for progress...', 10);
+
+    // Step 2: Poll for status
+    return new Promise<void>((resolve, reject) => {
+      const poll = async () => {
+        try {
+          const statusRes = await fetch(`/api/job-status/${jobId}`);
+          if (!statusRes.ok) { reject(new Error(`Status check failed: ${statusRes.status}`)); return; }
+          const status = await statusRes.json();
+
+          if (status.progress !== undefined) {
+            addActivity('scan', status.message || `Progress: ${status.progress}%`, 'running', `${status.progress}%`, status.progress);
+          }
+
+          if (status.status === 'completed') {
+            addActivity('scan', `Analysis complete: ${status.resultCount} findings`, 'success', 'Done', 100);
+            // Fetch results
+            try {
+              const vulnsRes = await fetch('/api/vulnerabilities');
+              if (vulnsRes.ok) {
+                const serverVulns: Vulnerability[] = await vulnsRes.json();
+                const highConf = serverVulns.filter(v => (v.confidence || 0) >= 0.90);
+                setVulns(prev => {
+                  const existingIds = new Set(prev.map(v => v.id));
+                  const toAdd = highConf.filter((f: any) => !existingIds.has(f.id));
+                  return toAdd.length > 0 ? [...toAdd, ...prev] : prev;
+                });
+              }
+            } catch {}
+            resolve();
+            return;
+          }
+
+          if (status.status === 'failed') {
+            reject(new Error(status.error || 'Analysis failed'));
+            return;
+          }
+
+          // Still running — poll again in 5s
+          setTimeout(poll, 5_000);
+        } catch (err) {
+          reject(err);
+        }
+      };
+      setTimeout(poll, 2_000);
+    });
+  };
+
+  const analyzeContract = async () => {
     if (isAnalyzingRef.current) {
       addActivity('scan', 'Analysis already in progress — skipping', 'warning', 'Wait for current analysis to finish', 0);
       return;
