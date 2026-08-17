@@ -360,10 +360,29 @@ async function validateWithFoundry(sourceCode: string, contractName: string, vul
 
 // ═══════════════════════════════════════════════════════════════════
 // WEB VULNERABILITY VALIDATION (HTTP-based real testing)
+//
+// ─── STRICT CLASS-MATCHING POLICY ──────────────────────────────────
+// A finding can ONLY be upgraded to EXPLOITABLE if the active test
+// confirms the SPECIFIC vulnerability class that was claimed.
+//
+//   Hypothesis: IDOR
+//      ↓ Validator tests
+//   Did attacker access another user's resource?
+//      ↓ NO
+//   NOT_EXPLOITABLE (or INCONCLUSIVE if we couldn't test IDOR specifically)
+//
+// The aggressive fallback (which runs when no specific test suite exists
+// for the claimed type) can NEVER upgrade a finding to EXPLOITABLE.
+// If it finds a DIFFERENT vuln class, that's a separate hypothesis —
+// it returns INCONCLUSIVE with a note about what was found.
+//
+// This policy prioritizes PRECISION over RECALL. For bug bounty:
+//   2 real confirmed bugs > 50 speculative HIGH/CRITICAL findings.
 // ═══════════════════════════════════════════════════════════════════
 
 interface WebTestPayload {
   name: string;
+  vulnType: string;  // Maps to the vuln type this suite confirms
   payloads: string[];
   check: (response: { status: number; body: string; headers: Record<string, string> }, payload: string) => boolean;
   evidence: (response: { status: number; body: string; headers: Record<string, string> }, payload: string) => string;
@@ -371,80 +390,136 @@ interface WebTestPayload {
 
 const XSS_PAYLOADS: WebTestPayload = {
   name: 'XSS',
+  vulnType: 'xss',
   payloads: ['<img src=x onerror=alert(1)>', '"><svg onload=alert(1)>', '<svg onload=alert(1)>'],
   check: (resp, payload) => {
+    // STRICT: payload must be reflected UNENCODED in the HTML body.
+    // If the payload contains < > and they are HTML-encoded (&lt; &gt;),
+    // body.includes(decoded) will NOT match — which is correct (no XSS).
     let decoded = payload; try { decoded = decodeURIComponent(payload); } catch {}
     const body = resp.body.toLowerCase();
     if (body.includes(decoded.toLowerCase())) return true;
-    if (body.includes('onerror=alert') || body.includes('onload=alert')) return true;
+    // Do NOT use the loose 'onerror=alert' substring check — it matches
+    // documentation pages, error messages, and our own payload in JSON APIs.
     return false;
   },
-  evidence: (resp, payload) => `XSS CONFIRMED: Payload "${payload}" reflected unescaped. HTTP ${resp.status}.`,
+  evidence: (resp, payload) => `XSS CONFIRMED: Payload "${payload}" reflected unescaped in HTML body. HTTP ${resp.status}.`,
 };
 
 const SQLI_PAYLOADS: WebTestPayload = {
   name: 'SQL Injection',
+  vulnType: 'sql_injection',
   payloads: ["' OR '1'='1", "' OR '1'='1' --", "admin'--"],
   check: (resp, _payload) => {
+    // STRICT: only match actual SQL error messages from database engines.
+    // These strings are unambiguous — they don't appear in normal HTML.
     const body = resp.body.toLowerCase();
-    const sqlErrors = ['sql syntax', 'mysql_fetch', 'ORA-', 'postgresql', 'ERROR:  syntax error',
-      'unclosed quotation mark', 'sqlite3.OperationalError', 'SQLSTATE', 'you have an error in your sql syntax'];
+    const sqlErrors = [
+      'sql syntax', 'mysql_fetch', 'ORA-', 'ERROR:  syntax error',
+      'unclosed quotation mark', 'sqlite3.OperationalError', 'SQLSTATE',
+      'you have an error in your sql syntax', 'PG::SyntaxError',
+      'Microsoft SQL Server', 'SQLServer JDBC Driver',
+    ];
     if (sqlErrors.some(e => body.includes(e.toLowerCase()))) return true;
+    // Also check for boolean-based SQLi: response differs between
+    // ' OR '1'='1 (true) and ' OR '1'='2 (false) — but we don't send
+    // the false payload here, so we can't confirm boolean-based.
     return false;
   },
-  evidence: (resp, payload) => `SQL INJECTION CONFIRMED: Payload "${payload}" triggered SQL error. HTTP ${resp.status}.`,
+  evidence: (resp, payload) => `SQL INJECTION CONFIRMED: Payload "${payload}" triggered database error message. HTTP ${resp.status}.`,
 };
 
 const SSRF_PAYLOADS: WebTestPayload = {
   name: 'SSRF',
+  vulnType: 'ssrf',
   payloads: ['http://169.254.169.254/latest/meta-data/', 'http://localhost:80', 'http://127.0.0.1:80'],
   check: (resp, payload) => {
+    // STRICT: only match actual cloud metadata content.
+    // The old check matched body.includes('ssh') — which appears on
+    // virtually every page (CSS classes, "press shift", SSH key docs, etc.)
+    // and body.includes('connection refused') — which appears in error docs.
     const body = resp.body.toLowerCase();
-    if (payload.includes('169.254.169.254') && (body.includes('ami-id') || body.includes('instance-id') || body.includes('security-credentials'))) return true;
-    if (body.includes('ssh') || body.includes('connection refused')) return true;
+    if (payload.includes('169.254.169.254')) {
+      // AWS metadata content — unambiguous
+      const awsMarkers = ['ami-id', 'instance-id', 'security-credentials',
+        'iam/security-credentials', 'instance-metadata',
+        'aki-', 'reservation-id', 'local-ipv4'];
+      if (awsMarkers.some(m => body.includes(m))) return true;
+    }
+    // For localhost payloads: check for actual internal service signatures
+    // (e.g. "It works!" from Apache, nginx default page, X-Powered-By with internal IP)
+    // Do NOT match 'ssh' or 'connection refused' — too generic.
+    if (payload.includes('localhost') || payload.includes('127.0.0.1')) {
+      if (body.includes('<title>apache2 ubuntu default page')) return true;
+      if (body.includes('welcome to nginx')) return true;
+      if (resp.headers['x-powered-by']?.includes('Express')) return true;
+    }
     return false;
   },
-  evidence: (resp, payload) => `SSRF CONFIRMED: Server fetched internal URL "${payload}". HTTP ${resp.status}.`,
+  evidence: (resp, payload) => `SSRF CONFIRMED: Server fetched internal URL "${payload}" and returned internal content. HTTP ${resp.status}.`,
 };
 
 const REDIRECT_PAYLOADS: WebTestPayload = {
   name: 'Open Redirect',
+  vulnType: 'open_redirect',
   payloads: ['https://evil.com', '//evil.com', 'https:evil.com'],
   check: (resp, payload) => {
+    // STRICT: Location header must contain the attacker domain.
+    // HTTP 3xx + Location: evil.com is unambiguous.
     const location = resp.headers['location'] || '';
     if (location.includes('evil.com')) return true;
     return false;
   },
-  evidence: (resp, payload) => `OPEN REDIRECT CONFIRMED: Location: "${resp.headers['location'] || 'N/A'}". HTTP ${resp.status}.`,
+  evidence: (resp, payload) => `OPEN REDIRECT CONFIRMED: Location header redirects to "${resp.headers['location'] || 'N/A'}". HTTP ${resp.status}.`,
 };
 
 const CMDI_PAYLOADS: WebTestPayload = {
   name: 'Command Injection',
-  payloads: ['; id', '| id', '&& whoami'],
+  vulnType: 'command_injection',
+  payloads: ['; id', '| id', '&& whoami', '; cat /etc/passwd'],
   check: (resp, payload) => {
+    // STRICT: only match actual command output.
+    // The old check matched body.includes('root') — which appears on
+    // virtually every 404 page ("root element", "root domain", "document root",
+    // "root path", etc.). This caused massive false positives.
     const body = resp.body;
-    if (body.includes('uid=') && body.includes('gid=')) return true;
-    if (body.includes('root:x:0:0:')) return true;
-    if (payload.includes('whoami') && (body.includes('root') || body.includes('www-data'))) return true;
+    // `id` command output: uid=NNN(...) gid=NNN(...) groups=...
+    if (/uid=\d+\([^)]*\)\s+gid=\d+/.test(body)) return true;
+    // /etc/passwd content: root:x:0:0:root:/root:/bin/bash
+    if (/root:x:0:0:[^:]*:\/root:\/bin\/(bash|sh|zsh)/.test(body)) return true;
+    // `whoami` output: must be a standalone line with just the username
+    // (not "root" appearing somewhere in HTML)
+    if (payload.includes('whoami')) {
+      // Check if body has a line that is EXACTLY a username (root, www-data, nginx, etc.)
+      // This must be a bare line, not "root" inside other text.
+      if (/^root$/m.test(body) || /^www-data$/m.test(body) || /^nginx$/m.test(body)) return true;
+    }
     return false;
   },
-  evidence: (resp, payload) => `COMMAND INJECTION CONFIRMED: Payload "${payload}" executed. HTTP ${resp.status}.`,
+  evidence: (resp, payload) => `COMMAND INJECTION CONFIRMED: Payload "${payload}" produced command output in response. HTTP ${resp.status}.`,
 };
 
 const PATH_TRAVERSAL_PAYLOADS: WebTestPayload = {
   name: 'Path Traversal',
+  vulnType: 'path_traversal',
   payloads: ['../../../etc/passwd', '../../../../windows/win.ini', '%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd'],
   check: (resp, _payload) => {
+    // STRICT: only match actual /etc/passwd or win.ini content.
+    // These patterns are unambiguous — they don't appear in normal HTML.
     const body = resp.body.toLowerCase();
-    if (body.includes('root:x:0:0:') || body.includes('root:$')) return true;
+    // /etc/passwd: root:x:0:0:... (full line, not just "root")
+    if (/root:x:0:0:[^:]*:\/root:\/bin\/(bash|sh)/.test(body)) return true;
+    if (body.includes('daemon:x:1:1:') || body.includes('bin:x:2:2:')) return true;
+    // win.ini: [fonts] or [extensions] section headers
     if (body.includes('[fonts]') || body.includes('[extensions]')) return true;
     return false;
   },
-  evidence: (resp, payload) => `PATH TRAVERSAL CONFIRMED: Payload "${payload}" accessed system files. HTTP ${resp.status}.`,
+  evidence: (resp, payload) => `PATH TRAVERSAL CONFIRMED: Payload "${payload}" returned system file content. HTTP ${resp.status}.`,
 };
 
 const CORS_TEST: WebTestPayload = {
   name: 'CORS Misconfiguration',
+  vulnType: 'cors_misconfig',
   payloads: ['https://evil.com', 'null'],
   check: (resp, _payload) => {
     const acao = resp.headers['access-control-allow-origin'] || '';
@@ -828,11 +903,21 @@ async function validateWebVulnerability(targetUrl: string, vuln: any, sourceCode
   if (mentionedParam) candidateParams = [mentionedParam];
   else candidateParams = await discoverTargetParameters(targetUrl);
 
-  // ─── AGGRESSIVE FALLBACK ──────────────────────────────────────────
-  // If no specific test suite matches the vuln type, the user wants the validator
-  // to "actively test anything" — so we run ALL payload-based test suites in parallel
-  // against the target. If ANY of them confirms, we have EXPLOITABLE. If all run and
-  // none confirm, NOT_EXPLOITABLE. If all requests fail, INCONCLUSIVE.
+  // ─── AGGRESSIVE FALLBACK (STRICT CLASS-MATCHING) ─────────────────
+  // This runs when no specific test suite exists for the claimed vuln type
+  // (e.g. IDOR, business_logic, auth_bypass, etc.).
+  //
+  // POLICY: The fallback can NEVER upgrade the original finding to EXPLOITABLE.
+  // If it finds a DIFFERENT vuln class (e.g. XSS while testing an IDOR claim),
+  // that's a SEPARATE hypothesis — not a confirmation of IDOR.
+  //
+  // Possible outcomes:
+  //   - Fallback finds a different-class vuln → INCONCLUSIVE (note what was found)
+  //   - Fallback runs all tests, none confirm   → NOT_EXPLOITABLE (for the claimed type)
+  //   - All requests fail (network)             → INCONCLUSIVE
+  //
+  // This prevents the bug where "tried && whoami, got 404, body contains 'root'"
+  // would upgrade an IDOR finding to EXPLOITABLE for Command Injection.
   if (!testSuite) {
     const allSuites: { name: string; suite: WebTestPayload }[] = [
       { name: 'XSS', suite: XSS_PAYLOADS },
@@ -842,54 +927,67 @@ async function validateWebVulnerability(targetUrl: string, vuln: any, sourceCode
       { name: 'CommandInjection', suite: CMDI_PAYLOADS },
       { name: 'PathTraversal', suite: PATH_TRAVERSAL_PAYLOADS },
     ];
-    const fallbackTests: Promise<{ suiteName: string; confirmed: boolean; evidence: string; payload?: string; status?: number; body?: string }>[] = [];
+    const fallbackTests: Promise<{ suiteName: string; suiteVulnType: string; confirmed: boolean; evidence: string; payload?: string; status?: number; body?: string }>[] = [];
     for (const param of candidateParams) {
       for (const { name, suite } of allSuites) {
         for (const payload of suite.payloads) {
           for (const method of ['GET', 'POST']) {
             fallbackTests.push((async () => {
               const resp = await sendTestRequest(targetUrl, method, payload, param, { followRedirect: true });
-              if (resp.status === 0) return { suiteName: name, confirmed: false, evidence: '' };
+              if (resp.status === 0) return { suiteName: name, suiteVulnType: suite.vulnType, confirmed: false, evidence: '' };
               if (suite.check(resp, payload)) return {
-                suiteName: name, confirmed: true,
-                evidence: `[AGGRESSIVE-FALLBACK] ${name} CONFIRMED: ${suite.evidence(resp, payload)} — ${method} ${targetUrl}?${param}=${payload} (HTTP ${resp.status})`,
+                suiteName: name, suiteVulnType: suite.vulnType, confirmed: true,
+                evidence: `${name} indicator found: ${suite.evidence(resp, payload)} — ${method} ${targetUrl}?${param}=${payload} (HTTP ${resp.status})`,
                 payload, status: resp.status, body: resp.body.slice(0, 500),
               };
-              return { suiteName: name, confirmed: false, evidence: '' };
+              return { suiteName: name, suiteVulnType: suite.vulnType, confirmed: false, evidence: '' };
             })());
           }
         }
       }
     }
     const results = await Promise.allSettled(fallbackTests);
-    let anySucceeded = false;
+
+    // Collect any different-class confirmations (for the evidence note)
+    const differentClassFindings: string[] = [];
+    let anyRequestSucceeded = false;
     for (const r of results) {
       if (r.status === 'fulfilled') {
         if (r.value.confirmed) {
-          return exploitConfirmed(r.value.evidence,
-            { validationScope: 'target', requestUrl: targetUrl, responseStatus: r.value.status, responseBody: r.value.body, payload: r.value.payload });
+          // A different vuln class was confirmed — but this does NOT confirm
+          // the ORIGINAL finding's claimed type. Record it as a note.
+          differentClassFindings.push(r.value.evidence);
         }
-        if (r.value.evidence !== '' || r.value.suiteName) anySucceeded = true;
+        if (r.value.suiteName) anyRequestSucceeded = true;
       }
     }
-    // Check if ANY request actually succeeded (status !== 0)
-    // We can re-run a single probe to verify reachability if needed
-    if (!anySucceeded) {
-      // Re-verify with a single probe
+
+    // If no requests succeeded at all → INCONCLUSIVE
+    if (!anyRequestSucceeded) {
       try {
         const probe = await fetch(targetUrl, { headers: BROWSER_HEADERS, signal: AbortSignal.timeout(5_000) });
-        anySucceeded = true;
+        anyRequestSucceeded = true;
       } catch {
-        anySucceeded = false;
+        anyRequestSucceeded = false;
       }
     }
-    if (!anySucceeded) {
+    if (!anyRequestSucceeded) {
       return inconclusive(
         `[AGGRESSIVE-FALLBACK] All ${fallbackTests.length} payload tests to ${targetUrl} failed (network error or timeout). Cannot determine exploitability for "${vulnType}". Verdict: INCONCLUSIVE.`,
         { validationScope: 'theoretical', requestUrl: targetUrl });
     }
+
+    // If we found a DIFFERENT vuln class, report it but DO NOT upgrade
+    // the original finding to EXPLOITABLE.
+    if (differentClassFindings.length > 0) {
+      return inconclusive(
+        `[AGGRESSIVE-FALLBACK] Claimed vuln type: "${vulnType}". No specific test suite exists for this type. Fallback tested 6 other classes (XSS/SQLi/SSRF/Redirect/CmdInjection/PathTraversal) and found indicators of a DIFFERENT class:\n${differentClassFindings.join('\n')}\n\nNOTE: These are NOT confirmations of the claimed "${vulnType}" vulnerability. They are separate hypotheses that should be reported as independent findings. The original "${vulnType}" finding remains UNCONFIRMED. Verdict: INCONCLUSIVE — needs manual verification or a specific test for "${vulnType}".`,
+        { validationScope: 'target', requestUrl: targetUrl });
+    }
+
+    // All tests ran, none confirmed anything — NOT_EXPLOITABLE for the claimed type
     return exploitRefuted(
-      `[AGGRESSIVE-FALLBACK] Ran ${fallbackTests.length} payload tests across ${allSuites.length} suites (XSS/SQLi/SSRF/Redirect/CmdInjection/PathTraversal) × ${candidateParams.length} params × 2 methods against ${targetUrl}. None confirmed for vuln type "${vulnType}". Verdict: NOT_EXPLOITABLE — no payload-based vuln found via automated testing.`,
+      `[AGGRESSIVE-FALLBACK] Ran ${fallbackTests.length} payload tests across ${allSuites.length} suites (XSS/SQLi/SSRF/Redirect/CmdInjection/PathTraversal) × ${candidateParams.length} params × 2 methods against ${targetUrl}. None confirmed for vuln type "${vulnType}". Verdict: NOT_EXPLOITABLE — no payload-based vuln found via automated testing. The claimed "${vulnType}" could not be confirmed (no specific test suite exists for it).`,
       { validationScope: 'target', requestUrl: targetUrl });
   }
 
