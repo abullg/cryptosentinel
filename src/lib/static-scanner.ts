@@ -390,19 +390,45 @@ const CAIRO_PATTERNS: Pattern[] = [
 const WEB_PATTERNS: Pattern[] = [
   {
     type: 'xss',
-    title: 'Reflected XSS via innerHTML or document.write',
-    severity: 'critical',
+    title: 'Potential DOM XSS via innerHTML or document.write',
+    severity: 'medium', // Sink found but source unknown — not 'critical'
     regex: /(?:innerHTML|outerHTML|document\.write)\s*[=\(]/g,
-    description: (m, f) => `DOM manipulation via ${m[0].slice(0, 30)} in ${f} directly injects content into the page. If user input reaches this sink without sanitization, an attacker can inject arbitrary JavaScript, steal session tokens, manipulate wallet connections, or redirect transactions.`,
-    confidence: 0.80, v1: 0.85, v2: 0.80, v3: 0.75, v4: 0.60,
+    description: (m, f) => {
+      const match = m[0].toLowerCase();
+      const hasKnownSource = match.includes('location.hash') ||
+        match.includes('location.search') ||
+        match.includes('e.data') ||
+        match.includes('event.data') ||
+        match.includes('postmessage') ||
+        match.includes('referrer');
+      if (hasKnownSource) {
+        return `DOM XSS sink in ${f} with KNOWN attacker-controlled source (TYPE A). Source appears to be user input (location/postMessage). POTENTIAL impact: JS execution IF payload bypasses sanitization. Requires active validation. Note: <script> via innerHTML does NOT execute — only event handlers (onerror, onload) do.`;
+      }
+      return `DOM XSS sink in ${f} with UNKNOWN source (TYPE B). innerHTML present but source not visible. If data is attacker-controlled → XSS. If trusted → NOT a vulnerability. Requires source tracing.`;
+    },
+    confidence: 0.60, // Lowered — sink found but source unknown
+    v1: 0.65, v2: 0.60, v3: 0.55, v4: 0.40,
   },
   {
     type: 'api_leak',
     title: 'Hardcoded API key or secret',
-    severity: 'critical',
+    severity: 'low', // Changed from 'critical' — severity depends on whether the key is REAL
     regex: /(?:api[_-]?key|secret|token|password|private[_-]?key)\s*[=:]\s*['"][^'"]{8,}['"]/gi,
-    description: (m, f) => `Hardcoded secret in ${f}. API keys, private keys, or passwords embedded in client-side code are visible to anyone inspecting the page source or network requests. This enables unauthorized API access, fund theft (if private key), or account takeover.`,
-    confidence: 0.92, v1: 0.95, v2: 0.90, v3: 0.95, v4: 0.80,
+    description: (m, f) => {
+      const match = m[0];
+      // Extract the value to check if it's a test/placeholder
+      const valueMatch = match.match(/['"]([^'"]+)['"]/);
+      const value = valueMatch?.[1] || '';
+      const testPatterns = /^(sk-leaked|sk-test|sk-fake|sk-placeholder|test|example|demo|sample|xxx|yyy|aaa|your[_-]?api[_-]?key|placeholder|changeme|default|foo|bar|baz|password|secret|token|abc123|12345678)$/i;
+      const isTestValue = testPatterns.test(value) || value.length < 12;
+
+      if (isTestValue) {
+        return `OBSERVATION: Hardcoded string matching API key pattern found in ${f}: "${value.slice(0, 3)}***${value.slice(-3)}". The value appears to be a TEST/PLACEHOLDER. If this is a real production key, severity should be HIGH. Marking as LOW pending confirmation that this is a real, active credential.`;
+      }
+      return `Hardcoded secret in ${f}: "${value.slice(0, 3)}***${value.slice(-3)}". The value does not match known test patterns — it may be a real credential. POTENTIAL impact: unauthorized API access IF the key is valid and grants meaningful permissions. Requires validation: (1) is the key accepted by an API endpoint? (2) what permissions does it grant? (3) is it still active?`;
+    },
+    confidence: 0.50, // Lowered from 0.92 — detection is certain, but severity is not
+    v1: 0.50, v2: 0.50, v3: 0.50, v4: 0.30,
   },
   {
     type: 'cors_misconfig',
