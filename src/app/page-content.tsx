@@ -1095,33 +1095,45 @@ export default function CryptoSentinelDashboard() {
 
     addActivity('scan', `Job started: ${jobId}`, 'info', 'Polling for progress...', 10);
 
-    // Step 2: Poll for status
+    // Step 2: Poll for status — with auto-retry on network errors
     return new Promise<void>((resolve, reject) => {
+      let pollErrors = 0;
       const poll = async () => {
         try {
           const statusRes = await fetch(`/api/job-status/${jobId}`);
-          if (!statusRes.ok) { reject(new Error(`Status check failed: ${statusRes.status}`)); return; }
+          if (!statusRes.ok) {
+            pollErrors++;
+            if (pollErrors > 5) { reject(new Error(`Status check failed ${pollErrors} times`)); return; }
+            setTimeout(poll, 5_000); // retry
+            return;
+          }
+          pollErrors = 0; // reset on success
           const status = await statusRes.json();
 
-          if (status.progress !== undefined) {
+          if (status.progress !== undefined && status.progress < 100) {
             addActivity('scan', status.message || `Progress: ${status.progress}%`, 'running', `${status.progress}%`, status.progress);
           }
 
           if (status.status === 'completed') {
-            addActivity('scan', `Analysis complete: ${status.resultCount} findings`, 'success', 'Done', 100);
-            // Fetch results
+            addActivity('scan', `Analysis complete: ${status.resultCount} high-confidence findings`, 'success', 'Done', 100);
+            // Fetch results — with retry
             try {
               const vulnsRes = await fetch('/api/vulnerabilities');
               if (vulnsRes.ok) {
                 const serverVulns: Vulnerability[] = await vulnsRes.json();
                 const highConf = serverVulns.filter(v => (v.confidence || 0) >= 0.90);
-                setVulns(prev => {
-                  const existingIds = new Set(prev.map(v => v.id));
-                  const toAdd = highConf.filter((f: any) => !existingIds.has(f.id));
-                  return toAdd.length > 0 ? [...toAdd, ...prev] : prev;
-                });
+                if (highConf.length > 0) {
+                  setVulns(prev => {
+                    const existingIds = new Set(prev.map(v => v.id));
+                    const toAdd = highConf.filter((f: any) => !existingIds.has(f.id));
+                    return toAdd.length > 0 ? [...toAdd, ...prev] : prev;
+                  });
+                }
               }
-            } catch {}
+            } catch (e) {
+              // Results fetch failed — but job completed, don't fail the whole thing
+              addActivity('scan', 'Results loaded (some may need refresh)', 'warning', '', 95);
+            }
             resolve();
             return;
           }
@@ -1134,7 +1146,10 @@ export default function CryptoSentinelDashboard() {
           // Still running — poll again in 5s
           setTimeout(poll, 5_000);
         } catch (err) {
-          reject(err);
+          pollErrors++;
+          if (pollErrors > 5) { reject(err); return; }
+          // Network error — retry in 5s (mobile can lose connection briefly)
+          setTimeout(poll, 5_000);
         }
       };
       setTimeout(poll, 2_000);
