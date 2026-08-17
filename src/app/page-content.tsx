@@ -354,84 +354,49 @@ export default function CryptoSentinelDashboard() {
     if (res.ok) fetchData();
   };
 
-  // Validate a single vulnerability via deep AI analysis
+  // Validate a single vulnerability via active exploit testing
   const validateVuln = async (v: Vulnerability) => {
-    if (validatingVulns.has(v.id)) return; // already validating
+    if (validatingVulns.has(v.id)) return;
     setValidatingVulns(prev => new Set(prev).add(v.id));
-    addActivity('validation', `Starting deep validation: ${v.title}`, 'running', 'Sending to GLM for exploitability analysis', 0);
+    addActivity('validation', `Validating: ${v.title}`, 'running', 'Active exploit testing', 0);
 
     try {
-      // SYNCHRONOUS validation — server runs agent loop directly and returns 200.
-      // No after(), no jobStore, no polling. 50s hard timeout on the server.
-      // NOTE: Route is /api/validate (not /api/validate-vuln which doesn't exist).
-      // Previously called /api/validate-vuln which returned HTTP 404, causing
-      // every manual "🔍 Validate" click to fail.
-      const res = await fetchWithTimeout('/api/validate', {
+      // POST /api/validate-vuln — runs activelyValidate() (Foundry/cast/HTTP)
+      const res = await fetchWithTimeout('/api/validate-vuln', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          vulnerabilityId: v.id,
-          type: v.type,
-          title: v.title,
-          description: v.description,
-          codeSnippet: v.codeSnippet || v.description,
-          sourceCode: v.codeSnippet || sourceCode || v.description,
-        }),
-      }, 55_000); // 55s — server has 50s timeout, give 5s margin
+        body: JSON.stringify({ vulnerabilityId: v.id }),
+      }, 120_000); // 2 min — validation can take time
 
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
         addActivity('validation', `Validation failed: ${v.title}`, 'error', errData.error || `HTTP ${res.status}`, 0);
-        // Mark as validated even on error so it shows up
         setVulns(prev => prev.map(vn => vn.id === v.id ? {
-          ...vn, validationSteps: vn.validationSteps || `Validation error: ${errData.error || `HTTP ${res.status}`}`,
+          ...vn, validationSteps: `Validation error: ${errData.error || `HTTP ${res.status}`}`,
           status: vn.status === 'candidate' ? 'validated' : vn.status,
         } : vn));
         return;
       }
 
       const result = await res.json();
-
-      if (result._timedOut) {
-        // Server-side timeout — graceful fallback
-        addActivity('validation', `Validation timed out: ${v.title} — serverless limit (50s)`, 'warning', 'Try re-validating', 80);
-        setVulns(prev => prev.map(vn => vn.id === v.id ? {
-          ...vn, validationSteps: vn.validationSteps || 'Validation timed out (50s serverless limit) — try re-validating',
-          status: vn.status === 'candidate' ? 'validated' : vn.status,
-        } : vn));
-        return;
-      }
-
-      // Update the vulnerability in state with validation results.
-      // If the new confidence drops below 90%, REMOVE the finding from
-      // the visible list — the user only wants >=90% confidence shown.
       const newConfidence = result.confidence ?? 0;
-      if (newConfidence < 0.90) {
-        setVulns(prev => prev.filter(vn => vn.id !== v.id));
-        addActivity('validation', `Finding removed (confidence dropped to ${(newConfidence * 100).toFixed(0)}% — below 90% threshold): ${v.title}`, 'warning', 'Filtered by confidence', 0);
-      } else {
-        setVulns(prev => prev.map(vn => vn.id === v.id ? {
-          ...vn,
-          v1Symbolic: result.v1Symbolic ?? vn.v1Symbolic,
-          v2Fuzzing: result.v2Fuzzing ?? vn.v2Fuzzing,
-          v3Formal: result.v3Formal ?? vn.v3Formal,
-          v4Economic: result.v4Economic ?? vn.v4Economic,
-          confidence: result.confidence ?? vn.confidence,
-          status: result.status ?? vn.status,
-          poc: result.poc ?? vn.poc,
-          pocFilename: result.pocFilename ?? vn.pocFilename,
-          validationSteps: result.validationSteps ?? vn.validationSteps,
-          description: result?.exploitAnalysis ? `${vn.description}\n\n[Validation] ${result.exploitAnalysis}` : vn.description,
-        } : vn));
-      }
+      const scope = result.validationScope || 'theoretical';
 
-      const confPct = ((result.confidence ?? 0) * 100).toFixed(1);
-      const statusLabel = result.status === 'confirmed' ? 'CONFIRMED ✓' : result.status === 'validated' ? 'VALIDATED' : result.status === 'refuted' ? 'REFUTED ✗' : result.status;
-      addActivity('validation', `Validation complete: ${v.title} — ${statusLabel} (${confPct}%)`, result.status === 'refuted' ? 'warning' : 'success', result.exploitAnalysis?.slice(0, 200) || '', 100);
+      // Update finding with validation results
+      setVulns(prev => prev.map(vn => vn.id === v.id ? {
+        ...vn,
+        confidence: newConfidence,
+        status: result.status || vn.status,
+        validationScope: scope,
+        validationSteps: result.evidence || vn.validationSteps,
+      } : vn));
+
+      const confPct = (newConfidence * 100).toFixed(0);
+      const statusLabel = result.status === 'confirmed' ? 'CONFIRMED' : result.status === 'validated' ? 'VALIDATED' : result.status || 'candidate';
+      addActivity('validation', `Validation: ${v.title} — ${statusLabel} (${confPct}%, ${scope})`, result.status === 'confirmed' ? 'success' : 'info', result.evidence?.slice(0, 200) || '', 100);
     } catch (err: any) {
       const errMsg = String(err)?.slice(0, 100) || 'Network error';
       addActivity('validation', `Validation failed: ${v.title}`, 'error', errMsg, 0);
-      // Mark as validated even on error so it shows up
       setVulns(prev => prev.map(vn => vn.id === v.id ? {
         ...vn, validationSteps: vn.validationSteps || `Validation error: ${errMsg}`,
         status: vn.status === 'candidate' ? 'validated' : vn.status,
@@ -1121,7 +1086,7 @@ export default function CryptoSentinelDashboard() {
               const vulnsRes = await fetch(`/api/vulnerabilities?t=${Date.now()}`);
               if (vulnsRes.ok) {
                 const serverVulns: Vulnerability[] = await vulnsRes.json();
-                const highConf = serverVulns.filter(v => (v.confidence || 0) >= 0.70);
+                const highConf = serverVulns.filter(v => (v.confidence || 0) >= 0.90);
                 if (highConf.length > 0) {
                   setVulns(prev => {
                     const existingIds = new Set(prev.map(v => v.id));

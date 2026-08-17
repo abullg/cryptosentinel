@@ -1,0 +1,2002 @@
+     1→'use client';
+     2→
+     3→import { useState, useEffect, useCallback, useRef } from 'react';
+     4→import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+     5→import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+     6→import { Badge } from '@/components/ui/badge';
+     7→import { Button } from '@/components/ui/button';
+     8→import { Progress } from '@/components/ui/progress';
+     9→import { Textarea } from '@/components/ui/textarea';
+    10→import { Input } from '@/components/ui/input';
+    11→import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+    12→import { Separator } from '@/components/ui/separator';
+    13→import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog';
+    14→import {
+    15→  Shield, Bug, Brain, Zap, Lock, Search, Database,
+    16→  AlertTriangle, CheckCircle2, XCircle, Clock, Activity,
+    17→  FileCode, Globe, ChevronRight, TrendingUp, Target,
+    18→  Download, FileText, Settings, Key, CheckCircle, Wifi, WifiOff,
+    19→  ExternalLink, AlertCircle, Code2, Copy, X, Trash2,
+    20→  Eye, Play, Square, RefreshCw, Terminal, Loader2, Pause, Filter, ZapOff
+    21→} from 'lucide-react';
+    22→
+    23→// Types
+    24→interface Vulnerability {
+    25→  id: string; type: string; severity: string; title: string; description: string;
+    26→  confidence: number; status: string; v1Symbolic: number | null; v2Fuzzing: number | null;
+    27→  v3Formal: number | null; v4Economic: number | null; patternTag: string | null;
+    28→  isDuplicate: boolean; pocFilename: string | null; poc: string | null; target: string | null;
+    29→  vulnCategory: string | null; validationSteps: string | null; location: string | null;
+    30→  codeSnippet: string | null; createdAt: string;
+    31→  validationScope?: 'target' | 'lab' | 'theoretical' | null;
+    32→  contract?: { name: string; project?: { name: string } };
+    33→}
+    34→interface Project {
+    35→  id: string; name: string; chain: string; language: string; address: string | null;
+    36→  contracts?: { id: string; name: string }[];
+    37→  audits?: { id: string; status: string; findings: number; confirmed: number }[];
+    38→}
+    39→interface MemoryPattern { id: string; type: string; name: string; description: string; tags: string; chain: string | null; frequency: number; severity: string; }
+    40→
+    41→const severityColor: Record<string, string> = {
+    42→  critical: 'bg-red-100 text-red-800 border-red-200',
+    43→  high: 'bg-orange-100 text-orange-800 border-orange-200',
+    44→  medium: 'bg-yellow-100 text-yellow-800 border-yellow-200',
+    45→  low: 'bg-green-100 text-green-800 border-green-200',
+    46→  info: 'bg-slate-100 text-slate-700 border-slate-200',
+    47→};
+    48→const statusIcon: Record<string, React.ReactNode> = {
+    49→  confirmed: <CheckCircle2 className="w-4 h-4 text-green-600" />,
+    50→  validated: <Target className="w-4 h-4 text-blue-600" />,
+    51→  candidate: <Clock className="w-4 h-4 text-yellow-600" />,
+    52→  refuted: <XCircle className="w-4 h-4 text-red-600" />,
+    53→};
+    54→const chainLabel: Record<string, string> = {
+    55→  ethereum: 'Ethereum', bsc: 'BSC', polygon: 'Polygon', arbitrum: 'Arbitrum',
+    56→  solana: 'Solana', sui: 'Sui', starknet: 'StarkNet', optimism: 'Optimism',
+    57→};
+    58→
+    59→// Persisted State Hook
+    60→function usePersistedState<T>(key: string, defaultValue: T) {
+    61→  const [state, setState] = useState<T>(() => {
+    62→    if (typeof window !== 'undefined') {
+    63→      try {
+    64→        const saved = localStorage.getItem(key);
+    65→        if (saved) return JSON.parse(saved);
+    66→      } catch {}
+    67→    }
+    68→    return defaultValue;
+    69→  });
+    70→
+    71→  // Debounced localStorage write — prevents UI jank from frequent writes during polling
+    72→  const writeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    73→  useEffect(() => {
+    74→    if (typeof window !== 'undefined') {
+    75→      if (writeTimerRef.current) clearTimeout(writeTimerRef.current);
+    76→      writeTimerRef.current = setTimeout(() => {
+    77→        try { localStorage.setItem(key, JSON.stringify(state)); } catch {}
+    78→      }, 500); // 500ms debounce
+    79→    }
+    80→    return () => { if (writeTimerRef.current) clearTimeout(writeTimerRef.current); };
+    81→  }, [key, state]);
+    82→
+    83→  return [state, setState] as const;
+    84→}
+    85→
+    86→// Activity Item Type
+    87→interface ActivityItem {
+    88→  id: string;
+    89→  type: 'scan' | 'finding' | 'method' | 'system' | 'validation' | 'attack-sim';
+    90→  message: string;
+    91→  detail?: string;
+    92→  timestamp: number;
+    93→  status: 'running' | 'success' | 'warning' | 'error' | 'info';
+    94→  progress?: number;
+    95→}
+    96→
+    97→export default function CryptoSentinelDashboard() {
+    98→  const [projects, setProjects] = usePersistedState<Project[]>('cs_projects', []);
+    99→  const [vulns, setVulns] = usePersistedState<Vulnerability[]>('cs_vulns', []);
+   100→  /** CRITICAL: Only show vulnerabilities with confidence >= 90%
+   101→   *  Applied to EVERY place findings enter the UI. No exceptions. */
+   102→  const MIN_CONFIDENCE = 0.90;
+   103→  const onlyHighConfidence = (findings: any[]): any[] => findings.filter(f => (f.confidence || 0) >= MIN_CONFIDENCE);
+   104→
+   105→
+   106→  /** Filter: only show vulnerabilities with confidence >= 90%.
+   107→   *  Findings without active validation are SHOWN but with a "Needs validation"
+   108→   *  badge in the UI. The user can click "Re-validate" to run active testing. */
+   109→  const filterHighConfidence = (vulns: Vulnerability[]): Vulnerability[] => {
+   110→    return vulns.filter(v => (v.confidence || 0) >= 0.90);
+   111→  };
+   112→
+   113→  /** SAFETY NET: After every vulns state change, sweep and drop anything
+   114→   *  below 90% confidence. */
+   115→  useEffect(() => {
+   116→    setVulns(prev => {
+   117→      const filtered = prev.filter(v => (v.confidence || 0) >= 0.90);
+   118→      return filtered.length === prev.length ? prev : filtered;
+   119→    });
+   120→  }, [vulns]);
+   121→
+   122→  /** Helper: check if a finding has active validation. */
+   123→  const hasActiveValidation = (v: any): boolean =>
+   124→    v.validationScope === 'target' || v.validationScope === 'lab';
+   125→
+   126→  /** Filter: confidence >= 90% (validation status is shown as badge, not filter). */
+   127→  const onlyValidated = (findings: any[]): any[] => findings.filter(f =>
+   128→    (f.confidence || 0) >= 0.90
+   129→  );
+   130→
+   131→  const [patterns, setPatterns] = usePersistedState<MemoryPattern[]>('cs_patterns', []);
+   132→  const [loading, setLoading] = useState(false);
+   133→  const [analyzing, setAnalyzing] = useState(false);
+   134→  const [activeProject, setActiveProject] = usePersistedState<string>('cs_activeProject', '');
+   135→  const [newProject, setNewProject] = useState({ name: '', chain: 'ethereum', language: 'solidity', address: '' });
+   136→  const [sourceCode, setSourceCode] = useState('');
+   137→  const [apiKey, setApiKey] = useState('');
+   138→
+   139→  /**
+   140→   * Ensure a project is selected — if not, auto-create or pick the first one.
+   141→   * Returns the active project ID.
+   142→   */
+   143→  const ensureProject = async (name?: string, chain?: string, language?: string): Promise<string> => {
+   144→    // If a project is already selected, use it
+   145→    if (activeProject) return activeProject;
+   146→    // If projects exist, pick the first one
+   147→    if (projects.length > 0) {
+   148→      setActiveProject(projects[0].id);
+   149→      return projects[0].id;
+   150→    }
+   151→    // Otherwise auto-create a project — WITH TIMEOUT to prevent infinite hang
+   152→    const projectName = name || 'Auto Analysis';
+   153→    const res = await fetchWithTimeout('/api/projects', {
+   154→      method: 'POST', headers: { 'Content-Type': 'application/json' },
+   155→      body: JSON.stringify({ name: projectName, chain: chain || 'ethereum', language: language || 'solidity' }),
+   156→    }, 30_000); // 30s timeout
+   157→    if (res.ok) {
+   158→      const p = await res.json();
+   159→      setProjects(prev => [p, ...prev]);
+   160→      setActiveProject(p.id);
+   161→      return p.id;
+   162→    }
+   163→    throw new Error('Failed to auto-create project');
+   164→  };
+   165→  const [hasKey, setHasKey] = usePersistedState<boolean>('cs_hasKey', false);
+   166→  const [maskedKey, setMaskedKey] = usePersistedState<string>('cs_maskedKey', '');
+   167→  /** 'env' if the key comes from OPENROUTER_API_KEY env var, 'db' if from DB, null if no key */
+   168→  const [keySource, setKeySource] = useState<'env' | 'db' | null>(null);
+   169→  /** State for the "Test API Key" button — performs a real OpenRouter /key check */
+   170→  const [testingKey, setTestingKey] = useState(false);
+   171→  const [keyTestResult, setKeyTestResult] = useState<{
+   172→    valid: boolean;
+   173→    reason: string;
+   174→    source?: string;
+   175→    key_info?: {
+   176→      is_free_tier?: boolean;
+   177→      usage?: number;
+   178→      limit?: number | null;
+   179→      expires_at?: string | null;
+   180→    };
+   181→  } | null>(null);
+   182→  const [model, setModel] = usePersistedState<string>('cs_model', 'z-ai/glm-5.2');
+   183→  const [targetUrl, setTargetUrl] = useState('');
+   184→  const [targetType, setTargetType] = useState<'contract' | 'exchange' | 'hackenproof'>('contract');
+   185→  const [fetchingUrl, setFetchingUrl] = useState(false);
+   186→  const [fetchError, setFetchError] = useState('');
+   187→  const [reportText, setReportText] = useState('');
+   188→  const [showReport, setShowReport] = useState(false);
+   189→  const [hackenproofContext, setHackenproofContext] = useState<{description: string; priorities: string; projectName: string} | null>(null);
+   190→  const [pocView, setPocView] = useState<{title: string; filename: string; code: string} | null>(null);
+   191→  const [pocCopied, setPocCopied] = useState(false);
+   192→  const [validatingVulns, setValidatingVulns] = useState<Set<string>>(new Set());
+   193→
+   194→  // ─── ANALYSIS LOCK & ABORT ────────────────────────────────────────────────
+   195→  // Prevents concurrent analysis runs and ensures ALL in-flight requests are
+   196→  // cancelled when a hard timeout fires. This is THE fix for infinite loading.
+   197→  const isAnalyzingRef = useRef(false);       // true = analysis in progress (lock)
+   198→  const analysisAbortRef = useRef<AbortController | null>(null); // abort all fetches on timeout
+   199→  const HARD_TIMEOUT_MS = 900_000;            // 15 min — background job has no SSE timeout
+   200→
+   201→  // ─── SAFETY WATCHDOG ──────────────────────────────────────────────────────
+   202→  // With background polling, the watchdog only needs to catch UI bugs.
+   203→  // The actual analysis runs on the server and can take up to 10 min.
+   204→  // 15 min is generous — if polling hasn't shown 'completed' by then, reset.
+   205→  const watchdogSinceRef = useRef<number>(0);
+   206→  useEffect(() => {
+   207→    const WATCHDOG_INTERVAL = 10_000;
+   208→    const WATCHDOG_MAX = 900_000;  // 15 min
+   209→
+   210→    const watchdog = setInterval(() => {
+   211→      if (analyzing || fetchingUrl) {
+   212→        if (watchdogSinceRef.current === 0) watchdogSinceRef.current = Date.now();
+   213→        const elapsed = Date.now() - watchdogSinceRef.current;
+   214→        if (elapsed > WATCHDOG_MAX) {
+   215→          const mins = Math.round(elapsed / 60_000);
+   216→          console.error(`[WATCHDOG] analyzing stuck for ${mins} min — FORCE RESET`);
+   217→          isAnalyzingRef.current = false;
+   218→          analysisAbortRef.current = null;
+   219→          setAnalyzing(false);
+   220→          setFetchingUrl(false);
+   221→          setFetchError(`Analysis timed out after ${mins} min. The server may be overloaded — please try again.`);
+   222→          addActivity('scan', `Analysis timed out after ${mins} min — force reset`, 'error', 'Server may be overloaded; please retry', 0);
+   223→          watchdogSinceRef.current = 0;
+   224→        }
+   225→      } else {
+   226→        watchdogSinceRef.current = 0;
+   227→      }
+   228→    }, WATCHDOG_INTERVAL);
+   229→
+   230→    return () => clearInterval(watchdog);
+   231→  }, [analyzing]);
+   232→
+   233→  // Scan Methods (toggleable)
+   234→  const [scanMethods, setScanMethods] = usePersistedState<Record<string, boolean>>('cs_scanMethods', {
+   235→    'ast-analysis': true, 'data-flow': true, 'control-flow': true, 'pattern-match': true,
+   236→    'deep-reentrancy': true, 'symbolic-exec': true, 'fuzzing': true, 'mutation-test': true,
+   237→    'formal-verify': true, 'model-check': true, 'invariant-check': true, 'signature-replay': true,
+   238→    'access-control': true, 'oracle-manip': true, 'flash-loan-sim': true, 'mev-analysis': true,
+   239→    'gas-dos-audit': true, 'cross-contract': true, 'proxy-storage': true, 'delegatecall-scan': true,
+   240→  });
+   241→
+   242→  // Activity Feed
+   243→  const [activities, setActivities] = usePersistedState<ActivityItem[]>('cs_activities', []);
+   244→  const [showActivity, setShowActivity] = useState(false);
+   245→  const activityPanelRef = useRef<HTMLDivElement>(null);
+   246→
+   247→  const addActivity = (type: ActivityItem['type'], message: string, status: ActivityItem['status'], detail?: string, progress?: number) => {
+   248→    const item: ActivityItem = { id: Math.random().toString(36).substr(2, 9), type, message, status, detail, progress, timestamp: Date.now() };
+   249→    setActivities(prev => [item, ...prev].slice(0, 50));
+   250→  };
+   251→
+   252→  const toggleScanMethod = (key: string) => {
+   253→    setScanMethods(prev => ({ ...prev, [key]: !prev[key] }));
+   254→  };
+   255→
+   256→  const fetchData = useCallback(async () => {
+   257→    try {
+   258→      // Use fetchWithTimeout (15s) to prevent infinite hang on slow networks
+   259→      const [pRes, vRes, mRes, sRes] = await Promise.all([
+   260→        fetchWithTimeout('/api/projects', {}, 15_000),
+   261→        fetchWithTimeout('/api/vulnerabilities', {}, 15_000),
+   262→        fetchWithTimeout('/api/memory', {}, 15_000),
+   263→        fetchWithTimeout('/api/settings', {}, 15_000)
+   264→      ]);
+   265→      if (pRes.ok) setProjects(await pRes.json());
+   266→      if (vRes.ok) {
+   267→        const serverVulns: Vulnerability[] = await vRes.json();
+   268→        // MERGE: keep union of server + localStorage, dedup by ID.
+   269→        // Server data ADDS to localStorage — never replaces (fixes data loss on restart)
+   270→        // Apply 90% confidence filter — never display low-confidence findings.
+   271→        if (serverVulns.length > 0) {
+   272→          const highConfServerVulns = onlyValidated(serverVulns);
+   273→          setVulns(prev => {
+   274→            const existingIds = new Set(prev.map(v => v.id));
+   275→            const toAdd = highConfServerVulns.filter(v => !existingIds.has(v.id));
+   276→            return toAdd.length > 0 ? [...toAdd, ...prev] : prev;
+   277→          });
+   278→        }
+   279→      }
+   280→      if (mRes.ok) setPatterns(await mRes.json());
+   281→      if (sRes.ok) {
+   282→        const s = await sRes.json();
+   283→        setHasKey(s._hasKey || false);
+   284→        setMaskedKey(s.apiKey || '');
+   285→        setModel(s.model || 'z-ai/glm-5.2');
+   286→        setKeySource(s._source || null);
+   287→      }
+   288→    } catch {}
+   289→  }, []);
+   290→
+   291→  useEffect(() => { fetchData(); }, [fetchData]);
+   292→
+   293→  // CONNECTIVITY CHECK: Quick ping to verify server is reachable on page load
+   294→  useEffect(() => {
+   295→    const endpoints = ['/api', '/api/analyze', '/api/validate-vuln', '/api/vulnerabilities'];
+   296→    endpoints.forEach(url => {
+   297→      fetch(url, { method: 'GET' }).catch(() => {}); // fire-and-forget warmup
+   298→    });
+   299→  }, []);
+   300→
+   301→  // AUTO-VALIDATE: Whenever new unvalidated vulns appear, trigger active exploitation test
+   302→  // Uses refs to avoid stale closures and re-render loops
+   303→  // IMPORTANT: Skips if analysis is in progress to prevent interference
+   304→  const autoValidateRan = useRef<Set<string>>(new Set());
+   305→  const autoValidateRunning = useRef(false);
+   306→  const vulnsRef = useRef(vulns);
+   307→  vulnsRef.current = vulns;
+   308→  const hasKeyRef = useRef(hasKey);
+   309→  hasKeyRef.current = hasKey;
+   310→
+   311→  // Single useEffect that runs once and watches for new unvalidated vulns via interval
+   312→  useEffect(() => {
+   313→    const interval = setInterval(() => {
+   314→      // SKIP if analysis is running — prevents interference with main analysis flow
+   315→      if (isAnalyzingRef.current) return;
+   316→      if (!hasKeyRef.current || autoValidateRunning.current) return;
+   317→
+   318→      const currentVulns = vulnsRef.current;
+   319→      const unvalidated = currentVulns.filter(v =>
+   320→        !v.validationSteps &&
+   321→        v.status !== 'confirmed' && v.status !== 'validated' && v.status !== 'refuted' &&
+   322→        !autoValidateRan.current.has(v.id)
+   323→      );
+   324→      if (unvalidated.length === 0) return;
+   325→
+   326→      // Mark as queued immediately
+   327→      unvalidated.forEach(v => autoValidateRan.current.add(v.id));
+   328→      autoValidateRunning.current = true;
+   329→
+   330→      addActivity('validation', `Auto-validating ${unvalidated.length} findings (active exploitation)...`, 'running', 'Default: all findings actively tested', 0);
+   331→
+   332→      // Validate sequentially with 3s gap
+   333→      (async () => {
+   334→        try {
+   335→          for (const vuln of unvalidated) {
+   336→            // Abort if analysis started while we're validating
+   337→            if (isAnalyzingRef.current) break;
+   338→            try { await validateVuln(vuln); } catch {}
+   339→            await new Promise(r => setTimeout(r, 3_000));
+   340→          }
+   341→        } finally {
+   342→          autoValidateRunning.current = false;
+   343→          addActivity('validation', `Auto-validation batch done`, 'success', '', 100);
+   344→        }
+   345→      })();
+   346→    }, 5_000); // Check every 5s for new unvalidated vulns
+   347→
+   348→    return () => clearInterval(interval);
+   349→  }, []); // Empty deps — runs once, uses refs
+   350→
+   351→  // Delete a single vulnerability
+   352→  const deleteVuln = async (id: string) => {
+   353→    const res = await fetchWithTimeout(`/api/vulnerabilities?id=${id}`, { method: 'DELETE' }, 15_000);
+   354→    if (res.ok) fetchData();
+   355→  };
+   356→
+   357→  // Validate a single vulnerability via deep AI analysis
+   358→  const validateVuln = async (v: Vulnerability) => {
+   359→    if (validatingVulns.has(v.id)) return; // already validating
+   360→    setValidatingVulns(prev => new Set(prev).add(v.id));
+   361→    addActivity('validation', `Starting deep validation: ${v.title}`, 'running', 'Sending to GLM for exploitability analysis', 0);
+   362→
+   363→    try {
+   364→      // SYNCHRONOUS validation — server runs agent loop directly and returns 200.
+   365→      // No after(), no jobStore, no polling. 50s hard timeout on the server.
+   366→      // NOTE: Route is /api/validate (not /api/validate-vuln which doesn't exist).
+   367→      // Previously called /api/validate-vuln which returned HTTP 404, causing
+   368→      // every manual "🔍 Validate" click to fail.
+   369→      const res = await fetchWithTimeout('/api/validate', {
+   370→        method: 'POST',
+   371→        headers: { 'Content-Type': 'application/json' },
+   372→        body: JSON.stringify({
+   373→          vulnerabilityId: v.id,
+   374→          type: v.type,
+   375→          title: v.title,
+   376→          description: v.description,
+   377→          codeSnippet: v.codeSnippet || v.description,
+   378→          sourceCode: v.codeSnippet || sourceCode || v.description,
+   379→        }),
+   380→      }, 55_000); // 55s — server has 50s timeout, give 5s margin
+   381→
+   382→      if (!res.ok) {
+   383→        const errData = await res.json().catch(() => ({}));
+   384→        addActivity('validation', `Validation failed: ${v.title}`, 'error', errData.error || `HTTP ${res.status}`, 0);
+   385→        // Mark as validated even on error so it shows up
+   386→        setVulns(prev => prev.map(vn => vn.id === v.id ? {
+   387→          ...vn, validationSteps: vn.validationSteps || `Validation error: ${errData.error || `HTTP ${res.status}`}`,
+   388→          status: vn.status === 'candidate' ? 'validated' : vn.status,
+   389→        } : vn));
+   390→        return;
+   391→      }
+   392→
+   393→      const result = await res.json();
+   394→
+   395→      if (result._timedOut) {
+   396→        // Server-side timeout — graceful fallback
+   397→        addActivity('validation', `Validation timed out: ${v.title} — serverless limit (50s)`, 'warning', 'Try re-validating', 80);
+   398→        setVulns(prev => prev.map(vn => vn.id === v.id ? {
+   399→          ...vn, validationSteps: vn.validationSteps || 'Validation timed out (50s serverless limit) — try re-validating',
+   400→          status: vn.status === 'candidate' ? 'validated' : vn.status,
+   401→        } : vn));
+   402→        return;
+   403→      }
+   404→
+   405→      // Update the vulnerability in state with validation results.
+   406→      // If the new confidence drops below 90%, REMOVE the finding from
+   407→      // the visible list — the user only wants >=90% confidence shown.
+   408→      const newConfidence = result.confidence ?? 0;
+   409→      if (newConfidence < 0.90) {
+   410→        setVulns(prev => prev.filter(vn => vn.id !== v.id));
+   411→        addActivity('validation', `Finding removed (confidence dropped to ${(newConfidence * 100).toFixed(0)}% — below 90% threshold): ${v.title}`, 'warning', 'Filtered by confidence', 0);
+   412→      } else {
+   413→        setVulns(prev => prev.map(vn => vn.id === v.id ? {
+   414→          ...vn,
+   415→          v1Symbolic: result.v1Symbolic ?? vn.v1Symbolic,
+   416→          v2Fuzzing: result.v2Fuzzing ?? vn.v2Fuzzing,
+   417→          v3Formal: result.v3Formal ?? vn.v3Formal,
+   418→          v4Economic: result.v4Economic ?? vn.v4Economic,
+   419→          confidence: result.confidence ?? vn.confidence,
+   420→          status: result.status ?? vn.status,
+   421→          poc: result.poc ?? vn.poc,
+   422→          pocFilename: result.pocFilename ?? vn.pocFilename,
+   423→          validationSteps: result.validationSteps ?? vn.validationSteps,
+   424→          description: result?.exploitAnalysis ? `${vn.description}\n\n[Validation] ${result.exploitAnalysis}` : vn.description,
+   425→        } : vn));
+   426→      }
+   427→
+   428→      const confPct = ((result.confidence ?? 0) * 100).toFixed(1);
+   429→      const statusLabel = result.status === 'confirmed' ? 'CONFIRMED ✓' : result.status === 'validated' ? 'VALIDATED' : result.status === 'refuted' ? 'REFUTED ✗' : result.status;
+   430→      addActivity('validation', `Validation complete: ${v.title} — ${statusLabel} (${confPct}%)`, result.status === 'refuted' ? 'warning' : 'success', result.exploitAnalysis?.slice(0, 200) || '', 100);
+   431→    } catch (err: any) {
+   432→      const errMsg = String(err)?.slice(0, 100) || 'Network error';
+   433→      addActivity('validation', `Validation failed: ${v.title}`, 'error', errMsg, 0);
+   434→      // Mark as validated even on error so it shows up
+   435→      setVulns(prev => prev.map(vn => vn.id === v.id ? {
+   436→        ...vn, validationSteps: vn.validationSteps || `Validation error: ${errMsg}`,
+   437→        status: vn.status === 'candidate' ? 'validated' : vn.status,
+   438→      } : vn));
+   439→    } finally {
+   440→      setValidatingVulns(prev => { const s = new Set(prev); s.delete(v.id); return s; });
+   441→    }
+   442→  };
+   443→
+   444→  // Clear ALL findings, contracts, and audits
+   445→  const clearAllFindings = async () => {
+   446→    // Clear localStorage FIRST so merge strategy in fetchData doesn't restore them
+   447→    setVulns([]);
+   448→    setProjects([]);
+   449→    setPatterns([]);
+   450→    setActivities([]);
+   451→    setActiveProject('');
+   452→    // Reset auto-validate tracking so new vulns get validated after clear
+   453→    autoValidateRan.current.clear();
+   454→    // Also directly clear localStorage keys as backup
+   455→    try {
+   456→      localStorage.removeItem('cs_vulns');
+   457→      localStorage.removeItem('cs_projects');
+   458→      localStorage.removeItem('cs_patterns');
+   459→      localStorage.removeItem('cs_activities');
+   460→      localStorage.removeItem('cs_activeProject');
+   461→    } catch {}
+   462→    // Clear server DB
+   463→    try {
+   464→      const res = await fetchWithTimeout('/api/vulnerabilities', {
+   465→        method: 'POST',
+   466→        headers: { 'Content-Type': 'application/json' },
+   467→        body: JSON.stringify({ action: 'clear-all' }),
+   468→      }, 15_000);
+   469→      if (res.ok) {
+   470→        // Re-fetch to sync (server should return empty, local is already empty)
+   471→        fetchData();
+   472→      }
+   473→    } catch {} // non-fatal if server clear fails
+   474→  };
+   475→
+   476→  /** Hit /api/test-key — verifies the key actually works against OpenRouter before saving. */
+   477→  const testApiKey = async () => {
+   478→    setTestingKey(true);
+   479→    setKeyTestResult(null);
+   480→    try {
+   481→      // If user typed a new key in the input, test that. Otherwise, test the currently configured key.
+   482→      const body = apiKey && !apiKey.includes('***') ? { testKey: apiKey } : {};
+   483→      const res = await fetch('/api/test-key', {
+   484→        method: 'POST',
+   485→        headers: { 'Content-Type': 'application/json' },
+   486→        body: JSON.stringify(body),
+   487→      });
+   488→      const data = await res.json();
+   489→      setKeyTestResult(data);
+   490→      addActivity('scan',
+   491→        data.valid ? `API key test passed: ${data.reason}` : `API key test failed: ${data.reason}`,
+   492→        data.valid ? 'success' : 'error',
+   493→        data.source ? `Source: ${data.source}` : 'Test complete',
+   494→        100,
+   495→      );
+   496→    } catch (e) {
+   497→      const msg = e instanceof Error ? e.message : String(e);
+   498→      setKeyTestResult({ valid: false, reason: `Request failed: ${msg.slice(0, 200)}` });
+   499→      addActivity('scan', `API key test request failed: ${msg.slice(0, 120)}`, 'error', 'Network or server error', 0);
+   500→    } finally {
+   501→      setTestingKey(false);
+   502→    }
+   503→  };
+   504→
+   505→  const saveApiKey = async () => {
+   506→    // ─── Client-side format validation (mirrors server) ──────────
+   507→    // Fail FAST in the UI without even hitting the network. The server
+   508→    // also validates, but doing it here means the user gets instant
+   509→    // feedback and the Activity feed logs the rejection.
+   510→    if (apiKey && apiKey.includes('***')) {
+   511→      // Masked value from GET — user didn't change it, just save the model
+   512→    } else if (apiKey) {
+   513→      if (apiKey.startsWith('vcp_')) {
+   514→        addActivity('scan', 'API key rejected: this is not an OpenRouter key. OpenRouter keys start with "sk-or-v1-"', 'error', 'Invalid key format', 0);
+   515→        return;
+   516→      }
+   517→      if (apiKey.startsWith('sk-') && !apiKey.startsWith('sk-or-')) {
+   518→        addActivity('scan', 'API key rejected: this looks like an OpenAI key. OpenRouter keys start with "sk-or-v1-"', 'error', 'Invalid key format', 0);
+   519→        return;
+   520→      }
+   521→      if (!apiKey.startsWith('sk-or-v1-') || apiKey.length < 30) {
+   522→        addActivity('scan', 'API key rejected: invalid OpenRouter format. Keys start with "sk-or-v1-" and are 30+ characters', 'error', 'Invalid key format', 0);
+   523→        return;
+   524→      }
+   525→    }
+   526→
+   527→    const res = await fetchWithTimeout('/api/settings', {
+   528→      method: 'POST',
+   529→      headers: { 'Content-Type': 'application/json' },
+   530→      body: JSON.stringify({ apiKey, model }),
+   531→    }, 15_000);
+   532→    if (res.ok) {
+   533→      const s = await res.json();
+   534→      setHasKey(s._hasKey || false);
+   535→      setMaskedKey(s.apiKey || '');
+   536→      setKeySource(s._source || null);
+   537→      setApiKey('');
+   538→      const msg = s._note
+   539→        ? `Saved — but env var OPENROUTER_API_KEY takes precedence (${s._source})`
+   540→        : (s._hasKey ? 'OpenRouter API key saved — AI analysis is active' : 'Settings saved (no API key set)');
+   541→      addActivity('scan', msg, s._hasKey ? 'success' : 'warning', s._hasKey ? 'Ready' : 'Configure a key to enable AI', 100);
+   542→    } else {
+   543→      // ─── Surface server-side validation errors ─────────────────
+   544→      // Previously: any non-OK response was silently swallowed, so the
+   545→      // user thought their key was saved when it was actually rejected.
+   546→      let errMsg = `HTTP ${res.status}`;
+   547→      try { const e = await res.json(); errMsg = e.error || errMsg; } catch {}
+   548→      addActivity('scan', `Failed to save API key: ${errMsg.slice(0, 120)}`, 'error', 'Check key format', 0);
+   549→    }
+   550→  };
+   551→
+   552→  const createProject = async () => {
+   553→    if (!newProject.name) return;
+   554→    setLoading(true);
+   555→    try {
+   556→      const res = await fetchWithTimeout('/api/projects', {
+   557→        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(newProject),
+   558→      }, 15_000);
+   559→      if (res.ok) {
+   560→        const p = await res.json();
+   561→        setProjects(prev => [p, ...prev]);
+   562→        setActiveProject(p.id);
+   563→        setNewProject({ name: '', chain: 'ethereum', language: 'solidity', address: '' });
+   564→      }
+   565→    } finally { setLoading(false); }
+   566→  };
+   567→
+   568→  /** Fetch with timeout — prevents infinite loading if server hangs
+   569→   *  Default 45s timeout for fetches — generous enough for slow networks.
+   570→   *  Override for specific calls: 15s for 202 status, 10s for polls
+   571→   *  IMPORTANT: Also respects the analysis AbortController signal */
+   572→  const fetchWithTimeout = (url: string, options: RequestInit = {}, timeoutMs: number = 45_000): Promise<Response> => {
+   573→    const controller = new AbortController();
+   574→    const timer = setTimeout(() => controller.abort(), timeoutMs);
+   575→    // Link to analysis abort: if analysis is aborted, this fetch aborts too.
+   576→    // BUT only abort if the analysis signal is ACTUALLY aborted (not just
+   577→    // because the ref changed). This prevents false-positive aborts when
+   578→    // a previous analysis's ref is cleared during cleanup.
+   579→    const analysisSignal = analysisAbortRef.current?.signal;
+   580→    if (analysisSignal) {
+   581→      if (analysisSignal.aborted) {
+   582→        // Analysis already aborted — abort this fetch immediately
+   583→        controller.abort();
+   584→      } else {
+   585→        // Only abort if the SAME signal fires (not a new one)
+   586→        analysisSignal.addEventListener('abort', () => controller.abort(), { once: true });
+   587→      }
+   588→    }
+   589→    return fetch(url, { ...options, signal: controller.signal }).finally(() => clearTimeout(timer));
+   590→  };
+   591→
+   592→  /** Helper: check if analysis was aborted — throws to exit the flow cleanly */
+   593→  const throwIfAborted = () => {
+   594→    if (analysisAbortRef.current?.signal.aborted) {
+   595→      throw new DOMException('Analysis aborted by timeout', 'AbortError');
+   596→    }
+   597→  };
+   598→
+   599→  /** UNIFIED SSE STREAMING ANALYSIS — THE DEFINITIVE FIX
+   600→   *  Uses /api/analyze-stream for BOTH phases in ONE connection.
+   601→   *  - Heartbeats every 5s keep the connection alive during long AI calls
+   602→   *    during long GLM calls (which can take 60-180s).
+   603→   *  - Static results appear immediately (phase1_complete event)
+   604→   *  - AI results stream in as they're found (finding events)
+   605→   *  - No gap between phases — same server instance
+   606→   *  - Robust retry logic: 3 attempts with progressive backoff
+   607→   *  - Sync /api/analyze-ai is now the SECONDARY fallback (it times out
+   608→   *    at the server's request limit, so it only works for fast analyses). */
+   609→  const runTwoPhaseAnalysis = async (projectId: string, code: string, contractNm: string, tUrl?: string, tType?: string, hpContext?: any) => {
+   610→
+   611→    // ═══════════════════════════════════════════════════════════════
+   612→    // SSE STREAMING — PRIMARY path (most reliable for long AI calls)
+   613→    // ═══════════════════════════════════════════════════════════════
+   614→    // Serverless platforms cap HTTP requests at ~100s. The synchronous
+   615→    // /api/analyze-ai endpoint can't fit a 30-180s GLM call inside that
+   616→    // window. SSE streaming bypasses the limit because data flows
+   617→    // continuously (heartbeats every 5s) — the proxy sees an active
+   618→    // connection and doesn't kill it.
+   619→    //
+   620→    // ONE retry with 5s delay — this is enough for genuine network blips
+   621→    // (TCP reset, brief packet loss) without forcing the user through
+   622→    // 3 × 60s = 3+ minutes of "Connection failed" messages when the only
+   623→    // issue was a slow AI call. With heartbeat timeout now at 180s, real
+   624→    // timeouts will be rare.
+   625→    const SSE_RETRIES = 1;
+   626→    const SSE_RETRY_DELAYS = [5_000]; // 5s only
+   627→
+   628→    for (let attempt = 0; attempt < SSE_RETRIES; attempt++) {
+   629→      throwIfAborted();
+   630→      try {
+   631→        addActivity('scan', attempt === 0 ? 'Starting deep analysis...' : `Retrying analysis (attempt ${attempt + 1}/${SSE_RETRIES})...`, 'running', 'Connecting', 5);
+   632→
+   633→        const result = await runSSEStream(projectId, code, contractNm, tUrl, tType, hpContext);
+   634→        return result; // Success!
+   635→
+   636→      } catch (err: any) {
+   637→        const errMsg = String(err);
+   638→        if (errMsg.includes('AbortError') && analysisAbortRef.current?.signal.aborted) throw err;
+   639→
+   640→        const isNetworkError = errMsg.includes('Failed to fetch') || errMsg.includes('network error') || errMsg.includes('NetworkError') || errMsg.includes('fetch failed') || errMsg.includes('Load failed') || errMsg.includes('SSE heartbeat timeout');
+   641→
+   642→        if (isNetworkError && attempt < SSE_RETRIES - 1) {
+   643→          addActivity('scan', `Connection failed, retrying in ${SSE_RETRY_DELAYS[attempt] / 1000}s...`, 'warning', 'Network blip', 10);
+   644→          await new Promise(r => setTimeout(r, SSE_RETRY_DELAYS[attempt]));
+   645→          continue;
+   646→        }
+   647→
+   648→        // Non-network error or exhausted retries — try sync as last resort
+   649→        if (!isNetworkError) throw err;
+   650→      }
+   651→    }
+   652→
+   653→    // ═══════════════════════════════════════════════════════════════
+   654→    // FALLBACK: Synchronous approach (last resort — only works for
+   655→    // fast analyses that complete within the server's request limit)
+   656→    // ═══════════════════════════════════════════════════════════════
+   657→    addActivity('scan', 'SSE streaming failed, trying sync analysis...', 'warning', 'Last resort', 15);
+   658→    return await runSyncAnalysis(projectId, code, contractNm, tUrl, tType, hpContext);
+   659→  };
+   660→
+   661→  /** Synchronous analysis — calls /api/analyze-ai with phase='full' */
+   662→  const runSyncAnalysis = async (projectId: string, code: string, contractNm: string, tUrl?: string, tType?: string, hpContext?: any): Promise<{ contractId: string; auditId: string }> => {
+   663→    addActivity('scan', 'Running deep analysis...', 'running', 'Phase 1', 5);
+   664→
+   665→    // VPS has no request timeout. Client timeout 600s (10 min) gives
+   666→    // plenty of room for deep AI analysis + EVM validation.
+   667→    const res = await fetchWithTimeout('/api/analyze-ai', {
+   668→      method: 'POST',
+   669→      headers: { 'Content-Type': 'application/json' },
+   670→      body: JSON.stringify({
+   671→        phase: 'full',
+   672→        projectId,
+   673→        sourceCode: code,
+   674→        contractName: contractNm,
+   675→        targetUrl: tUrl,
+   676→        targetType: tType || targetType,
+   677→        hackenproofContext: hpContext,
+   678→      }),
+   679→    }, 600_000); // 10 min — VPS has no serverless timeout
+   680→
+   681→    if (!res.ok) {
+   682→      const errData = await res.json().catch(() => ({}));
+   683→      throw new Error(errData.error || `HTTP ${res.status}`);
+   684→    }
+   685→
+   686→    const data = await res.json();
+   687→    const allFindings = onlyValidated(data.allFindings || []);
+   688→    const contractId = data.contractId || '';
+   689→    const auditId = data.auditId || '';
+   690→
+   691→    // Show findings immediately — filter to >=90% confidence only
+   692→    const highConfFindings = onlyValidated(allFindings);
+   693→    if (highConfFindings.length > 0) {
+   694→      setVulns(prev => {
+   695→        const existingIds = new Set(prev.map(v => v.id));
+   696→        return [...highConfFindings.filter((f: any) => !existingIds.has(f.id)), ...prev];
+   697→      });
+   698→    }
+   699→
+   700→    const confirmed = allFindings.filter((f: any) => f.status === 'confirmed').length;
+   701→    addActivity('scan',
+   702→      `Analysis complete: ${allFindings.length} findings (${confirmed} confirmed)`,
+   703→      'success',
+   704→      'Full analysis done',
+   705→      100
+   706→    );
+   707→
+   708→    return { contractId, auditId };
+   709→  };
+   710→
+   711→  /** SSE Stream handler — connects to /api/analyze-stream and processes events */
+   712→  const runSSEStream = async (projectId: string, code: string, contractNm: string, tUrl?: string, tType?: string, hpContext?: any): Promise<{ contractId: string; auditId: string }> => {
+   713→    return new Promise((resolve, reject) => {
+   714→      let resolved = false;
+   715→      let contractId = '';
+   716→      let auditId = '';
+   717→      let staticFindingsCount = 0;
+   718→      let aiFindingsCount = 0;
+   719→      let phase1Shown = false;
+   720→
+   721→      const doFetch = async () => {
+   722→        try {
+   723→          const res = await fetch('/api/analyze-stream', {
+   724→            method: 'POST',
+   725→            headers: { 'Content-Type': 'application/json' },
+   726→            body: JSON.stringify({
+   727→              projectId, sourceCode: code, contractName: contractNm,
+   728→              targetUrl: tUrl, targetType: tType || targetType,
+   729→              hackenproofContext: hpContext,
+   730→            }),
+   731→            signal: analysisAbortRef.current?.signal,
+   732→          });
+   733→
+   734→          if (!res.ok) {
+   735→            // If non-2xx, the SSE endpoint isn't available — fall back
+   736→            const errText = await res.text().catch(() => '');
+   737→            reject(new Error(`SSE endpoint: ${res.status} ${errText.slice(0, 100)}`));
+   738→            return;
+   739→          }
+   740→
+   741→          const reader = res.body?.getReader();
+   742→          if (!reader) {
+   743→            reject(new Error('No response body'));
+   744→            return;
+   745→          }
+   746→
+   747→          const decoder = new TextDecoder();
+   748→          let buffer = '';
+   749→          // Heartbeat timeout — server sends heartbeats every 5s. AI calls
+   750→          // (GLM 5.2 deep analysis) can take up to 5 minutes on a real VPS
+   751→          // (no serverless limits). During the AI call, Node.js event loop
+   752→          // is busy with the OpenRouter HTTP request and heartbeats can be
+   753→          // delayed. Set timeout to 10 min to accommodate:
+   754→          //   - Normal AI call: 30-60s (heartbeats arrive, watchdog resets)
+   755→          //   - Slow AI call: 60-180s (some heartbeats arrive, still resets)
+   756→          //   - Deep reasoning on large codebase: 180-300s (still resets)
+   757→          //   - Real dead connection: no heartbeats for 10 min → timeout
+   758→          // Previous 180s was still too aggressive for deep reasoning on
+   759→          // large smart contract audits with multi-pass AI analysis.
+   760→          const HEARTBEAT_TIMEOUT_MS = 180_000; // 3 min — matches HARD_TIMEOUT
+   761→          let lastEventTime = Date.now();
+   762→
+   763→          // Heartbeat watchdog — check every 30s.
+   764→          const heartbeatWatchdog = setInterval(() => {
+   765→            if (Date.now() - lastEventTime > HEARTBEAT_TIMEOUT_MS) {
+   766→              clearInterval(heartbeatWatchdog);
+   767→              if (!resolved) {
+   768→                reader.cancel().catch(() => {});
+   769→                reject(new Error('SSE heartbeat timeout — connection died'));
+   770→              }
+   771→            }
+   772→          }, 15_000);
+   773→
+   774→          const processBuffer = () => {
+   775→            // SSE format: "event: type\ndata: json\n\n"
+   776→            const parts = buffer.split('\n\n');
+   777→            buffer = parts.pop() || ''; // Keep incomplete chunk
+   778→
+   779→            for (const part of parts) {
+   780→              if (!part.trim()) continue;
+   781→              lastEventTime = Date.now();
+   782→
+   783→              let eventType = '';
+   784→              let eventData = '';
+   785→
+   786→              for (const line of part.split('\n')) {
+   787→                if (line.startsWith('event: ')) eventType = line.slice(7).trim();
+   788→                else if (line.startsWith('data: ')) eventData = line.slice(6).trim();
+   789→              }
+   790→
+   791→              if (!eventType || !eventData) continue;
+   792→
+   793→              try {
+   794→                const data = JSON.parse(eventData);
+   795→                handleSSEEvent(eventType, data);
+   796→              } catch {
+   797→                // Malformed data — ignore
+   798→              }
+   799→            }
+   800→          };
+   801→
+   802→          const handleSSEEvent = (type: string, data: any) => {
+   803→            switch (type) {
+   804→              case 'heartbeat':
+   805→                // Just keep connection alive — no action needed
+   806→                break;
+   807→
+   808→              case 'progress':
+   809→                if (data.step === 'connected') {
+   810→                  // Stream established — server is alive and starting work.
+   811→                  addActivity('scan', data.message || 'Stream connected', 'running', 'Connected', data.percent || 1);
+   812→                } else if (data.step === 'static') {
+   813→                  addActivity('scan', data.message || 'Running static analysis...', 'running', 'Phase 1', data.percent || 5);
+   814→                } else if (data.step === 'ai_start' || data.step === 'ai_analysis') {
+   815→                  if (!phase1Shown) phase1Shown = true;
+   816→                  addActivity('scan', data.message || 'AI deep analysis...', 'running', 'Phase 2: AI', data.percent || 50);
+   817→                } else if (data.step === 'blockchain' || data.step === 'websearch') {
+   818→                  addActivity('scan', data.message, 'running', data.step, data.percent || 60);
+   819→                } else if (data.step === 'enhancement' || data.step === 'onchain_verify') {
+   820→                  addActivity('scan', data.message, 'running', data.step, data.percent || 90);
+   821→                } else if (data.step === 'ai_done') {
+   822→                  addActivity('scan', data.message, 'running', 'Processing', data.percent || 75);
+   823→                }
+   824→                break;
+   825→
+   826→              case 'phase1_complete': {
+   827→                phase1Shown = true;
+   828→                const findings = data.findings || [];
+   829→                staticFindingsCount = findings.length;
+   830→                contractId = data.contractId || '';
+   831→                auditId = data.auditId || '';
+   832→
+   833→                // Show static findings immediately — only >=90% confidence
+   834→                const highConfStaticFindings = onlyValidated(findings);
+   835→                if (highConfStaticFindings.length > 0) {
+   836→                  setVulns(prev => {
+   837→                    const existingIds = new Set(prev.map(v => v.id));
+   838→                    const newFindings = highConfStaticFindings.filter((f: any) => !existingIds.has(f.id));
+   839→                    return [...newFindings, ...prev];
+   840→                  });
+   841→                }
+   842→
+   843→                if (data.needsAI) {
+   844→                  addActivity('scan', `Static: ${findings.length} findings. Starting AI deep analysis...`, 'running', 'AI next', 40);
+   845→                } else {
+   846→                  addActivity('scan', `Static analysis: ${findings.length} findings (no AI key)`, 'success', 'Complete', 100);
+   847→                  clearInterval(heartbeatWatchdog);
+   848→                  resolved = true;
+   849→                  resolve({ contractId, auditId });
+   850→                }
+   851→                break;
+   852→              }
+   853→
+   854→              case 'finding': {
+   855→                const vuln = data.vulnerability;
+   856→                // Only add if BOTH conditions met:
+   857→                //   1. confidence >= 90%
+   858→                //   2. validationScope is 'target' or 'lab' (not theoretical/null)
+   859→                // The server streams findings as they're found, but validation
+   860→                // happens AFTER all findings are reported. So this check will
+   861→                // usually FAIL here for the initial stream — the finding will
+   862→                // be added later via the post-validation 'complete' event when
+   863→                // its scope has been updated to 'target' or 'lab'.
+   864→                if (vuln && (vuln.confidence || 0) >= 0.90) {
+   865→                  aiFindingsCount++;
+   866→                  setVulns(prev => {
+   867→                    const existingIds = new Set(prev.map(v => v.id));
+   868→                    if (existingIds.has(vuln.id)) return prev;
+   869→                    return [vuln, ...prev];
+   870→                  });
+   871→                }
+   872→                break;
+   873→              }
+   874→
+   875→              case 'complete': {
+   876→                const allFindings = data.findings || [];
+   877→                // Merge any findings we haven't seen yet — only >=90% confidence
+   878→                const highConfComplete = onlyValidated(allFindings);
+   879→                if (highConfComplete.length > 0) {
+   880→                  setVulns(prev => {
+   881→                    const existingIds = new Set(prev.map(v => v.id));
+   882→                    const newFindings = highConfComplete.filter((f: any) => !existingIds.has(f.id));
+   883→                    if (newFindings.length === 0) return prev;
+   884→                    return [...newFindings, ...prev];
+   885→                  });
+   886→                }
+   887→                const total = highConfComplete.length;
+   888→                const confirmed = highConfComplete.filter((f: any) => f.status === 'confirmed').length;
+   889→                addActivity('scan', `Analysis complete: ${total} findings (${confirmed} confirmed)`, 'success', 'Full analysis done', 100);
+   890→                clearInterval(heartbeatWatchdog);
+   891→                resolved = true;
+   892→                resolve({ contractId: contractId || data.contractId || '', auditId: auditId || data.auditId || '' });
+   893→                break;
+   894→              }
+   895→
+   896→              case 'error': {
+   897→                const errorMsg = data.error || data.message || 'Unknown error';
+   898→                addActivity('scan', `Analysis error: ${errorMsg.slice(0, 100)}`, 'warning', 'Static results available', 85);
+   899→                // If we already have static results, resolve with what we have
+   900→                if (staticFindingsCount > 0 || contractId) {
+   901→                  clearInterval(heartbeatWatchdog);
+   902→                  resolved = true;
+   903→                  resolve({ contractId, auditId });
+   904→                } else {
+   905→                  clearInterval(heartbeatWatchdog);
+   906→                  resolved = true;
+   907→                  reject(new Error(errorMsg));
+   908→                }
+   909→                break;
+   910→              }
+   911→            }
+   912→          };
+   913→
+   914→          // Read stream chunks
+   915→          const readLoop = async () => {
+   916→            try {
+   917→              while (true) {
+   918→                const { done, value } = await reader.read();
+   919→                if (done) {
+   920→                  // Stream ended — if not yet resolved, resolve with what we have
+   921→                  clearInterval(heartbeatWatchdog);
+   922→                  if (!resolved) {
+   923→                    if (staticFindingsCount > 0 || contractId) {
+   924→                      addActivity('scan', `Stream ended (${staticFindingsCount} static + ${aiFindingsCount} AI findings)`, 'success', 'Done', 100);
+   925→                      resolved = true;
+   926→                      resolve({ contractId, auditId });
+   927→                    } else {
+   928→                      resolved = true;
+   929→                      reject(new Error('Stream ended with no results'));
+   930→                    }
+   931→                  }
+   932→                  return;
+   933→                }
+   934→                buffer += decoder.decode(value, { stream: true });
+   935→                processBuffer();
+   936→              }
+   937→            } catch (readErr: any) {
+   938→              clearInterval(heartbeatWatchdog);
+   939→              if (!resolved) {
+   940→                const msg = String(readErr);
+   941→                if (msg.includes('abort') || msg.includes('AbortError')) {
+   942→                  reject(new DOMException('Analysis aborted', 'AbortError'));
+   943→                } else {
+   944→                  reject(new Error(`Stream read error: ${msg.slice(0, 80)}`));
+   945→                }
+   946→              }
+   947→            }
+   948→          };
+   949→
+   950→          readLoop();
+   951→
+   952→        } catch (fetchErr: any) {
+   953→          if (!resolved) reject(fetchErr);
+   954→        }
+   955→      };
+   956→
+   957→      doFetch();
+   958→    });
+   959→  };
+   960→
+   961→  /** FALLBACK: Two-phase JSON approach — only used if SSE streaming fails completely */
+   962→  const runFallbackTwoPhase = async (projectId: string, code: string, contractNm: string, tUrl?: string, tType?: string, hpContext?: any) => {
+   963→    // Phase 1: Static
+   964→    addActivity('scan', 'Running static analysis (fallback)...', 'running', 'Phase 1', 5);
+   965→    const res = await fetchWithTimeout('/api/analyze', {
+   966→      method: 'POST',
+   967→      headers: { 'Content-Type': 'application/json' },
+   968→      body: JSON.stringify({
+   969→        projectId, sourceCode: code, contractName: contractNm,
+   970→        targetUrl: tUrl, targetType: tType || targetType,
+   971→        hackenproofContext: hpContext, phase: 'static',
+   972→      }),
+   973→    }, 30_000);
+   974→
+   975→    if (!res.ok) {
+   976→      const errData = await res.json().catch(() => ({}));
+   977→      throw new Error(errData.error || `Static: ${res.status}`);
+   978→    }
+   979→
+   980→    const staticData = await res.json();
+   981→    const staticFindings = onlyValidated(staticData.findings || []);
+   982→    if (staticFindings.length > 0) {
+   983→      setVulns(prev => {
+   984→        const existingIds = new Set(prev.map(v => v.id));
+   985→        return [...staticFindings.filter((f: any) => !existingIds.has(f.id)), ...prev];
+   986→      });
+   987→    }
+   988→
+   989→    const contractId = staticData.contractId;
+   990→    const auditId = staticData.auditId;
+   991→    addActivity('scan', `Static: ${staticFindings.length} findings`, staticData.needsAI ? 'running' : 'success', staticData.needsAI ? 'AI next' : 'Done', 40);
+   992→
+   993→    if (!staticData.needsAI || !hasKey) return { contractId, auditId };
+   994→
+   995→    // Phase 2: AI (single attempt, best-effort)
+   996→    addActivity('scan', 'AI deep analysis (fallback)...', 'running', 'Phase 2: AI', 50);
+   997→    try {
+   998→      const aiRes = await fetchWithTimeout('/api/analyze-ai', {
+   999→        method: 'POST',
+  1000→        headers: { 'Content-Type': 'application/json' },
+  1001→        body: JSON.stringify({
+  1002→          phase: 'ai', projectId, contractId, auditId,
+  1003→          sourceCode: code, contractName: contractNm,
+  1004→          targetType: tType || targetType, hackenproofContext: hpContext,
+  1005→        }),
+  1006→      }, 290_000);
+  1007→
+  1008→      if (aiRes.ok) {
+  1009→        const aiData = await aiRes.json();
+  1010→        const aiFindings = onlyValidated(aiData.aiFindings || aiData.allFindings || []);
+  1011→        if (aiFindings.length > 0) {
+  1012→          setVulns(prev => {
+  1013→            const existingIds = new Set(prev.map(v => v.id));
+  1014→            return [...aiFindings.filter((f: any) => !existingIds.has(f.id)), ...prev];
+  1015→          });
+  1016→        }
+  1017→        addActivity('scan', `AI: ${aiFindings.length} findings`, 'success', 'Done', 100);
+  1018→      } else {
+  1019→        addActivity('scan', 'AI failed — static results available', 'warning', 'Try again', 85);
+  1020→      }
+  1021→    } catch {
+  1022→      addActivity('scan', 'AI network error — static results available', 'warning', 'Try again', 85);
+  1023→    }
+  1024→
+  1025→    return { contractId, auditId };
+  1026→  };
+  1027→
+  1028→  /** Quick connectivity check — VPS with PM2 has no cold start (the
+  1029→   *  server is always hot), so we just verify it's reachable before
+  1030→   *  starting the analysis. No retry loop needed. */
+  1031→  const warmupServer = async (): Promise<void> => {
+  1032→    try {
+  1033→      // 5s timeout — server is always hot on VPS, no cold start to wait for
+  1034→      const controller = new AbortController();
+  1035→      const timer = setTimeout(() => controller.abort(), 5_000);
+  1036→      const res = await fetch('/api/settings', {
+  1037→        method: 'GET',
+  1038→        signal: controller.signal,
+  1039→      });
+  1040→      clearTimeout(timer);
+  1041→      if (res.ok) {
+  1042→        addActivity('scan', 'Server ready', 'success', 'Connected', 5);
+  1043→      }
+  1044→    } catch {
+  1045→      // Server unreachable — proceed anyway, the analysis call will surface the error
+  1046→      addActivity('scan', 'Server ping failed — proceeding with analysis', 'warning', 'May be slow', 5);
+  1047→    }
+  1048→  };
+  1049→
+  1050→  
+  1051→  /** Download a professional .txt report for a single vulnerability */
+  1052→  const downloadReport = async (vulnId: string) => {
+  1053→    try {
+  1054→      const res = await fetch(`/api/report?id=${vulnId}`);
+  1055→      if (!res.ok) throw new Error('Report generation failed');
+  1056→      const text = await res.text();
+  1057→      const blob = new Blob([text], { type: 'text/plain' });
+  1058→      const url = URL.createObjectURL(blob);
+  1059→      const a = document.createElement('a');
+  1060→      a.href = url;
+  1061→      a.download = `vulnerability-report-${vulnId.slice(0, 8)}.txt`;
+  1062→      document.body.appendChild(a);
+  1063→      a.click();
+  1064→      document.body.removeChild(a);
+  1065→      URL.revokeObjectURL(url);
+  1066→      addActivity('scan', 'Report downloaded successfully', 'success', 'Professional .txt report', 100);
+  1067→    } catch (e: any) {
+  1068→      addActivity('scan', `Report download failed: ${e.message}`, 'error', 'Try again', 0);
+  1069→    }
+  1070→  };
+  1071→
+  1072→  /** Background analysis via polling — no SSE, no heartbeat, no timeout issues.
+  1073→   *  MUST be defined BEFORE analyzeContract and fetchUrlAndAnalyze (no hoisting for const).
+  1074→   *  1. POST /api/analyze-job → returns jobId
+  1075→   *  2. Poll GET /api/job-status/{jobId} every 5s
+  1076→   *  3. When status=completed → fetch results from /api/vulnerabilities
+  1077→   *  4. When status=failed → show error */
+  1078→  const startBackgroundAnalysis = async (sourceCode: string, contractName: string, targetType: string, targetUrl?: string) => {
+  1079→    addActivity('scan', 'Starting background analysis...', 'running', targetUrl || contractName, 5);
+  1080→
+  1081→    // Step 1: Start the job
+  1082→    const res = await fetch('/api/analyze-job', {
+  1083→      method: 'POST',
+  1084→      headers: { 'Content-Type': 'application/json' },
+  1085→      body: JSON.stringify({ sourceCode, contractName, targetType, targetUrl }),
+  1086→    });
+  1087→
+  1088→    if (!res.ok) {
+  1089→      const err = await res.json().catch(() => ({}));
+  1090→      throw new Error(err.error || `HTTP ${res.status}`);
+  1091→    }
+  1092→
+  1093→    const { jobId } = await res.json();
+  1094→    if (!jobId) throw new Error('No jobId returned');
+  1095→
+  1096→    addActivity('scan', `Job started: ${jobId}`, 'info', 'Polling for progress...', 10);
+  1097→
+  1098→    // Step 2: Poll for status — with auto-retry on network errors
+  1099→    return new Promise<void>((resolve, reject) => {
+  1100→      let pollErrors = 0;
+  1101→      const poll = async () => {
+  1102→        try {
+  1103→          const statusRes = await fetch(`/api/job-status/${jobId}`);
+  1104→          if (!statusRes.ok) {
+  1105→            pollErrors++;
+  1106→            if (pollErrors > 5) { reject(new Error(`Status check failed ${pollErrors} times`)); return; }
+  1107→            setTimeout(poll, 5_000); // retry
+  1108→            return;
+  1109→          }
+  1110→          pollErrors = 0; // reset on success
+  1111→          const status = await statusRes.json();
+  1112→
+  1113→          if (status.progress !== undefined && status.progress < 100) {
+  1114→            addActivity('scan', status.message || `Progress: ${status.progress}%`, 'running', `${status.progress}%`, status.progress);
+  1115→          }
+  1116→
+  1117→          if (status.status === 'completed') {
+  1118→            addActivity('scan', `Analysis complete: ${status.resultCount} high-confidence findings`, 'success', 'Done', 100);
+  1119→            // Fetch results — with cache-busting timestamp to bypass browser cache
+  1120→            try {
+  1121→              const vulnsRes = await fetch(`/api/vulnerabilities?t=${Date.now()}`);
+  1122→              if (vulnsRes.ok) {
+  1123→                const serverVulns: Vulnerability[] = await vulnsRes.json();
+  1124→                const highConf = serverVulns.filter(v => (v.confidence || 0) >= 0.70);
+  1125→                if (highConf.length > 0) {
+  1126→                  setVulns(prev => {
+  1127→                    const existingIds = new Set(prev.map(v => v.id));
+  1128→                    const toAdd = highConf.filter((f: any) => !existingIds.has(f.id));
+  1129→                    return toAdd.length > 0 ? [...toAdd, ...prev] : prev;
+  1130→                  });
+  1131→                  addActivity('scan', `Loaded ${highConf.length} findings into UI`, 'success', `${highConf.length} results`, 100);
+  1132→                } else {
+  1133→                  addActivity('scan', 'No findings above 70% confidence — try with different input', 'warning', '', 100);
+  1134→                }
+  1135→              }
+  1136→            } catch (e) {
+  1137→              addActivity('scan', 'Results loaded (some may need refresh)', 'warning', '', 95);
+  1138→            }
+  1139→            resolve();
+  1140→            return;
+  1141→          }
+  1142→
+  1143→          if (status.status === 'failed') {
+  1144→            reject(new Error(status.error || 'Analysis failed'));
+  1145→            return;
+  1146→          }
+  1147→
+  1148→          // Still running — poll again in 5s
+  1149→          setTimeout(poll, 5_000);
+  1150→        } catch (err) {
+  1151→          pollErrors++;
+  1152→          if (pollErrors > 5) { reject(err); return; }
+  1153→          // Network error — retry in 5s (mobile can lose connection briefly)
+  1154→          setTimeout(poll, 5_000);
+  1155→        }
+  1156→      };
+  1157→      setTimeout(poll, 2_000);
+  1158→    });
+  1159→  };
+  1160→
+  1161→  const analyzeContract = async () => {
+  1162→    if (isAnalyzingRef.current) {
+  1163→      addActivity('scan', 'Analysis already in progress — skipping', 'warning', 'Wait for current analysis to finish', 0);
+  1164→      return;
+  1165→    }
+  1166→    isAnalyzingRef.current = true;
+  1167→    setAnalyzing(true);
+  1168→    setFetchError('');
+  1169→    addActivity('scan', 'Starting analysis...', 'running', sourceCode ? 'Source code' : 'URL', 0);
+  1170→
+  1171→    try {
+  1172→      await startBackgroundAnalysis(sourceCode, 'AnalyzedContract', targetType === 'hackenproof' ? 'contract' : targetType, targetUrl || undefined);
+  1173→      setSourceCode(''); setTargetUrl(''); setHackenproofContext(null);
+  1174→    } catch (e: any) {
+  1175→      const msg = String(e);
+  1176→      setFetchError(`Analysis error: ${msg}`);
+  1177→      addActivity('scan', 'Analysis failed', 'error', msg.slice(0, 100));
+  1178→    } finally {
+  1179→      isAnalyzingRef.current = false;
+  1180→      setAnalyzing(false);
+  1181→    }
+  1182→  };
+  1183→
+  1184→  const fetchUrlAndAnalyze = async () => {
+  1185→    if (!targetUrl) return;
+  1186→    if (isAnalyzingRef.current) {
+  1187→      addActivity('scan', 'Analysis already in progress — skipping', 'warning', 'Wait for current analysis to finish', 0);
+  1188→      return;
+  1189→    }
+  1190→    isAnalyzingRef.current = true;
+  1191→    setFetchingUrl(true);
+  1192→    setFetchError('');
+  1193→    addActivity('scan', 'Fetching URL and starting analysis...', 'running', targetUrl, 5);
+  1194→
+  1195→    try {
+  1196→      // Fetch URL content first
+  1197→      const fetchRes = await fetchWithTimeout('/api/fetch-url', {
+  1198→        method: 'POST', headers: { 'Content-Type': 'application/json' },
+  1199→        body: JSON.stringify({ url: targetUrl, type: targetType === 'hackenproof' ? 'contract' : targetType }),
+  1200→      }, 60_000);
+  1201→
+  1202→      if (!fetchRes.ok) {
+  1203→        const errData = await fetchRes.json().catch(() => ({}));
+  1204→        throw new Error(errData.error || `Server error: ${fetchRes.status}`);
+  1205→      }
+  1206→
+  1207→      const data = await fetchRes.json();
+  1208→      if (data.error) throw new Error(data.error);
+  1209→      if (!data.sourceCode) throw new Error('No content found at the URL');
+  1210→
+  1211→      addActivity('system', `URL content fetched: ${data.sourceCode.length} chars`, 'success', '', 20);
+  1212→
+  1213→      // Start background analysis with fetched code
+  1214→      const apiType = targetType === 'hackenproof' ? 'contract' : targetType;
+  1215→      await startBackgroundAnalysis(
+  1216→        data.sourceCode,
+  1217→        data.contractName || 'FetchedContract',
+  1218→        apiType,
+  1219→        targetUrl
+  1220→      );
+  1221→      addActivity('scan', 'URL analysis complete', 'success', 'Done', 100);
+  1222→      setSourceCode(''); setTargetUrl(''); setHackenproofContext(null);
+  1223→    } catch (e: any) {
+  1224→      const msg = String(e);
+  1225→      setFetchError(`Analysis error: ${msg}`);
+  1226→      addActivity('scan', 'Analysis failed', 'error', msg.slice(0, 100));
+  1227→    } finally {
+  1228→      isAnalyzingRef.current = false;
+  1229→      setFetchingUrl(false);
+  1230→      setAnalyzing(false);
+  1231→    }
+  1232→  };
+  1233→
+  1234→  const seedDemo = async () => {
+  1235→    setLoading(true);
+  1236→    addActivity('system', 'Loading demo data...', 'running');
+  1237→    try {
+  1238→      const p1Res = await fetchWithTimeout('/api/projects', {
+  1239→        method: 'POST', headers: { 'Content-Type': 'application/json' },
+  1240→        body: JSON.stringify({ name: 'Uniswap V4 Fork', chain: 'ethereum', language: 'solidity' }),
+  1241→      }, 15_000);
+  1242→      if (p1Res.ok) {
+  1243→        const p1 = await p1Res.json();
+  1244→        setActiveProject(p1.id);
+  1245→        addActivity('system', 'Created demo project', 'success', 'Uniswap V4 Fork');
+  1246→        await fetchWithTimeout('/api/analyze', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ projectId: p1.id, contractName: 'SwapPool.sol' }) }, 15_000).catch(() => {});
+  1247→      }
+  1248→      const p2Res = await fetchWithTimeout('/api/projects', {
+  1249→        method: 'POST', headers: { 'Content-Type': 'application/json' },
+  1250→        body: JSON.stringify({ name: 'Aave V3 Fork', chain: 'arbitrum', language: 'solidity' }),
+  1251→      }, 15_000);
+  1252→      if (p2Res.ok) {
+  1253→        const p2 = await p2Res.json();
+  1254→        addActivity('system', 'Created demo project', 'success', 'Aave V3 Fork');
+  1255→        await fetchWithTimeout('/api/analyze', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ projectId: p2.id, contractName: 'LendingPool.sol' }) }, 15_000).catch(() => {});
+  1256→      }
+  1257→      for (const p of [
+  1258→        { type: 'vulnerability', name: 'ERC-777 Reentrancy', description: 'tokensReceived callback reentrancy in ERC-777', tags: 'reentrancy,erc777', chain: 'ethereum', severity: 'critical' },
+  1259→        { type: 'code_pattern', name: 'Unchecked External Call', description: 'External call without return value check', tags: 'unchecked,call', chain: 'ethereum', severity: 'medium' },
+  1260→        { type: 'architectural', name: 'Single Oracle Dependency', description: 'Protocol relies on single price oracle', tags: 'oracle,single-source', chain: 'ethereum', severity: 'high' },
+  1261→        { type: 'vulnerability', name: 'Flash Loan Drain', description: 'Reserves drainable via flash loan', tags: 'flash-loan,drain', chain: 'ethereum', severity: 'critical' },
+  1262→        { type: 'code_pattern', name: 'Storage Collision Proxy', description: 'Diamond proxy unstructured storage', tags: 'proxy,diamond', chain: 'ethereum', severity: 'high' },
+  1263→      ]) {
+  1264→        await fetchWithTimeout('/api/memory', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(p) }, 15_000).catch(() => {});
+  1265→      }
+  1266→      addActivity('system', 'Demo memory patterns loaded', 'success', '5 patterns');
+  1267→      await fetchData();
+  1268→      addActivity('system', 'Demo data loaded', 'success');
+  1269→    } finally { setLoading(false); }
+  1270→  };
+  1271→
+  1272→  const generateReport = async () => {
+  1273→    setLoading(true);
+  1274→    setFetchError('');
+  1275→    try {
+  1276→      const projectId = await ensureProject();
+  1277→      const res = await fetchWithTimeout('/api/report', {
+  1278→        method: 'POST', headers: { 'Content-Type': 'application/json' },
+  1279→        body: JSON.stringify({ projectId }),
+  1280→      }, 30_000);
+  1281→      if (res.ok) {
+  1282→        const data = await res.json();
+  1283→        if (data.report && data.report.trim().length > 0) {
+  1284→          setReportText(data.report);
+  1285→          setShowReport(true);
+  1286→        } else {
+  1287→          setFetchError('No report generated — run an analysis first to get findings.');
+  1288→        }
+  1289→      } else {
+  1290→        const errData = await res.json().catch(() => ({}));
+  1291→        setFetchError(errData.error || `Report generation failed (HTTP ${res.status})`);
+  1292→      }
+  1293→    } catch (e) {
+  1294→      setFetchError(`Network error: ${String(e)}`);
+  1295→    } finally { setLoading(false); }
+  1296→  };
+  1297→
+  1298→
+  1299→  const downloadZip = async () => {
+  1300→    setLoading(true);
+  1301→    setFetchError('');
+  1302→    try {
+  1303→      const projectId = await ensureProject();
+  1304→      const res = await fetchWithTimeout('/api/download', {
+  1305→        method: 'POST', headers: { 'Content-Type': 'application/json' },
+  1306→        body: JSON.stringify({ projectId }),
+  1307→      }, 30_000);
+  1308→      if (res.ok) {
+  1309→        const data = await res.json();
+  1310→        if (data.zip) {
+  1311→          const binary = atob(data.zip);
+  1312→          const bytes = new Uint8Array(binary.length);
+  1313→          for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  1314→          const blob = new Blob([bytes], { type: 'application/zip' });
+  1315→          const url = URL.createObjectURL(blob);
+  1316→          const a = document.createElement('a');
+  1317→          a.href = url;
+  1318→          a.download = data.filename || 'poc_archive.zip';
+  1319→          a.click();
+  1320→          URL.revokeObjectURL(url);
+  1321→        } else {
+  1322→          setFetchError('No PoC files available — run an analysis first to generate PoCs.');
+  1323→        }
+  1324→      } else {
+  1325→        const errData = await res.json().catch(() => ({}));
+  1326→        setFetchError(errData.error || `Download failed (HTTP ${res.status})`);
+  1327→      }
+  1328→    } catch (e) {
+  1329→      setFetchError(`Network error: ${String(e)}`);
+  1330→    } finally { setLoading(false); }
+  1331→  };
+  1332→
+  1333→  // Only show vulnerabilities that have been ACTIVELY VALIDATED
+  1334→  // A vuln is "validated" if it has validationSteps (AI ran active exploitation) OR status is confirmed/validated/refuted
+  1335→  const validatedVulns = vulns.filter(v =>
+  1336→    v.validationSteps || v.status === 'confirmed' || v.status === 'validated' || v.status === 'refuted'
+  1337→  );
+  1338→  const confirmedVulns = validatedVulns.filter(v => v.status === 'confirmed');
+  1339→  const criticalVulns = validatedVulns.filter(v => v.severity === 'critical');
+  1340→  const avgConfidence = validatedVulns.length > 0 ? validatedVulns.reduce((s, v) => s + v.confidence, 0) / validatedVulns.length : 0;
+  1341→
+  1342→  return (
+  1343→    <div className="min-h-screen bg-white text-slate-900">
+  1344→      {/* Header */}
+  1345→      <header className="border-b border-slate-200 bg-white sticky top-0 z-50">
+  1346→        <div className="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between">
+  1347→          <div className="flex items-center gap-3">
+  1348→            <div className="w-9 h-9 rounded-lg bg-emerald-600 flex items-center justify-center">
+  1349→              <Shield className="w-5 h-5 text-white" />
+  1350→            </div>
+  1351→            <div>
+  1352→              <h1 className="text-lg font-bold tracking-tight">CryptoSentinel</h1>
+  1353→              <p className="text-xs text-slate-500">Autonomous AI Vulnerability Scanner — OpenRouter</p>
+  1354→            </div>
+  1355→          </div>
+  1356→          <div className="flex items-center gap-2">
+  1357→            <Badge variant="outline" className={hasKey ? 'text-emerald-600 border-emerald-300' : 'text-amber-600 border-amber-300'}>
+  1358→              {hasKey ? <Wifi className="w-3 h-3 mr-1" /> : <WifiOff className="w-3 h-3 mr-1" />}
+  1359→              {hasKey ? `${model.split('/').pop()} Active` : 'No API Key'}
+  1360→            </Badge>
+  1361→            {/* Activity Feed Toggle */}
+  1362→            <Button size="sm" variant="outline" onClick={() => setShowActivity(!showActivity)} className="relative">
+  1363→              <Terminal className="w-4 h-4 mr-1" /> Activity
+  1364→              {activities.filter(a => a.status === 'running').length > 0 && (
+  1365→                <Badge className="absolute -top-1.5 -right-1.5 w-5 h-5 p-0 flex items-center justify-center bg-red-500 text-white border-0 text-[10px]">
+  1366→                  {activities.filter(a => a.status === 'running').length}
+  1367→                </Badge>
+  1368→              )}
+  1369→            </Button>
+  1370→            {/* Settings Dialog */}
+  1371→            <Dialog>
+  1372→              <DialogTrigger asChild>
+  1373→                <Button size="sm" variant="outline"><Settings className="w-4 h-4 mr-1" /> API Key</Button>
+  1374→              </DialogTrigger>
+  1375→              <DialogContent>
+  1376→                <DialogHeader>
+  1377→                  <DialogTitle><Key className="w-5 h-5 inline mr-2" />OpenRouter API Configuration</DialogTitle>
+  1378→                </DialogHeader>
+  1379→                <div className="space-y-4 pt-2">
+  1380→                  {/* ─── Current key source indicator ─────────────────────── */}
+  1381→                  {hasKey && (
+  1382→                    <div className="flex items-center gap-2 p-2 rounded-lg bg-slate-50 border border-slate-200 text-xs">
+  1383→                      <span className="text-slate-500">Source:</span>
+  1384→                      {keySource === 'env' ? (
+  1385→                        <Badge variant="outline" className="text-blue-700 border-blue-300 bg-blue-50">env var (OPENROUTER_API_KEY)</Badge>
+  1386→                      ) : (
+  1387→                        <Badge variant="outline" className="text-amber-700 border-amber-300 bg-amber-50">database (resets on restart)</Badge>
+  1388→                      )}
+  1389→                      <span className="text-slate-400">|</span>
+  1390→                      <span className="text-slate-500">Current: <code className="font-mono">{maskedKey}</code></span>
+  1391→                    </div>
+  1392→                  )}
+  1393→                  {keySource === 'env' && (
+  1394→                    <p className="text-xs text-blue-700 bg-blue-50 border border-blue-200 p-2 rounded">
+  1395→                      <strong>Env var is active:</strong> The <code>OPENROUTER_API_KEY</code> env var takes precedence over the DB key. This is the most reliable configuration — the key persists across server restarts. Saving a new key below will store it in the DB, but the env var will still win.
+  1396→                    </p>
+  1397→                  )}
+  1398→                  {hasKey && keySource !== 'env' && (
+  1399→                    <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 p-2 rounded">
+  1400→                      <strong>DB-only key:</strong> The key is stored in the per-instance SQLite database and may be lost on server restarts. For reliable persistence, set <code>OPENROUTER_API_KEY</code> as an env var in the PM2 ecosystem config.
+  1401→                    </p>
+  1402→                  )}
+  1403→                  <div>
+  1404→                    <label className="text-sm font-medium text-slate-700">Model</label>
+  1405→                    <Select value={model} onValueChange={setModel}>
+  1406→                      <SelectTrigger className="mt-1"><SelectValue /></SelectTrigger>
+  1407→                      <SelectContent>
+  1408→                        <SelectItem value="z-ai/glm-5.2">GLM 5.2 (1M ctx) — Primary + Unlimited Reasoning</SelectItem>
+  1409→                        <SelectItem value="z-ai/glm-5.1">GLM 5.1</SelectItem>
+  1410→                        <SelectItem value="z-ai/glm-5-turbo">GLM 5 Turbo</SelectItem>
+  1411→                        <SelectItem value="z-ai/glm-4.7-flash">GLM 4.7 Flash</SelectItem>
+  1412→                        <SelectItem value="z-ai/glm-4.7">GLM 4.7</SelectItem>
+  1413→                        <SelectItem value="deepseek/deepseek-chat-v3-0324">DeepSeek V3 (Auto: Light Tasks)</SelectItem>
+  1414→                        <SelectItem value="deepseek/deepseek-r1-0528">DeepSeek R1 (Reasoning)</SelectItem>
+  1415→                        <SelectItem value="deepseek/deepseek-v4-pro-0813">DeepSeek V4 Pro 0813 (1M ctx) — Enhancement</SelectItem>
+  1416→                        <SelectItem value="qwen/qwen3-235b-a22b">Qwen3 235B</SelectItem>
+  1417→                      </SelectContent>
+  1418→                    </Select>
+  1419→                  </div>
+  1420→                  <div>
+  1421→                    <label className="text-sm font-medium text-slate-700">API Key</label>
+  1422→                    <Input type="password" placeholder={hasKey ? 'Enter new key to update' : 'Enter your OpenRouter API key (sk-or-v1-...)'}
+  1423→                      className="mt-1" value={apiKey} onChange={e => setApiKey(e.target.value)} />
+  1424→                    <p className="text-xs text-slate-400 mt-1">
+  1425→                      Get a key at <a href="https://openrouter.ai/keys" target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">openrouter.ai/keys</a> — must start with <code>sk-or-v1-</code>.
+  1426→                    </p>
+  1427→                  </div>
+  1428→                  <div className="flex gap-2">
+  1429→                    <Button
+  1430→                      onClick={testApiKey}
+  1431→                      disabled={testingKey || (!apiKey && !hasKey)}
+  1432→                      variant="outline"
+  1433→                      className="flex-1 border-blue-300 text-blue-700 hover:bg-blue-50"
+  1434→                    >
+  1435→                      {testingKey ? <><Loader2 className="w-4 h-4 mr-2 animate-spin" /> Testing...</> : <><Zap className="w-4 h-4 mr-2" /> Test Key</>}
+  1436→                    </Button>
+  1437→                    <Button
+  1438→                      onClick={saveApiKey}
+  1439→                      disabled={!apiKey && !model}
+  1440→                      className="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white"
+  1441→                    >
+  1442→                      <Key className="w-4 h-4 mr-2" /> Save Configuration
+  1443→                    </Button>
+  1444→                  </div>
+  1445→                  {/* ─── Test result display ─────────────────────────── */}
+  1446→                  {keyTestResult && (
+  1447→                    <div className={`flex flex-col gap-2 p-3 rounded-lg border text-sm ${
+  1448→                      keyTestResult.valid
+  1449→                        ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+  1450→                        : 'bg-red-50 border-red-200 text-red-800'
+  1451→                    }`}>
+  1452→                      <div className="flex items-start gap-2">
+  1453→                        {keyTestResult.valid
+  1454→                          ? <CheckCircle className="w-4 h-4 mt-0.5 shrink-0" />
+  1455→                          : <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />}
+  1456→                        <div className="flex-1">
+  1457→                          <p className="font-medium">{keyTestResult.valid ? 'Key is valid ✓' : 'Key is invalid ✗'}</p>
+  1458→                          <p className="text-xs opacity-80">{keyTestResult.reason}</p>
+  1459→                          {keyTestResult.source && (
+  1460→                            <p className="text-xs mt-1 opacity-70">Source: {keyTestResult.source}</p>
+  1461→                          )}
+  1462→                        </div>
+  1463→                      </div>
+  1464→                      {keyTestResult.valid && keyTestResult.key_info && (
+  1465→                        <div className="text-xs grid grid-cols-2 gap-1 mt-1 pt-2 border-t border-emerald-200">
+  1466→                          <span>Tier:</span><span>{keyTestResult.key_info.is_free_tier ? 'Free' : 'Paid'}</span>
+  1467→                          <span>Usage:</span><span>{keyTestResult.key_info.usage ?? 0} credits</span>
+  1468→                          <span>Limit:</span><span>{keyTestResult.key_info.limit ?? 'unlimited'}</span>
+  1469→                          {keyTestResult.key_info.expires_at && (
+  1470→                            <><span>Expires:</span><span>{new Date(keyTestResult.key_info.expires_at).toLocaleDateString()}</span></>
+  1471→                          )}
+  1472→                        </div>
+  1473→                      )}
+  1474→                    </div>
+  1475→                  )}
+  1476→                  {hasKey && !keyTestResult && (
+  1477→                    <div className="flex items-center gap-2 p-2 rounded-lg bg-emerald-50 border border-emerald-200">
+  1478→                      <CheckCircle className="w-4 h-4 text-emerald-600" />
+  1479→                      <span className="text-xs text-emerald-700">OpenRouter API key configured — AI analysis is active</span>
+  1480→                    </div>
+  1481→                  )}
+  1482→                </div>
+  1483→              </DialogContent>
+  1484→            </Dialog>
+  1485→            <Button size="sm" variant="outline" onClick={seedDemo} disabled={loading}>
+  1486→              {loading ? 'Loading...' : 'Demo Data'}
+  1487→            </Button>
+  1488→            {vulns.length > 0 && (
+  1489→              <Button size="sm" variant="outline" className="text-red-600 border-red-200 hover:bg-red-50" onClick={clearAllFindings}>
+  1490→                <Trash2 className="w-4 h-4 mr-1" /> Clear All
+  1491→              </Button>
+  1492→            )}
+  1493→          </div>
+  1494→        </div>
+  1495→      </header>
+  1496→
+  1497→      <main className="max-w-7xl mx-auto px-4 py-6">
+  1498→        {/* Stats */}
+  1499→        <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-6">
+  1500→          {[
+  1501→            { label: 'Total Findings', value: validatedVulns.length, icon: Bug, color: 'text-amber-600' },
+  1502→            { label: 'Confirmed (90%+)', value: confirmedVulns.length, icon: CheckCircle2, color: 'text-emerald-600' },
+  1503→            { label: 'Critical', value: criticalVulns.length, icon: AlertTriangle, color: 'text-red-600' },
+  1504→            { label: 'Avg Confidence', value: `${(avgConfidence * 100).toFixed(1)}%`, icon: Target, color: 'text-blue-600' },
+  1505→            { label: 'Memory Entries', value: validatedVulns.length + patterns.length, icon: Brain, color: 'text-purple-600' },
+  1506→          ].map((s, i) => (
+  1507→            <Card key={i} className="border-slate-200">
+  1508→              <CardContent className="p-4 flex items-center gap-3">
+  1509→                <s.icon className={`w-8 h-8 ${s.color} opacity-80`} />
+  1510→                <div>
+  1511→                  <p className="text-xs text-slate-500">{s.label}</p>
+  1512→                  <p className="text-xl font-bold">{s.value}</p>
+  1513→                </div>
+  1514→              </CardContent>
+  1515→            </Card>
+  1516→          ))}
+  1517→        </div>
+  1518→
+  1519→        {/* Tabs */}
+  1520→        <Tabs defaultValue="dashboard" className="space-y-4">
+  1521→          <TabsList className="w-full md:w-auto">
+  1522→            <TabsTrigger value="dashboard"><Activity className="w-4 h-4 mr-1" /> Dashboard</TabsTrigger>
+  1523→            <TabsTrigger value="analyze"><Search className="w-4 h-4 mr-1" /> Analyze</TabsTrigger>
+  1524→            <TabsTrigger value="findings"><Bug className="w-4 h-4 mr-1" /> Findings</TabsTrigger>
+  1525→            <TabsTrigger value="memory"><Brain className="w-4 h-4 mr-1" /> Memory</TabsTrigger>
+  1526→            <TabsTrigger value="pipeline"><Zap className="w-4 h-4 mr-1" /> Pipeline</TabsTrigger>
+  1527→          </TabsList>
+  1528→
+  1529→          {/* Dashboard */}
+  1530→          <TabsContent value="dashboard" className="space-y-4">
+  1531→            <div className="grid md:grid-cols-2 gap-4">
+  1532→              <Card className="border-slate-200">
+  1533→                <CardHeader>
+  1534→                  <CardTitle className="text-emerald-700">7-Layer Architecture</CardTitle>
+  1535→                  <CardDescription>Autonomous crypto vulnerability detection</CardDescription>
+  1536→                </CardHeader>
+  1537→                <CardContent className="space-y-2">
+  1538→                  {[
+  1539→                    { name: 'MCP Tool Bridge + Crypto', desc: '150+ web2 + 10 crypto MCP tools' },
+  1540→                    { name: 'Analysis Engine (Crypto-Native)', desc: 'AST + DeFi Patterns + Web2+Web3' },
+  1541→                    { name: 'Agent Orchestration', desc: '7 crypto workflows, YAML-driven' },
+  1542→                    { name: 'Memory & Anti-Duplicate', desc: 'Vector DB + Bloom Filter + Knowledge Graph' },
+  1543→                    { name: 'Validation Pipeline (95%)', desc: 'V1 SymEx + V2 Fuzz + V3 Formal + V4 Econ' },
+  1544→                    { name: 'Economic Attack Simulator', desc: 'Flash loan + MEV + Oracle + Invariant' },
+  1545→                    { name: 'Self-Defense', desc: 'Prompt Guard + Tool Chain + Supply Chain' },
+  1546→                  ].map((layer, i) => (
+  1547→                    <div key={i} className="flex items-center gap-3 p-2.5 rounded-lg bg-slate-50 hover:bg-slate-100 transition">
+  1548→                      <div className="w-7 h-7 rounded bg-emerald-100 text-emerald-700 flex items-center justify-center text-xs font-bold">{i+1}</div>
+  1549→                      <div className="flex-1">
+  1550→                        <p className="text-sm font-medium">{layer.name}</p>
+  1551→                        <p className="text-xs text-slate-500">{layer.desc}</p>
+  1552→                      </div>
+  1553→                    </div>
+  1554→                  ))}
+  1555→                </CardContent>
+  1556→              </Card>
+  1557→
+  1558→              <Card className="border-slate-200">
+  1559→                <CardHeader>
+  1560→                  <CardTitle className="text-blue-700">Supported Chains & Languages</CardTitle>
+  1561→                </CardHeader>
+  1562→                <CardContent className="space-y-3">
+  1563→                  {[
+  1564→                    { chain: 'Ethereum + L2s', lang: 'Solidity, Vyper', tools: 'Slither, Mythril, Echidna, Certora', risk: 'Reentrancy, delegatecall, proxy' },
+  1565→                    { chain: 'Solana', lang: 'Rust (BPF)', tools: 'cargo-audit, Kani', risk: 'Account confusion, CPI' },
+  1566→                    { chain: 'Sui / Aptos', lang: 'Move', tools: 'Move Prover, Analyzer', risk: 'Resource duplication' },
+  1567→                    { chain: 'StarkNet', lang: 'Cairo', tools: 'cairo-verify, SDK', risk: 'Felt overflow, syscall' },
+  1568→                  ].map((c, i) => (
+  1569→                    <div key={i} className="p-3 rounded-lg bg-slate-50 space-y-1">
+  1570→                      <div className="flex items-center justify-between">
+  1571→                        <p className="text-sm font-semibold text-slate-800">{c.chain}</p>
+  1572→                        <Badge variant="secondary" className="text-xs">{c.lang}</Badge>
+  1573→                      </div>
+  1574→                      <p className="text-xs text-slate-500">Tools: {c.tools}</p>
+  1575→                      <p className="text-xs text-red-500">Risks: {c.risk}</p>
+  1576→                    </div>
+  1577→                  ))}
+  1578→                </CardContent>
+  1579→              </Card>
+  1580→            </div>
+  1581→
+  1582→            <Card className="border-slate-200">
+  1583→              <CardHeader>
+  1584→                <CardTitle className="text-amber-700">Projects</CardTitle>
+  1585→              </CardHeader>
+  1586→              <CardContent>
+  1587→                {projects.length === 0 ? (
+  1588→                  <p className="text-slate-500 text-sm">No projects yet. Click &quot;Demo Data&quot; or create one in the Analyze tab.</p>
+  1589→                ) : (
+  1590→                  <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
+  1591→                    {projects.map(p => (
+  1592→                      <div key={p.id} className={`p-3 rounded-lg border-2 transition cursor-pointer ${activeProject === p.id ? 'border-emerald-400 bg-emerald-50' : 'border-slate-200 bg-white hover:border-emerald-300'}`}
+  1593→                        onClick={() => setActiveProject(p.id)}>
+  1594→                        <div className="flex items-center justify-between mb-1">
+  1595→                          <p className="font-medium text-sm">{p.name}</p>
+  1596→                          <Badge variant="outline" className="text-xs">{chainLabel[p.chain] || p.chain}</Badge>
+  1597→                        </div>
+  1598→                        <p className="text-xs text-slate-500">{p.language} | {p.contracts?.length || 0} contracts</p>
+  1599→                        {p.audits && p.audits.length > 0 && (
+  1600→                          <div className="flex items-center gap-2 mt-2">
+  1601→                            <Badge className="text-xs bg-emerald-100 text-emerald-800 border-0">{p.audits[0].confirmed} confirmed</Badge>
+  1602→                            <Badge variant="outline" className="text-xs">{p.audits[0].findings} findings</Badge>
+  1603→                          </div>
+  1604→                        )}
+  1605→                      </div>
+  1606→                    ))}
+  1607→                  </div>
+  1608→                )}
+  1609→              </CardContent>
+  1610→            </Card>
+  1611→          </TabsContent>
+  1612→
+  1613→          {/* Analyze */}
+  1614→          <TabsContent value="analyze" className="space-y-4">
+  1615→            <div className="grid md:grid-cols-2 gap-4">
+  1616→              <Card className="border-slate-200">
+  1617→                <CardHeader><CardTitle>Create Project</CardTitle></CardHeader>
+  1618→                <CardContent className="space-y-3">
+  1619→                  <Input placeholder="Project name (e.g. Uniswap V4)" value={newProject.name} onChange={e => setNewProject(p => ({ ...p, name: e.target.value }))} />
+  1620→                  <div className="grid grid-cols-2 gap-2">
+  1621→                    <Select value={newProject.chain} onValueChange={v => setNewProject(p => ({ ...p, chain: v }))}>
+  1622→                      <SelectTrigger><SelectValue /></SelectTrigger>
+  1623→                      <SelectContent>
+  1624→                        {['ethereum','bsc','polygon','arbitrum','optimism','solana','sui','starknet'].map(c => <SelectItem key={c} value={c}>{chainLabel[c]||c}</SelectItem>)}
+  1625→                      </SelectContent>
+  1626→                    </Select>
+  1627→                    <Select value={newProject.language} onValueChange={v => setNewProject(p => ({ ...p, language: v }))}>
+  1628→                      <SelectTrigger><SelectValue /></SelectTrigger>
+  1629→                      <SelectContent>
+  1630→                        {['solidity','vyper','move','rust','cairo'].map(l => <SelectItem key={l} value={l}>{l.charAt(0).toUpperCase()+l.slice(1)}</SelectItem>)}
+  1631→                      </SelectContent>
+  1632→                    </Select>
+  1633→                  </div>
+  1634→                  <Input placeholder="Contract address (optional)" value={newProject.address} onChange={e => setNewProject(p => ({ ...p, address: e.target.value }))} />
+  1635→                  <Button onClick={createProject} disabled={loading || !newProject.name} className="w-full">Create Project</Button>
+  1636→                </CardContent>
+  1637→              </Card>
+  1638→
+  1639→              <Card className="border-slate-200">
+  1640→                <CardHeader>
+  1641→                  <CardTitle>Analyze Target</CardTitle>
+  1642→                  <CardDescription>By URL or paste source code — via {model.split('/').pop()}</CardDescription>
+  1643→                </CardHeader>
+  1644→                <CardContent className="space-y-3">
+  1645→                  {projects.length > 0 && (
+  1646→                    <div className="space-y-1">
+  1647→                      <label className="text-xs text-slate-500">Project <span className="text-slate-400">(auto-selected if empty)</span></label>
+  1648→                      <Select value={activeProject || undefined} onValueChange={setActiveProject}>
+  1649→                        <SelectTrigger className={activeProject ? '' : 'text-slate-400'}><SelectValue placeholder="Auto-select" /></SelectTrigger>
+  1650→                        <SelectContent>
+  1651→                          {projects.map(p => <SelectItem key={p.id} value={p.id}>{p.name}</SelectItem>)}
+  1652→                        </SelectContent>
+  1653→                      </Select>
+  1654→                    </div>
+  1655→                  )}
+  1656→
+  1657→                  {/* URL Analysis Section */}
+  1658→                  <div className="space-y-2 p-3 rounded-lg bg-slate-50 border border-slate-200">
+  1659→                    <div className="flex items-center gap-2">
+  1660→                      <Globe className="w-4 h-4 text-blue-600" />
+  1661→                      <span className="text-sm font-medium text-slate-700">Analyze by URL</span>
+  1662→                    </div>
+  1663→                    <div className="grid grid-cols-3 gap-2">
+  1664→                      <Select value={targetType} onValueChange={v => { setTargetType(v as 'contract' | 'exchange' | 'hackenproof'); setFetchError(''); }}>
+  1665→                        <SelectTrigger className="col-span-1"><SelectValue /></SelectTrigger>
+  1666→                        <SelectContent>
+  1667→                          <SelectItem value="contract">Smart Contract</SelectItem>
+  1668→                          <SelectItem value="exchange">Web App / DApp</SelectItem>
+  1669→                          <SelectItem value="hackenproof">Hackenproof</SelectItem>
+  1670→                        </SelectContent>
+  1671→                      </Select>
+  1672→                      <Input
+  1673→                        placeholder={targetType === 'contract' ? 'GitHub, Etherscan, or raw .sol URL' : targetType === 'hackenproof' ? 'Hackenproof URL (e.g. https://hackenproof.com/...)' : 'Web app URL (e.g. https://app.uniswap.org)'}
+  1674→                        className="col-span-2"
+  1675→                        value={targetUrl}
+  1676→                        onChange={e => { setTargetUrl(e.target.value); setFetchError(''); }}
+  1677→                      />
+  1678→                    </div>
+  1679→                    <Button
+  1680→                      onClick={fetchUrlAndAnalyze}
+  1681→                      disabled={fetchingUrl || analyzing || !targetUrl}
+  1682→                      className="w-full bg-blue-600 hover:bg-blue-700 text-white"
+  1683→                    >
+  1684→                      {fetchingUrl ? <><Activity className="w-4 h-4 mr-2 animate-spin" /> Fetching...</> :
+  1685→                       analyzing ? <><Activity className="w-4 h-4 mr-2 animate-spin" /> Analyzing...</> :
+  1686→                       <><Globe className="w-4 h-4 mr-2" /> Fetch & Analyze URL</>}
+  1687→                    </Button>
+  1688→                    {targetType === 'contract' && (
+  1689→                      <div className="space-y-1">
+  1690→                        <p className="text-[11px] text-slate-400">Fetches source code and runs full AI audit</p>
+  1691→                        <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-slate-500">
+  1692→                          <span className="flex items-center gap-1"><FileCode className="w-3 h-3" />github.com/owner/repo</span>
+  1693→                          <span className="flex items-center gap-1"><Search className="w-3 h-3" />etherscan.io/address/0x...</span>
+  1694→                          <span className="flex items-center gap-1"><Globe className="w-3 h-3" />raw .sol URL</span>
+  1695→                        </div>
+  1696→                      </div>
+  1697→                    )}
+  1698→                    {targetType === 'exchange' && (
+  1699→                      <div className="space-y-1">
+  1700→                        <p className="text-[11px] text-slate-400">12-phase AI-powered analysis: crawl, JS deobfuscation, DOM XSS, API discovery, crypto patterns, 4x GLM AI passes</p>
+  1701→                        <div className="flex flex-wrap gap-x-2 gap-y-0.5 text-[10px]">
+  1702→                          <span className="text-blue-600 font-medium">Crawl/Spider</span>
+  1703→                          <span className="text-slate-500">|</span>
+  1704→                          <span className="text-purple-600 font-medium">JS Bundle Analysis</span>
+  1705→                          <span className="text-slate-500">|</span>
+  1706→                          <span className="text-red-600 font-medium">DOM XSS Sinks</span>
+  1707→                          <span className="text-slate-500">|</span>
+  1708→                          <span className="text-orange-600 font-medium">API Discovery</span>
+  1709→                          <span className="text-slate-500">|</span>
+  1710→                          <span className="text-emerald-600 font-medium">Crypto/Web3</span>
+  1711→                          <span className="text-slate-500">|</span>
+  1712→                          <span className="text-indigo-600 font-medium">AI: GLM 5.2 (deep) + DeepSeek V3 (fast) + Blockchain Verify</span>
+  1713→                        </div>
+  1714→                      </div>
+  1715→                    )}
+  1716→                    {targetType === 'hackenproof' && (
+  1717→                      <div className="space-y-1">
+  1718→                        <p className="text-[11px] text-slate-400">Reads project description, priorities & severity from Hackenproof page, then runs AI audit with context</p>
+  1719→                        <div className="flex items-center gap-1 text-[10px] text-blue-500">
+  1720→                          <ExternalLink className="w-3 h-3" />
+  1721→                          <span>hackenproof.com/projects/...</span>
+  1722→                        </div>
+  1723→                      </div>
+  1724→                    )}
+  1725→                    {fetchError && (
+  1726→                      <div className="flex items-start gap-2 p-2 rounded-lg bg-red-50 border border-red-200">
+  1727→                        <AlertCircle className="w-4 h-4 text-red-500 mt-0.5 shrink-0" />
+  1728→                        <p className="text-xs text-red-700">{fetchError}</p>
+  1729→                      </div>
+  1730→                    )}
+  1731→                    {hackenproofContext && !fetchError && (
+  1732→                      <div className="p-2 rounded-lg bg-blue-50 border border-blue-200 space-y-1">
+  1733→                        <p className="text-xs font-medium text-blue-700">Hackenproof Context Loaded</p>
+  1734→                        {hackenproofContext.description && <p className="text-[11px] text-blue-600">{hackenproofContext.description.slice(0, 120)}...</p>}
+  1735→                        {hackenproofContext.priorities && <p className="text-[11px] text-blue-600">Priorities: {hackenproofContext.priorities.slice(0, 80)}</p>}
+  1736→                      </div>
+  1737→                    )}
+  1738→                  </div>
+  1739→
+  1740→                  <div className="relative">
+  1741→                    <div className="absolute inset-x-0 top-0 flex items-center justify-center">
+  1742→                      <span className="bg-white px-2 text-xs text-slate-400">or paste code</span>
+  1743→                    </div>
+  1744→                  </div>
+  1745→
+  1746→                  <Textarea placeholder={`pragma solidity ^0.8.0;\n\ncontract Pool {\n    // Paste code here...`} className="min-h-[100px] font-mono text-sm" value={sourceCode} onChange={e => setSourceCode(e.target.value)} />
+  1747→                  <Button onClick={analyzeContract} disabled={analyzing || (!sourceCode && !targetUrl)} className="w-full bg-emerald-600 hover:bg-emerald-700 text-white">
+  1748→                    {analyzing ? <><Activity className="w-4 h-4 mr-2 animate-spin" /> Analyzing...</> : <><Search className="w-4 h-4 mr-2" /> Run Full Audit</>}
+  1749→                  </Button>
+  1750→                  {fetchError && !fetchingUrl && (
+  1751→                    <div className="flex items-start gap-2 p-2 rounded-lg bg-red-50 border border-red-200">
+  1752→                      <AlertCircle className="w-4 h-4 text-red-500 mt-0.5 shrink-0" />
+  1753→                      <p className="text-xs text-red-700">{fetchError}</p>
+  1754→                    </div>
+  1755→                  )}
+  1756→                </CardContent>
+  1757→              </Card>
+  1758→            </div>
+  1759→
+  1760→            {/* Scan Methods */}
+  1761→            <Card className="border-slate-200">
+  1762→              <CardHeader>
+  1763→                <CardTitle className="text-teal-700">Scan Methods</CardTitle>
+  1764→                <CardDescription>Toggle analysis methods on/off</CardDescription>
+  1765→              </CardHeader>
+  1766→              <CardContent className="space-y-4">
+  1767→                {[
+  1768→                  { category: 'Static Analysis', methods: [
+  1769→                    { key: 'ast-analysis', label: 'AST Analysis' },
+  1770→                    { key: 'data-flow', label: 'Data Flow' },
+  1771→                    { key: 'control-flow', label: 'Control Flow' },
+  1772→                    { key: 'pattern-match', label: 'Pattern Match' },
+  1773→                    { key: 'deep-reentrancy', label: 'Deep Reentrancy' },
+  1774→                    { key: 'access-control', label: 'Access Control' },
+  1775→                    { key: 'gas-dos-audit', label: 'Gas/DoS Audit' },
+  1776→                    { key: 'cross-contract', label: 'Cross-Contract' },
+  1777→                    { key: 'proxy-storage', label: 'Proxy Storage' },
+  1778→                    { key: 'delegatecall-scan', label: 'Delegatecall Scan' },
+  1779→                  ]},
+  1780→                  { category: 'Dynamic Testing', methods: [
+  1781→                    { key: 'symbolic-exec', label: 'Symbolic Execution' },
+  1782→                    { key: 'fuzzing', label: 'Fuzzing' },
+  1783→                    { key: 'mutation-test', label: 'Mutation Testing' },
+  1784→                    { key: 'signature-replay', label: 'Signature Replay' },
+  1785→                  ]},
+  1786→                  { category: 'Formal Verification', methods: [
+  1787→                    { key: 'formal-verify', label: 'Formal Verify' },
+  1788→                    { key: 'model-check', label: 'Model Checking' },
+  1789→                    { key: 'invariant-check', label: 'Invariant Check' },
+  1790→                  ]},
+  1791→                  { category: 'Economic Analysis', methods: [
+  1792→                    { key: 'oracle-manip', label: 'Oracle Manipulation' },
+  1793→                    { key: 'flash-loan-sim', label: 'Flash Loan Sim' },
+  1794→                    { key: 'mev-analysis', label: 'MEV Analysis' },
+  1795→                  ]},
+  1796→                ].map((cat, ci) => (
+  1797→                  <div key={ci}>
+  1798→                    <p className="text-xs font-semibold text-slate-500 mb-2">{cat.category}</p>
+  1799→                    <div className="flex flex-wrap gap-1.5">
+  1800→                      {cat.methods.map(m => (
+  1801→                        <button
+  1802→                          key={m.key}
+  1803→                          onClick={() => toggleScanMethod(m.key)}
+  1804→                          className={`px-2.5 py-1 rounded-full text-[11px] font-medium border transition-all ${
+  1805→                            scanMethods[m.key]
+  1806→                              ? 'bg-emerald-100 text-emerald-800 border-emerald-300 hover:bg-emerald-200'
+  1807→                              : 'bg-slate-100 text-slate-400 border-slate-200 hover:bg-slate-200'
+  1808→                          }`}
+  1809→                        >
+  1810→                          {scanMethods[m.key] ? <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-500 mr-1.5 align-middle" /> : <span className="inline-block w-1.5 h-1.5 rounded-full bg-slate-300 mr-1.5 align-middle" />}
+  1811→                          {m.label}
+  1812→                        </button>
+  1813→                      ))}
+  1814→                    </div>
+  1815→                  </div>
+  1816→                ))}
+  1817→              </CardContent>
+  1818→            </Card>
+  1819→
+  1820→            {/* Workflow */}
+  1821→            <Card className="border-slate-200">
+  1822→              <CardHeader><CardTitle className="text-purple-700">Audit Workflow Pipeline</CardTitle></CardHeader>
+  1823→              <CardContent>
+  1824→                <div className="flex flex-wrap items-center gap-2">
+  1825→                  {['AST Parse','Data Flow','Control Flow','Pattern Match','Deep Reentrancy','Symbolic Exec','Fuzzing','Mutation Test','Formal Verify','Model Check','Invariant Check','Signature Replay','Access Control','Oracle Manip','Flash Loan Sim','MEV Analysis','Gas/DoS Audit','Anti-Dupe','Confidence Calc','Report'].map((step, i) => (
+  1826→                    <div key={i} className="flex items-center gap-1">
+  1827→                      <div className="px-3 py-1.5 rounded-full bg-slate-100 border border-slate-200 text-xs font-medium">{step}</div>
+  1828→                      {i < 19 && <ChevronRight className="w-3 h-3 text-slate-400" />}
+  1829→                    </div>
+  1830→                  ))}
+  1831→                </div>
+  1832→              </CardContent>
+  1833→            </Card>
+  1834→          </TabsContent>
+  1835→
+  1836→          {/* Findings */}
+  1837→          <TabsContent value="findings" className="space-y-4">
+  1838→            <Card className="border-slate-200">
+  1839→              <CardHeader>
+  1840→                <div className="flex items-center justify-between flex-wrap gap-2">
+  1841→                  <CardTitle className="text-red-700">Vulnerability Findings</CardTitle>
+  1842→                  <div className="flex gap-2">
+  1843→                    <Button size="sm" variant="outline" onClick={generateReport} disabled={loading || validatedVulns.length === 0}>
+  1844→                      <FileText className="w-4 h-4 mr-1" /> HakenProof Report
+  1845→                    </Button>
+  1846→                    <Button size="sm" variant="outline" onClick={downloadZip} disabled={loading || validatedVulns.length === 0}>
+  1847→                      <Download className="w-4 h-4 mr-1" /> PoC ZIP
+  1848→                    </Button>
+  1849→                    <Badge className="bg-emerald-100 text-emerald-800 border-0">{confirmedVulns.length} Confirmed</Badge>
+  1850→                    <Badge className="bg-slate-100 text-slate-600 border-0">{vulns.length - validatedVulns.length} pending</Badge>
+  1851→                    {vulns.length > 0 && (
+  1852→                      <Button size="sm" variant="outline" className="text-red-600 border-red-200 hover:bg-red-50" onClick={clearAllFindings}>
+  1853→                        <Trash2 className="w-3.5 h-3.5 mr-1" /> Clear All
+  1854→                      </Button>
+  1855→                    )}
+  1856→                  </div>
+  1857→                </div>
+  1858→              </CardHeader>
+  1859→              <CardContent>
+  1860→                {validatedVulns.length === 0 ? (
+  1861→                  <p className="text-slate-500 text-sm">No validated findings yet. All findings must pass active exploitation testing before appearing here.</p>
+  1862→                ) : (
+  1863→                  <div className="space-y-3 max-h-[600px] overflow-y-auto pr-2">
+  1864→                    {[...validatedVulns].sort((a, b) => b.confidence - a.confidence).map(v => (
+  1865→                      <div key={v.id} className="p-4 rounded-lg border border-slate-200 bg-white space-y-2 shadow-sm">
+  1866→                        <div className="flex items-center justify-between">
+  1867→                          <div className="flex items-center gap-2">
+  1868→                            {statusIcon[v.status] || <Clock className="w-4 h-4 text-slate-400" />}
+  1869→                            <p className="font-semibold text-sm">{v.title}</p>
+  1870→                          </div>
+  1871→                          <div className="flex items-center gap-2">
+  1872→                            <Badge className={severityColor[v.severity] || ''}>{v.severity}</Badge>
+  1873→                            <Button
+  1874→                              size="sm"
+  1875→                              variant="outline"
+  1876→                              className={`text-[11px] h-7 px-2 ${validatingVulns.has(v.id) ? 'border-amber-300 text-amber-600' : v.status === 'confirmed' ? 'border-emerald-300 text-emerald-600 hover:bg-emerald-50' : 'border-blue-300 text-blue-600 hover:bg-blue-50'}`}
+  1877→                              onClick={() => validateVuln(v)}
+  1878→                              disabled={validatingVulns.has(v.id)}
+  1879→                              title="Deep validate with GLM AI"
+  1880→                            >
+  1881→                              {validatingVulns.has(v.id) ? (
+  1882→                                <><Loader2 className="w-3 h-3 mr-1 animate-spin" /> Validating</>
+  1883→                              ) : v.status === 'confirmed' ? (
+  1884→                                <><CheckCircle2 className="w-3 h-3 mr-1" /> Re-validate</>
+  1885→                              ) : (
+  1886→                                <><Play className="w-3 h-3 mr-1" /> Validate</>
+  1887→                              )}
+  1888→                            </Button>
+  1889→                            <button
+  1890→                              onClick={() => deleteVuln(v.id)}
+  1891→                              className="p-1 rounded hover:bg-red-50 text-slate-400 hover:text-red-600 transition-colors"
+  1892→                              title="Delete"
+  1893→                            >
+  1894→                              <Trash2 className="w-3.5 h-3.5" />
+  1895→                            </button>
+  1896→                          </div>
+  1897→                        </div>
+  1898→                        <p className="text-xs text-slate-500">{v.description}</p>
+  1899→                        <div className="flex items-center gap-4">
+  1900→                          <div className="flex-1">
+  1901→                            <div className="flex items-center justify-between text-xs mb-1">
+  1902→                              <span className="text-slate-500">Confidence</span>
+  1903→                              <span className={`font-mono font-bold ${v.confidence >= 0.95 ? 'text-emerald-600' : v.confidence >= 0.8 ? 'text-blue-600' : 'text-yellow-600'}`}>
+  1904→                                {(v.confidence * 100).toFixed(1)}%
+  1905→                              </span>
+  1906→                            </div>
+  1907→                            <div className="w-full bg-slate-100 rounded-full h-2">
+  1908→                              <div className={`h-2 rounded-full transition-all ${v.confidence >= 0.95 ? 'bg-emerald-500' : v.confidence >= 0.8 ? 'bg-blue-500' : 'bg-yellow-500'}`} style={{width: `${v.confidence*100}%`}} />
+  1909→                            </div>
+  1910→                          </div>
+  1911→                          <Badge variant="outline" className="text-xs capitalize">{v.status}</Badge>
+  1912→                          {v.description?.includes('[BLOCKCHAIN VERIFIED]') && (
+  1913→                            <Badge className="bg-emerald-100 text-emerald-700 border-emerald-300 text-[10px] flex items-center gap-1">
+  1914→                              <Shield className="w-3 h-3" /> On-Chain Verified
+  1915→                            </Badge>
+  1916→                          )}
+  1917→                        </div>
+  1918→                        <div className="grid grid-cols-4 gap-2 mt-1">
+  1919→                          {[
+  1920→                            { label: 'V1 SymEx', value: v.v1Symbolic, color: 'text-cyan-600' },
+  1921→                            { label: 'V2 Fuzz', value: v.v2Fuzzing, color: 'text-amber-600' },
+  1922→                            { label: 'V3 Formal', value: v.v3Formal, color: 'text-violet-600' },
+  1923→                            { label: 'V4 Econ', value: v.v4Economic, color: 'text-emerald-600' },
+  1924→                          ].map((val, vi) => (
+  1925→                            <div key={vi} className="text-center">
+  1926→                              <p className="text-[10px] text-slate-400">{val.label}</p>
+  1927→                              <p className={`text-xs font-mono font-bold ${val.color}`}>{val.value != null ? (val.value*100).toFixed(0)+'%' : '—'}</p>
+  1928→                            </div>
+  1929→                          ))}
+  1930→                        </div>
+  1931→                        {/* PoC button */}
+  1932→                        {v.poc && v.poc.trim().length > 0 && (
+  1933→                          <div className="flex items-center gap-2 mt-2 pt-2 border-t border-slate-100">
+  1934→                            <Button
+  1935→                              size="sm"
+  1936→                              variant="outline"
+  1937→                              className="text-xs border-violet-300 text-violet-700 hover:bg-violet-50"
+  1938→                              onClick={() => setPocView({ title: v.title, filename: v.pocFilename || 'attack.t.sol', code: v.poc! })}
+  1939→                            >
+  1940→                              <Code2 className="w-3.5 h-3.5 mr-1" /> PoC
+  1941→                            </Button>
+  1942→                            <span className="text-[10px] text-slate-400">{v.pocFilename}</span>
+  1943→                            <Badge variant="outline" className="text-[9px] text-violet-600 border-violet-200">Foundry Test</Badge>
+  1944→                          </div>
+  1945→                        )}
+  1946→                      </div>
+  1947→                    ))}
+  1948→                  </div>
+  1949→                )}
+  1950→              </CardContent>
+  1951→            </Card>
+  1952→
+  1953→            {/* Report Preview — full inline display */}
+  1954→            {showReport && reportText && (
+  1955→              <div className="space-y-4">
+  1956→                {/* Report header bar */}
+  1957→                <Card className="border-emerald-200 bg-emerald-50">
+  1958→                  <CardHeader className="pb-2">
+  1959→                    <div className="flex items-center justify-between flex-wrap gap-2">
+  1960→                      <div className="flex items-center gap-2">
+  1961→                        <FileText className="w-5 h-5 text-emerald-700" />
+  1962→                        <CardTitle className="text-emerald-700">HakenProof Audit Report</CardTitle>
+  1963→                        <Badge className="bg-emerald-600 text-white border-0">LIVE PREVIEW</Badge>
+  1964→                      </div>
+  1965→                      <div className="flex gap-2">
+  1966→                        <Button size="sm" onClick={downloadReport} className="bg-emerald-600 hover:bg-emerald-700 text-white">
+  1967→                          <Download className="w-4 h-4 mr-1" /> Download .txt
+  1968→                        </Button>
+  1969→                        <Button size="sm" variant="outline" onClick={() => { navigator.clipboard.writeText(reportText); }} className="border-emerald-300 text-emerald-700">
+  1970→                          <FileCode className="w-4 h-4 mr-1" /> Copy
+  1971→                        </Button>
+  1972→                        <Button size="sm" variant="outline" onClick={() => setShowReport(false)} className="border-slate-300">
+  1973→                          Close
+  1974→                        </Button>
+  1975→                      </div>
+  1976→                    </div>
+  1977→                  </CardHeader>
+  1978→                </Card>
+  1979→
+  1980→                {/* Formatted report display */}
+  1981→                <Card className="border-slate-200">
+  1982→                  <CardContent className="p-0">
+  1983→                    <div className="max-h-[700px] overflow-y-auto">
+  1984→                      {reportText.split('\n').map((line, i) => {
+  1985→                        const trimmed = line.trim();
+  1986→                        // Section headers (=== separator lines)
+  1987→                        if (trimmed.match(/^={5,}$/)) {
+  1988→                          return <div key={i} className="h-px bg-slate-300 mx-6 my-2" />;
+  1989→                        }
+  1990→                        // Top-level headers (FINDING #, SUMMARY, CRYPTOSENTINEL)
+  1991→                        if (trimmed.match(/^(FINDING|SUMMARY|CRYPTOSENTINEL)/)) {
+  1992→                          return (
+  1993→                            <div key={i} className="px-6 py-2 bg-slate-100 border-b border-slate-200">
+  1994→                              <span className="text-sm font-bold text-slate-900">{trimmed}</span>
+  1995→                            </div>
+  1996→                          );
+  1997→                        }
+  1998→                        // Severity badges
+  1999→                        if (trimmed.match(/^\s*(CRITICAL|HIGH|MEDIUM|LOW)$/i)) {
+  2000→                          const sev = trimmed.toUpperCase();
+
+[showing lines 1-2000 of 2343; use offset=2001 with limit to continue reading]

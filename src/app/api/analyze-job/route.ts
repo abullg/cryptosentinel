@@ -187,7 +187,7 @@ async function runAnalysisInBackground(jobId: string, config: {
             { title: v.title, type: v.type, severity: v.severity, description: v.description, location: v.location },
             apiKey, model
           );
-          const scope = verification.validationScope || 'lab';
+          const scope = verification.validationScope || 'theoretical';
           if (verification.confirmed) {
             const boost = scope === 'target' ? 0.15 : scope === 'lab' ? 0.05 : 0;
             const newConf = Math.min(vuln.confidence + boost, 0.99);
@@ -207,8 +207,8 @@ async function runAnalysisInBackground(jobId: string, config: {
             vuln.confidence = newConf; vuln.validationScope = scope;
           }
         } catch {
-          await db.vulnerability.update({ where: { id: vuln.id }, data: { validationScope: 'lab' } }).catch(() => {});
-          vuln.validationScope = 'lab';
+          await db.vulnerability.update({ where: { id: vuln.id }, data: { validationScope: 'theoretical' } }).catch(() => {});
+          vuln.validationScope = 'theoretical';
         }
       });
       await Promise.allSettled(verifyPromises);

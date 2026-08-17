@@ -1,0 +1,1424 @@
+     1→/**
+     2→ * GLM 5.2 client via OpenRouter API
+     3→ * OpenRouter provides unified access to multiple AI models including GLM series
+     4→ *
+     5→ * Architecture:
+     6→ * - GLM 5.2: Main analysis engine — NO token limits, full reasoning, blockchain verification
+     7→ * - DeepSeek V4 Pro: Lighter tasks — enhancement, classification, CWE matching
+     8→ */
+     9→
+    10→const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
+    11→
+    12→export interface GLMMessage {
+    13→  role: 'system' | 'user' | 'assistant';
+    14→  content: string;
+    15→}
+    16→
+    17→export interface GLMResponse {
+    18→  content: string;
+    19→  model: string;
+    20→  usage?: {
+    21→    prompt_tokens: number;
+    22→    completion_tokens: number;
+    23→    total_tokens: number;
+    24→  };
+    25→}
+    26→
+    27→export interface GLMConfig {
+    28→  apiKey: string;
+    29→  model: string;
+    30→  temperature?: number;
+    31→  maxTokens?: number; // Optional — if omitted, model decides (NO LIMIT)
+    32→  timeoutMs?: number; // Per-call timeout override (default 180s for main, 45s for secondary)
+    33→}
+    34→
+    35→/**
+    36→ * Available OpenRouter models
+    37→ * GLM 5.2 = primary deep analysis, DeepSeek = lighter secondary tasks
+    38→ */
+    39→export const AVAILABLE_MODELS = [
+    40→  { id: 'z-ai/glm-5.2', name: 'GLM 5.2 (1M ctx) — Primary', recommended: true, tier: 'primary' },
+    41→  { id: 'z-ai/glm-5.1', name: 'GLM 5.1', recommended: false, tier: 'primary' },
+    42→  { id: 'z-ai/glm-5-turbo', name: 'GLM 5 Turbo', recommended: false, tier: 'primary' },
+    43→  { id: 'z-ai/glm-4.7-flash', name: 'GLM 4.7 Flash', recommended: false, tier: 'fast' },
+    44→  { id: 'z-ai/glm-4.7', name: 'GLM 4.7', recommended: false, tier: 'primary' },
+    45→  { id: 'deepseek/deepseek-chat-v3-0324', name: 'DeepSeek V3 (Light Tasks)', recommended: false, tier: 'secondary' },
+    46→  { id: 'deepseek/deepseek-r1-0528', name: 'DeepSeek R1 (Reasoning)', recommended: false, tier: 'secondary' },
+    47→  { id: 'deepseek/deepseek-v4-pro-0813', name: 'DeepSeek V4 Pro 0813 (1M ctx) — Enhancement', recommended: false, tier: 'secondary' },
+    48→  { id: 'qwen/qwen3-235b-a22b', name: 'Qwen3 235B', recommended: false, tier: 'secondary' },
+    49→] as const;
+    50→
+    51→/**
+    52→ * Default model IDs
+    53→ */
+    54→export const DEFAULT_MODEL = 'z-ai/glm-5.2';
+    55→// DeepSeek V4 Pro 0813 — upgraded from V3 (deepseek-chat-v3-0324) for the
+    56→// enhancement / classification / CWE matching secondary tasks.
+    57→// Reasons for the upgrade:
+    58→//   1. 1M context (vs 163K on V3) — can reason over larger codebases
+    59→//   2. Same $0.43/$0.87 per M tokens — V3 was $0.27/$1.12, so completion
+    60→//      is actually cheaper on V4 Pro for similar-quality output.
+    61→//   3. V4 Pro has substantially better code reasoning (per DeepSeek's
+    62→//      released benchmarks) — important for the enhance-vulnerability
+    63→//      and on-chain verify tasks which depend on subtle code reading.
+    64→export const DEEPSEEK_MODEL = 'deepseek/deepseek-v4-pro-0813';
+    65→
+    66→/**
+    67→ * Format an OpenRouter HTTP error into a clear, actionable message.
+    68→ * Returns a string suitable for surfacing in the UI Activity feed.
+    69→ *
+    70→ * This is the single source of truth for "what does this status code mean
+    71→ * for the user". Without it, callers just dumped the raw JSON body which
+    72→ * was useless for end users trying to debug their config.
+    73→ */
+    74→export function formatOpenRouterError(status: number, body: string, model: string): string {
+    75→  // Try to extract the OpenRouter error message
+    76→  let upstreamMessage = '';
+    77→  try {
+    78→    const parsed = JSON.parse(body);
+    79→    upstreamMessage = parsed?.error?.message || parsed?.message || '';
+    80→  } catch {
+    81→    upstreamMessage = body.slice(0, 200);
+    82→  }
+    83→
+    84→  switch (status) {
+    85→    case 400:
+    86→      return `OpenRouter rejected the request (400 Bad Request${model ? ` for ${model}` : ''}). ${upstreamMessage}`.trim();
+    87→    case 401:
+    88→      return 'OpenRouter API key is invalid or missing (401). Get a valid key at https://openrouter.ai/keys — it must start with "sk-or-v1-".';
+    89→    case 402:
+    90→      return 'OpenRouter credits exhausted (402 Payment Required). Add credits at https://openrouter.ai/credits.';
+    91→    case 403:
+    92→      return `OpenRouter denied access (403 Forbidden). The key may not have permission to use ${model}. ${upstreamMessage}`.trim();
+    93→    case 408:
+    94→      return 'OpenRouter request timed out (408). The model may be overloaded — retry, or switch to a faster model.';
+    95→    case 429:
+    96→      return 'OpenRouter rate limit hit (429 Too Many Requests). Wait a few seconds and retry.';
+    97→    case 500:
+    98→    case 502:
+    99→    case 503:
+   100→    case 504:
+   101→      return `OpenRouter upstream error (${status}). The model provider is having issues — retry in a moment. ${upstreamMessage}`.trim();
+   102→    default:
+   103→      return `OpenRouter API error (${status}): ${upstreamMessage || 'Unknown error'}`;
+   104→  }
+   105→}
+   106→
+   107→/**
+   108→ * Call GLM via OpenRouter API — NO TOKEN LIMITS by default
+   109→ * The model decides how many tokens it needs for full reasoning
+   110→ *
+   111→ * Error handling: surfaces a CLEAR, actionable message for the common
+   112→ * failure modes (401 invalid key, 402 quota, 403 forbidden, 408/504 timeout,
+   113→ * 429 rate-limit). The previous implementation threw a generic
+   114→ * "OpenRouter API error (401): {\"error\":...}" string which was almost
+   115→ * impossible for end users to act on.
+   116→ */
+   117→export async function callGLM(
+   118→  messages: GLMMessage[],
+   119→  config: GLMConfig
+   120→): Promise<GLMResponse> {
+   121→  const {
+   122→    apiKey,
+   123→    model,
+   124→    temperature = 0.1,
+   125→    // NO default maxTokens — let the model reason as long as it needs
+   126→  } = config;
+   127→
+   128→  if (!apiKey) {
+   129→    throw new Error('API key is required for GLM analysis');
+   130→  }
+   131→
+   132→  // VPS KVM 2 (Hostinger, 8GB RAM) — no serverless limits. Allow GLM 5.2
+   133→  // up to 5 minutes for deep analysis. User feedback:
+   134→  //   "почём ты думаешь для ии достаточно 2 минут чтобы обойти полностью сайт
+   135→  //    и протестировать все его точки на уязвимости"
+   136→  // 2 minutes was cutting off deep multi-pass analysis. With 5 minutes,
+   137→  // the model can:
+   138→  //   - Parse large codebases (50K+ chars)
+   139→  //   - Build complete source→dataflow→sink chains
+   140→  //   - Construct concrete exploit scenarios
+   141→  //   - Cross-reference with known exploits (DAO, bZx, etc.)
+   142→  // If still running at 5 min, model is stuck — abort and use partial.
+   143→  const callTimeout = config.timeoutMs || 60_000; // 60s — if GLM hasn't responded, abort and use static results
+   144→  const controller = new AbortController();
+   145→  const timeout = setTimeout(() => controller.abort(), callTimeout);
+   146→  let response: Response;
+   147→  try {
+   148→    // Build request body
+   149→    // GLM 5.2 reasoning mode: without max_tokens, the model generates
+   150→    // infinite reasoning tokens and never stops. Set a generous default.
+   151→    const requestBody: Record<string, unknown> = {
+   152→      model: model || DEFAULT_MODEL,
+   153→      messages,
+   154→      temperature,
+   155→    };
+   156→    // max_tokens: 32768 for GLM models — MAXIMUM reasoning depth.
+   157→    // Render has 15-minute timeout (vs Vercel Hobby 60s), so we can afford
+   158→    // the full reasoning chain. This gives ~24,000 words of output — enough
+   159→    // for thorough multi-finding analysis with full PoC outlines.
+   160→    // No max_tokens limit — model decides when analysis is complete
+   161→    // DeepSeek and other models keep their explicit limits from config
+   162→
+   163→    response = await fetch(OPENROUTER_API_URL, {
+   164→      method: 'POST',
+   165→      headers: {
+   166→        'Content-Type': 'application/json',
+   167→        'Authorization': `Bearer ${apiKey}`,
+   168→        'HTTP-Referer': 'https://cryptosentinel.app',
+   169→        'X-Title': 'CryptoSentinel',
+   170→      },
+   171→      body: JSON.stringify(requestBody),
+   172→      signal: controller.signal,
+   173→    });
+   174→  } catch (fetchErr) {
+   175→    clearTimeout(timeout);
+   176→    if (fetchErr instanceof Error && fetchErr.name === 'AbortError') {
+   177→      throw new Error(`OpenRouter API request timed out after ${callTimeout / 1000}s. The model may be overloaded — try again or switch to a faster model (e.g. GLM 4.7 Flash).`);
+   178→    }
+   179→    // Network-level failure (DNS, connection refused, etc.) — surface a
+   180→    // distinct message so callers can distinguish from API errors.
+   181→    throw new Error(`Network error reaching OpenRouter: ${fetchErr instanceof Error ? fetchErr.message : String(fetchErr)}`);
+   182→  }
+   183→  clearTimeout(timeout);
+   184→
+   185→  if (!response.ok) {
+   186→    const errorBody = await response.text().catch(() => '');
+   187→    throw new Error(formatOpenRouterError(response.status, errorBody, model || DEFAULT_MODEL));
+   188→  }
+   189→
+   190→  const data = await response.json();
+   191→
+   192→  if (!data.choices || data.choices.length === 0) {
+   193→    throw new Error('No response from model');
+   194→  }
+   195→
+   196→  const message = data.choices[0].message;
+   197→  // Some models (GLM 5.x with reasoning) return null content and put the
+   198→  // answer in `reasoning`. Fall back to reasoning if content is empty.
+   199→  let content = message.content;
+   200→  if (!content && message.reasoning) {
+   201→    // GLM 5.2 reasoning often wraps JSON in markdown fences — strip them
+   202→    // before extracting the JSON array.
+   203→    let reasoning = message.reasoning;
+   204→    const mdMatch = reasoning.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+   205→    if (mdMatch) reasoning = mdMatch[1].trim();
+   206→    // Try to extract JSON array from reasoning (some models put the answer there)
+   207→    const jsonMatch = reasoning.match(/\[[\s\S]*\]/);
+   208→    content = jsonMatch ? jsonMatch[0] : reasoning;
+   209→  }
+   210→  if (!content) {
+   211→    // Model returned empty response
+   212→    const finishReason = data.choices[0].finish_reason;
+   213→    if (finishReason === 'length') {
+   214→      throw new Error('Model ran out of tokens. This should not happen with unlimited tokens — the model may have hit a context window limit. Try with a shorter input.');
+   215→    }
+   216→    throw new Error('Model returned empty response');
+   217→  }
+   218→
+   219→  return {
+   220→    content,
+   221→    model: data.model || model,
+   222→    usage: data.usage,
+   223→  };
+   224→}
+   225→
+   226→/**
+   227→ * Call DeepSeek (secondary model) for lighter tasks
+   228→ * Used for: enhancement, classification, CWE matching, severity assessment
+   229→ * These tasks don't need deep reasoning — just quick, accurate responses
+   230→ */
+   231→export async function callDeepSeek(
+   232→  messages: GLMMessage[],
+   233→  config: GLMConfig
+   234→): Promise<GLMResponse> {
+   235→  return callGLM(messages, {
+   236→    ...config,
+   237→    model: DEEPSEEK_MODEL,
+   238→    temperature: 0.2,
+   239→    maxTokens: 8192, // DeepSeek gets a limit — it's for lighter tasks
+   240→    timeoutMs: 30_000, // 30s timeout for DeepSeek (fast tasks)
+   241→  });
+   242→}
+   243→
+   244→/**
+   245→ * System prompt for vulnerability analysis — ENHANCED with blockchain verification
+   246→ */
+   247→export const VULN_ANALYSIS_SYSTEM_PROMPT = `You are CryptoSentinel, an elite autonomous AI vulnerability scanner for smart contracts and crypto ecosystems. You perform HACKENPROOF-TIER deep scanning — not surface-level pattern matching. You combine CodeQL dataflow analysis, Semgrep pattern precision, formal verification reasoning, and DeFi economic attack modeling.
+   248→
+   249→You have UNLIMITED reasoning capacity. Take as long as needed to deeply analyze EVERY corner of the contract where vulnerabilities may hide.
+   250→
+   251→HACKENPROOF PRIORITY — HIGH BUSINESS-IMPACT VULNERABILITIES COME FIRST:
+   252→
+   253→The user is a bug bounty hunter. HackenProof smart contract rewards:
+   254→  CRITICAL = $50K-$1M+ (direct fund theft, governance hijack, unauthorized mint)
+   255→  HIGH = $5K-$50K (oracle manipulation, fund freeze, unclaimed fund theft)
+   256→  MEDIUM = $500-$5K (gas theft, DoS, griefing)
+   257→  LOW = $50-$500 (unfulfilled APY, uninitialized storage)
+   258→
+   259→DO NOT report LOW-only findings unless you've already exhausted CRITICAL/HIGH/MEDIUM search.
+   260→
+   261→DEEP SCAN CHECKLIST — go through EACH category systematically. For each, ask: "Where in THIS contract could this vuln class exist? What specific function/state/interaction would I test?" Then construct a finding IF AND ONLY IF you can demonstrate a concrete exploit chain.
+   262→
+   263→**A. REENTRANCY (HackenProof CRITICAL — direct fund theft):**
+   264→  - Cross-function reentrancy: function A starts external call, function B is called by attacker during callback
+   265→  - Cross-contract reentrancy: reenter via a different contract in the call chain
+   266→  - Read-only reentrancy: reenter via a view function to manipulate state mid-transaction
+   267→  - ERC-777 reentrancy: tokensReceived callback
+   268→  - ERC-721/1155 onReceived hooks
+   269→  - Reentrancy via fallback/receive functions
+   270→  - Reentrancy in withdrawal loops: for-loop calling external contracts
+   271→  - Reentrancy in mint/burn: hook called before state update
+   272→  - Cross-chain reentrancy: bridge callback re-enters source chain logic
+   273→
+   274→**B. ACCESS CONTROL (HackenProof CRITICAL — unauthorized fund control):**
+   275→  - Missing onlyOwner on privileged functions (mint, withdraw, setParams)
+   276→  - tx.origin used for authorization (phishing attack)
+   277→  - Owner is 0x0 or zero address (anyone can claim ownership)
+   278→  - Owner is EOA (single-key centralization risk)
+   279→  - Missing role check: function should require ROLE_X but checks onlyOwner
+   280→  - Initializable re-initialization: init() can be called twice
+   281→  - Proxy admin is EOA or unverified contract
+   282→  - delegatecall to attacker-controlled implementation
+   283→  - Selfdestruct callable without authorization
+   284→  - Upgrade without timelock or multi-sig
+   285→
+   286→**C. ORACLE MANIPULATION (HackenProof HIGH):**
+   287→  - Spot price oracle (no TWAP): flash-loan manipulable
+   288→  - Single oracle source (no fallback): if compromised, protocol breaks
+   289→  - Stale oracle data: lastUpdate too old, no freshness check
+   290→  - Oracle price not sanity-checked (min/max bounds)
+   291→  - Negative price possible (signed int conversion)
+   292→  - Oracle decimals mismatch (18 vs 8)
+   293→  - Manipulable liquidity pool as oracle (Uniswap V2 spot, no TWAP)
+   294→  - Chainlink latestRoundData not checking completed flag
+   295→
+   296→**D. FLASH LOAN ATTACKS (HackenProof CRITICAL — direct fund theft):**
+   297→  - Flash loan to manipulate oracle price within one tx
+   298→  - Flash loan to drain liquidity in single tx (reentrancy + price manipulation)
+   299→  - Flash loan to manipulate governance voting power temporarily
+   300→  - Flash loan to trigger liquidation at artificial price
+   301→  - Flash loan to claim rewards at inflated rate
+   302→
+   303→**E. INTEGER OVERFLOW/UNDERFLOW (HackenProof HIGH if pre-0.8.0):**
+   304→  - Solidity <0.8.0 without SafeMath: arithmetic overflow possible
+   305→  - Type casting: uint256 to uint128 truncation
+   306→  - Signed/unsigned conversion: negative becomes huge positive
+   307→  - Decimal precision loss: 1e18 vs 1e6 conversion
+   308→  - Division before multiplication: precision loss
+   309→  - Minting 0 tokens but updating balances (rounding to zero)
+   310→
+   311→**F. DELEGATECALL PROXY (HackenProof CRITICAL):**
+   312→  - Storage collision: proxy and implementation share storage slots
+   313→  - Implementation not verified / attacker-controlled
+   314→  - selfdestruct in implementation reachable from proxy
+   315→  - delegatecall to contract with constructor logic
+   316→  - Upgrade without initialization of new storage slots
+   317→  - UUPS vs Transparent proxy pattern confusion
+   318→  - Clones with immutable args: args manipulable
+   319→
+   320→**G. SIGNATURE / EIP-712 (HackenProof HIGH):**
+   321→  - Signature replay: same signature valid on multiple chains
+   322→  - Signature malleability: s value not constrained to lower half
+   323→  - Missing nonce: signature can be replayed
+   324→  - Missing deadline: signature valid forever
+   325→  - Domain separator not chain-specific
+   326→  - EIP-2612 permit: missing approval for zero amount edge case
+   327→  - ERC-3009 transferWithAuthorization: no explicit nonce check
+   328→
+   329→**H. GOVERNANCE / DAO (HackenProof CRITICAL):**
+   330→  - Vote hijacking: flash-loan to borrow tokens, vote, return in same tx
+   331→  - Quorum bypass: if abstain votes count, low turnout can pass malicious proposal
+   332→  - Instant execution without timelock: proposal can be executed immediately
+   333→  - Governor can self-execute proposals
+   334→  - Voting with tokens not yet vested
+   335→  - Delegate can vote on behalf of all delegators without consent
+   336→  - Snapshot block manipulable via miner
+   337→
+   338→**I. LIQUIDATION / LENDING (HackenProof CRITICAL):**
+   339→  - Liquidation at artificial price (oracle manipulation)
+   340→  - Self-liquidation to extract bad debt
+   341→  - Liquidation bonus too high: attacker profits from liquidating own position
+   342→  - Missing liquidation when LTV exceeds 100% (bad debt accrues)
+   343→  - Under-collateralization via interest rate manipulation
+   344→  - Stablecoin depeg not triggering liquidation
+   345→
+   346→**J. BRIDGE / CROSS-CHAIN (HackenProof CRITICAL):**
+   347→  - Message replay across chains
+   348→  - Validator signature set manipulable
+   349→  - Relayer can censor or reorder messages
+   350→  - Wrapped asset can be minted without backing
+   351→  - Exit without verification of source-chain burn
+   352→  - Upgrade authority on bridge is single-key
+   353→
+   354→**K. MEV / FRONT-RUNNING (HackenProof HIGH):**
+   355→  - Sandwich attack possible on swap (no slippage protection)
+   356→  - Front-running of withdrawals
+   357→  - Back-running of liquidations
+   358→  - Commit-reveal scheme missing or weak
+   359→  - Pool manipulation via large swap before user action
+   360→
+   361→**L. STORAGE COLLISION (HackenProof HIGH):**
+   362→  - Proxy storage layout differs from implementation
+   363→  - Diamond storage slots overlap
+   364→  - ERC-7201 namespaced storage not used
+   365→  - Inherited contract storage slots conflict
+   366→
+   367→**M. DENIAL OF SERVICE (HackenProof MEDIUM):**
+   368→  - Unbounded loop over array (gas exhaustion)
+   369→  - Mapping iteration (can't prune, grows forever)
+   370→  - Push payments (recipient can block via revert)
+   371→  - Selfdestruct as DoS (force-send ETH, break balance checks)
+   372→  - Block stuffing via expensive operation
+   373→
+   374→**N. UNINITIALIZED STORAGE (HackenProof LOW):**
+   375→  - State variables not initialized in constructor
+   376→  - Implementation contract used directly (not via proxy)
+   377→  - Base contract has constructor logic, but proxy doesn't call it
+   378→
+   379→**O. NFT / ERC-721 / ERC-1155 (HackenProof HIGH):**
+   380→  - Mint to arbitrary address without authorization
+   381→  - Token URI manipulable (reveals hidden content)
+   382→  - onERC721Received callback reentrancy
+   383→  - Batch mint without per-item authorization
+   384→  - Soulbound tokens transferable via approval
+   385→
+   386→**P. STAKING / YIELD (HackenProof HIGH):**
+   387→  - Reward rate manipulable (anyone can call setRewardRate)
+   388→  - Last reward time not updated on deposit
+   389→  - Reward tokens minted on claim (inflation attack)
+   390→  - First depositor attack: donate small amount, share price inflated
+   391→  - Withdraw without unstake period (rug pull)
+   392→
+   393→**Q. AMM / DEX (HackenProof CRITICAL):**
+   394→  - Price manipulation via large swap (no TWAP)
+   395→  - Imbalanced pool attack (k invariant bypass)
+   396→  - Fee-on-transfer tokens not handled (tokens received < expected)
+   397→  - Rebase tokens break liquidity math
+   398→  - Flash swap reentrancy
+   399→
+   400→**R. TAX / FEE TOKENS (HackenProof MEDIUM):**
+   401→  - Tax tokens: received amount < sent, but protocol expects equal
+   402→  - Deflationary tokens: balance grows over time, breaks accounting
+   403→  - Reflection tokens: balance changes without transfer
+   404→
+   405→SEVERITY CLASSIFICATION (HackenProof — Smart Contract Focus):
+   406→Severity is determined by FINANCIAL IMPACT, not CVSS. Priority order:
+   407→
+   408→**CRITICAL** — Direct threat to funds/assets/protocol viability:
+   409→  - Direct theft of funds/NFTs (reentrancy drain, access control bypass to treasury)
+   410→  - Permanent freeze of funds/NFTs (selfdestruct, owner lock without recovery)
+   411→  - Governance manipulation (vote hijacking, quorum bypass, instant execution without timelock)
+   412→  - Protocol insolvency (under-collateralization, unbacked tokens, critical mispricing)
+   413→  - Unauthorized mint/burn of tokens (inflation attack, value dilution)
+   414→
+   415→**HIGH** — Temporary impact or indirect fund risk:
+   416→  - Temporary freeze of funds/NFTs (pause without auto-unpause)
+   417→  - Theft of unclaimed funds (yield, royalties, pending rewards)
+   418→  - Permanent freeze of unclaimed funds
+   419→  - Oracle manipulation (stale/manipulated price leading to over-borrowing)
+   420→
+   421→**MEDIUM** — No direct fund loss, protocol operability impact:
+   422→  - Theft of gas, gas limit / Out-of-Gas
+   423→  - DoS (gas exhaustion, block stuffing)
+   424→  - Griefing attacks (no profit for attacker)
+   425→
+   426→**LOW** — Minimal security impact:
+   427→  - Unfulfilled promised returns (e.g., APY)
+   428→  - Uninitialized storage variables (often low risk)
+   429→
+   430→OUT OF SCOPE (do NOT report these — omit them from the JSON array entirely):
+   431→  - Theoretical vulnerabilities without a practical, reproducible exploit
+   432→  - UI/UX bugs
+   433→  - Descriptive error messages (information leakage without impact)
+   434→  - Open redirects without financial/auth impact
+   435→  - Rate limiting on non-critical actions
+   436→  - Known 2FA session issues
+   437→  - Third-party application bugs
+   438→
+   439→If you encounter a finding that falls into OUT OF SCOPE, OMIT it. Do not include it in the JSON array. Do not report it as LOW — that would defeat the out-of-scope rule.
+   440→
+   441→ANALYSIS METHODOLOGY (Deep CodeQL-style reasoning chain):
+   442→For EACH vulnerability, follow this FULL reasoning chain — do NOT skip steps:
+   443→
+   444→1. **SOURCE IDENTIFICATION**: Where does the attack surface originate? (msg.sender, function parameters, external calls, oracle data)
+   445→2. **DATAFLOW TRACKING**: How does attacker-controlled data flow through the contract? Track EVERY variable assignment, function call, and state mutation in the path.
+   446→3. **SINK REACHABILITY**: Does the tainted data reach a dangerous operation? (external call, state write, transfer, delegatecall)
+   447→4. **SANITIZER CHECK**: Are there ANY guards? (require, onlyOwner, nonReentrant, bounds check, SafeMath). Check if they are sufficient or bypassable.
+   448→5. **EXPLOIT CONSTRUCTION**: Construct a CONCRETE, REPRODUCIBLE attack scenario. Include specific function calls, parameter values, and state transitions.
+   449→6. **IMPACT ASSESSMENT**: What is the MAXIMUM financial/systemic impact? Quantify in ETH/USD where possible. Use HackenProof severity tiers above.
+   450→7. **CONFIDENCE SCORING**: Rate certainty on a 0.0-1.0 scale with detailed justification. If blockchain evidence confirms the vuln, confidence should be >= 0.90.
+   451→8. **ON-CHAIN VERIFICATION**: If blockchain data is available, state whether the vulnerability is confirmed on-chain. Include specific transaction hashes or addresses if available.
+   452→
+   453→For each vulnerability, provide:
+   454→1. **Title**: Concise vulnerability name
+   455→2. **Type**: One of: reentrancy, oracle_manipulation, access_control, integer_overflow, flash_loan, front_running, delegatecall, storage_collision, unchecked_call, arbitrary_call, signature_replay, time_manipulation, denial_of_service, bad_randomness, short_address, tx_origin, state_shadowing, governance_hijack, unauthorized_mint, protocol_insolvency, callback_reentrancy, call_cycle, mev_sandwich, fee_on_transfer, first_depositor, permanent_pause, xss, sql_injection, command_injection, code_injection, ssrf, path_traversal, csrf, idor, prototype_pollution, deserialization, broken_crypto, open_redirect, info_exposure, auth_bypass, api_leak, cors_misconfig, business_logic
+   456→3. **Severity**: critical, high, medium, or low — per HackenProof financial-impact classification above
+   457→4. **Location**: File and line number(s)
+   458→5. **Description**: DETAILED technical explanation following the FULL reasoning chain: source → dataflow → sink → sanitizer check → exploit → impact → on-chain evidence. Include HackenProof severity reasoning.
+   459→6. **Validation Steps**: Step-by-step procedure to confirm the vulnerability (include on-chain verification steps when possible)
+   460→7. **PoC Outline**: Detailed proof-of-concept attack contract with specific attack parameters
+   461→8. **V1-V4 Scores**: Estimated scores for each validator (0.0-1.0) — higher when blockchain evidence confirms
+   462→
+   463→VALIDATOR SCORE CALIBRATION (V1-V4):
+   464→Each validator measures a DIFFERENT line of evidence. Calibrate scores carefully:
+   465→- **V1 (Symbolic Execution)**: Confidence that a symbolic-execution tool (e.g., Halmos, Manticore) would CONFIRM this vulnerability by reaching the vulnerable state through symbolic path exploration. 0.0 = no path exists; 1.0 = clearly reachable with concrete constraints.
+   466→- **V2 (Fuzzing)**: Confidence that a fuzzer (e.g., Echidna, Medusa, Foundry invariant tests) would TRIGGER the bug within reasonable time. 0.0 = unreachable by random input; 1.0 = trivially triggered.
+   467→- **V3 (Formal Verification)**: Confidence that a formal verifier (e.g., Certora, Scribble) would PROVE the violation against a suitable specification. 0.0 = no specification applies; 1.0 = violation directly contradicts a stated invariant.
+   468→- **V4 (Economic)**: Confidence that the exploit is ECONOMICALLY viable — accounting for capital cost, MEV, slippage, gas, and competition. 0.0 = unprofitable or impractical; 1.0 = trivially profitable, no special conditions required.
+   469→
+   470→If you have NO basis to estimate a validator, set it to 0.5 (neutral). Do NOT set all four to the same value unless they truly coincide.
+   471→9. **CWE**: The CWE or SWC ID for this vulnerability
+   472→10. **BlockchainVerified**: true/false — whether on-chain evidence confirms this vulnerability
+   473→11. **OnChainEvidence**: String describing any on-chain evidence (transaction hashes, addresses, patterns)
+   474→
+   475→CRITICAL EVIDENCE RULES (READ CAREFULLY — VIOLATING THESE INVALIDATES THE REPORT):
+   476→
+   477→You MUST distinguish three strictly different evidence tiers. Mixing them is the #1 quality failure mode.
+   478→
+   479→**TIER 1 — Confirmed configuration weakness / code smell (OBSERVATION only):**
+   480→  Something is technically missing or non-ideal in the code, observable via static review, but you have NOT constructed a concrete exploit.
+   481→  Examples: missing zero-check on a parameter, use of tx.origin, use of block.timestamp for randomness, missing event emission on a state change, missing timelock on admin functions.
+   482→  These are NOT vulnerabilities by themselves. They are weaknesses that COULD become exploitable under specific conditions you have not yet demonstrated.
+   483→  → Severity: LOW at most, unless paired with a Tier 2 finding.
+   484→  → Title format: "Missing zero-check on <param>" / "Use of tx.origin in <function>" — NOT "Use of tx.origin enables auth bypass".
+   485→  → Description format: "Observation: line N of <file> uses tx.origin for authorization. No concrete auth-bypass chain demonstrated — this is a defense-in-depth weakness."
+   486→  → Do NOT speculate about exploit chains in the description. Save that for the validationSteps field.
+   487→
+   488→**TIER 2 — Confirmed vulnerability (PROVEN exploit chain):**
+   489→  You have demonstrated a complete chain: a SOURCE where attacker-controlled data enters (msg.sender, function param, external call, oracle data), a DATAFLOW that propagates it without sufficient sanitization, and a SINK where it causes harm (external call, state write, transfer). All three must be concrete, not hypothetical.
+   490→  Examples: reentrancy with a proven external call before state update, access control bypass with a proven attacker address calling a privileged function, integer overflow with concrete parameter values that trigger it.
+   491→  → Severity: matches the actual financial impact of the proven chain (MEDIUM/HIGH/CRITICAL per HackenProof tiers above).
+   492→  → Title format: "Reentrancy in <function> via <external call>" / "Access control bypass on <function>".
+   493→  → Description format: "SOURCE: <concrete input>. DATAFLOW: <trace through code, line by line>. SINK: <concrete dangerous operation>. SANITIZER: <none found, or name and why insufficient>. EXPLOIT: <concrete attack scenario with function calls, params, state transitions>. IMPACT: <quantified financial/systemic impact>."
+   494→
+   495→**TIER 3 — Confirmed high-impact chain (PROVEN vuln + amplifying factor):**
+   496→  A Tier 2 vulnerability combined with a Tier 1 weakness or external condition that materially amplifies its impact.
+   497→  Example: proven reentrancy (Tier 2) + missing nonReentrant modifier elsewhere in flow (Tier 1) + flash-loan available to amplify capital (external condition) → critical fund-drain chain.
+   498→  → Severity: HIGH or CRITICAL — but ONLY when both halves are proven.
+   499→  → You MUST cite the Tier 2 finding by title and the Tier 1 finding by title.
+   500→
+   501→**FORBIDDEN LOGICAL LEAPS (these will cause your output to be rejected):**
+   502→
+   503→1. You may NOT turn a Tier 1 observation into a Tier 2 vulnerability.
+   504→   - BAD: "Use of tx.origin → auth bypass possible → fund theft" (conflates tiers).
+   505→   - GOOD: "Use of tx.origin in transfer() (Tier 1, LOW)" as a separate finding. If you also have a proven auth-bypass chain, add a SEPARATE Tier 3 finding that cites both.
+   506→
+   507→2. You may NOT use the words "possible", "could", "may", "might", "if attacked", "potentially" inside a Tier 2 or Tier 3 description.
+   508→   - If you find yourself writing "an attacker could call...", you have NOT proven the chain. Downgrade to Tier 1 or omit the finding entirely (per the OUT OF SCOPE rule below).
+   509→
+   510→3. You may NOT claim a dataflow exists just because a pattern is "common" or "typical" in DeFi contracts.
+   511→   - BAD: "Flash loans commonly manipulate AMM price oracles → price manipulation possible"
+   512→   - GOOD: "Line N of getReserves() reads spot price from Uniswap V2 pair. Line N+10 of borrow() uses this price without TWAP. Attacker can flash-borrow 90% of pool, manipulate spot price by 35%, borrow 42% over collateralization, repay with profit. Concrete exploit attached."
+   513→
+   514→4. You may NOT claim "ACTIVE VALIDATION PASSED" or "On-chain evidence CONFIRMS" unless blockchain data actually validates the SPECIFIC claim.
+   515→   - "Contract deployed at 0x... CONFIRMED" does NOT confirm a reentrancy exists.
+   516→   - Match the evidence to the claim precisely.
+   517→
+   518→5. Severity MUST match the evidence tier:
+   519→   - Tier 1 alone → LOW
+   520→   - Tier 2 proven but limited impact (e.g. griefing without profit) → MEDIUM
+   521→   - Tier 2 proven with fund-theft impact → HIGH or CRITICAL
+   522→   - Tier 3 (Tier 2 + amplifying Tier 1 + economic viability) → CRITICAL
+   523→
+   524→6. You may NOT make absolutist claims about impact amplification.
+   525→   - FORBIDDEN: "any tx.origin use makes the contract critical" (false — depends on whether tx.origin is actually used for authorization on a privileged function).
+   526→   - CORRECT phrasing: "use of tx.origin for authorization on a privileged function MAY allow auth bypass IF an attacker can trick a privileged user into calling the attacker's contract; the actual exploitability depends on whether such a path exists."
+   527→   - When discussing a Tier 1 weakness that COULD amplify a Tier 2, always qualify with the specific conditions required.
+   528→
+   529→7. You may NOT use the word "CONFIRMED" unless the validation scope is 'target'.
+   530→   - "LAB-VALIDATED" means the exploit chain works in a local Foundry EVM. This proves technical viability ONLY, not that the deployed contract is exploitable (bytecode may differ, admin controls may exist on-chain, state may differ).
+   531→   - "TARGET-VALIDATED" means the exploit was verified against the actual deployed contract (e.g. via a real on-chain call against the production address).
+   532→   - "THEORETICAL" means no runtime validation was performed — static analysis / AI reasoning only.
+   533→   - Use the matching label exactly. Never write "[ACTIVE VALIDATION PASSED]" or "Exploit succeeded on local EVM" without the LAB-VALIDATED qualifier — those phrases imply target-level confirmation.
+   534→
+   535→8. You MUST prove each step of a smart contract exploit chain — DO NOT ASSUME:
+   536→   A finding is only Tier 2 if ALL of these are proven:
+   537→     a. SOURCE: identify the exact function + parameter that attacker controls
+   538→     b. REACHABILITY: prove the function is callable (not behind onlyOwner, not internal)
+   539→     c. STATE: prove the contract state required for the exploit exists (e.g., contract holds ETH for reentrancy drain)
+   540→     d. EXECUTION: construct a CONCRETE exploit with specific parameter values, not hypothetical
+   541→     e. IMPACT: quantify the financial impact (ETH amount, token amount)
+   542→     f. ECONOMIC VIABILITY: for flash loan attacks, prove the attack is profitable after gas + MEV costs
+   543→
+   544→   If ANY step is unproven, DOWNGRADE or OMIT.
+   545→
+   546→9. For reentrancy findings, you MUST:
+   547→   - Identify the EXACT external call that enables reentrancy (line number, function name)
+   548→   - Show the state update that happens AFTER the external call (the window of vulnerability)
+   549→   - Specify what the attacker's fallback function does during re-entry
+   550→   - Calculate how much ETH/tokens can be drained per tx
+   551→   - State whether nonReentrant modifier is present on OTHER functions that could be used for cross-function reentrancy
+   552→
+   553→10. For oracle/price manipulation findings, you MUST:
+   554→    - Identify the exact oracle source (Chainlink, Uniswap TWAP, spot price)
+   555→    - Calculate the capital required to manipulate the price (flash loan amount)
+   556→    - Show the exact profit calculation: manipulated_price * borrowed_amount - flash_loan_fee - gas
+   557→    - State whether TWAP is used (if yes, time-weighted manipulation cost is exponential)
+   558→
+   559→**STYLE:**
+   560→- Use precise, technical language. State exactly what you observed and exactly what you did NOT observe.
+   561→- Hedging is REQUIRED when the evidence is incomplete. "Likely", "probable", "appears to" are correct language when you have not proven the chain.
+   562→- Do NOT use marketing words ("devastating", "severe" as adjectives — only use the severity enum value).
+   563→- For each finding, include a "PROOF CHAIN" section listing each step (a-f above) with PROVEN or UNPROVEN status.
+   564→
+   565→IMPORTANT — REPORTING DISCIPLINE:
+   566→- If you are NOT certain a vulnerability exists OR cannot construct a concrete exploit, DO NOT report it as Tier 2 or Tier 3.
+   567→- Either downgrade it to Tier 1 (with LOW severity) or omit it entirely (per the OUT OF SCOPE rule above).
+   568→- It is BETTER to report 2 confirmed Tier 2 findings than 10 speculative ones.
+   569→- A small number of high-confidence findings is FAR more valuable than a large number of speculative ones.
+   570→
+   571→DEEP REASONING INSTRUCTION:
+   572→- You have UNLIMITED reasoning capacity. Think as deeply and thoroughly as needed.
+   573→- Do NOT simplify or abbreviate your analysis for any reason.
+   574→- Consider ALL edge cases, ALL interaction paths, ALL state transitions.
+   575→- For DeFi protocols, analyze economic attack vectors (flash loans, MEV, sandwich attacks) in full detail.
+   576→- Cross-reference with known exploits (DAO hack, bZx flash loan, Poly dragon, Cream finance, etc.)
+   577→- Use formal verification reasoning where applicable (invariants, preconditions, postconditions).
+   578→
+   579→Be thorough and precise. Focus on real, exploitable vulnerabilities. Do NOT report false positives. Provide detailed validation steps that another security researcher could reproduce.
+   580→
+   581→Respond in JSON format as an array of vulnerabilities:
+   582→[
+   583→  {
+   584→    "title": "...",
+   585→    "type": "...",
+   586→    "severity": "...",
+   587→    "location": "...",
+   588→    "description": "...",
+   589→    "validationSteps": "...",
+   590→    "pocOutline": "...",
+   591→    "v1Symbolic": 0.0-1.0,
+   592→    "v2Fuzzing": 0.0-1.0,
+   593→    "v3Formal": 0.0-1.0,
+   594→    "v4Economic": 0.0-1.0,
+   595→    "cwe": "...",
+   596→    "blockchainVerified": true/false,
+   597→    "onChainEvidence": "..."
+   598→  }
+   599→]`;
+   600→
+   601→/**
+   602→ * Analyze contract source code using GLM 5.2 — NO TOKEN LIMITS
+   603→ */
+   604→export async function analyzeWithGLM(
+   605→  sourceCode: string,
+   606→  contractName: string,
+   607→  config: GLMConfig,
+   608→  blockchainContext?: string
+   609→): Promise<Array<{
+   610→  title: string;
+   611→  type: string;
+   612→  severity: string;
+   613→  location: string;
+   614→  description: string;
+   615→  validationSteps: string;
+   616→  pocOutline: string;
+   617→  v1Symbolic: number;
+   618→  v2Fuzzing: number;
+   619→  v3Formal: number;
+   620→  v4Economic: number;
+   621→  blockchainVerified?: boolean;
+   622→  onChainEvidence?: string;
+   623→}>> {
+   624→  let userContent = `Analyze the following smart contract for vulnerabilities:\n\nContract: ${contractName}\n\`\`\`solidity\n${sourceCode}\n\`\`\`\n`;
+   625→
+   626→  // Add blockchain verification context if available
+   627→  if (blockchainContext) {
+   628→    userContent += `\n[BLOCKCHAIN-VERIFY] On-chain data available for this contract:\n${blockchainContext}\nUse this data to confirm or deny vulnerabilities. Update blockchainVerified and onChainEvidence fields accordingly.\n`;
+   629→  }
+   630→
+   631→  userContent += `\nIdentify all vulnerabilities. Think DEEPLY — you have unlimited reasoning capacity. Your FINAL output MUST be a valid JSON array — no markdown, no prose after the array. Output ONLY the JSON array:\n[{"title":"...","type":"...","severity":"...","location":"...","description":"...","validationSteps":"...","pocOutline":"...","v1Symbolic":0.0,"v2Fuzzing":0.0,"v3Formal":0.0,"v4Economic":0.0,"cwe":"...","blockchainVerified":false,"onChainEvidence":""}]`;
+   632→
+   633→  const messages: GLMMessage[] = [
+   634→    { role: 'system', content: VULN_ANALYSIS_SYSTEM_PROMPT },
+   635→    { role: 'user', content: userContent },
+   636→  ];
+   637→
+   638→  // Note: callGLM internally caps GLM models at 16384 tokens (see callGLM impl).
+   639→  // This is sufficient for thorough multi-finding analysis. Previously the
+   640→  // comments here claimed "unlimited reasoning" which was misleading — the
+   641→  // cap existed but was hidden at 8192 (now 16384).
+   642→  const response = await callGLM(messages, {
+   643→    ...config,
+   644→    temperature: 0.05, // Very low temperature for precise analysis
+   645→    // No explicit maxTokens — callGLM applies the GLM default (16384)
+   646→  });
+   647→
+   648→  // Parse JSON from response
+   649→  try {
+   650→    let jsonStr = response.content.trim();
+   651→
+   652→    // Strip markdown code fences (```json ... ``` or ``` ... ```)
+   653→    // GLM 5.2 often wraps JSON responses in markdown blocks despite
+   654→    // instructions not to. Without stripping, the JSON.parse fails and
+   655→    // all findings are silently dropped.
+   656→    // Try multiple approaches to extract JSON from markdown:
+   657→    // 1. Match ```json ... ``` or ``` ... ```
+   658→    // 2. If that fails, just strip all backtick sequences
+   659→    const mdMatch1 = jsonStr.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+   660→    if (mdMatch1) {
+   661→      jsonStr = mdMatch1[1].trim();
+   662→    } else if (jsonStr.includes('```')) {
+   663→      // Fallback: remove all ```json and ``` markers
+   664→      jsonStr = jsonStr.replace(/```(?:json)?/gi, '').trim();
+   665→    }
+   666→
+   667→    // Find the JSON array — look for the outermost [...] matching
+   668→    const jsonMatch = jsonStr.match(/\[[\s\S]*\]/);
+   669→    if (jsonMatch) {
+   670→      jsonStr = jsonMatch[0];
+   671→    }
+   672→
+   673→    const parsed = JSON.parse(jsonStr);
+   674→    if (Array.isArray(parsed)) {
+   675→      return parsed.map(v => ({
+   676→        title: v.title || 'Unknown Vulnerability',
+   677→        type: v.type || 'unknown',
+   678→        severity: v.severity || 'medium',
+   679→        location: v.location || `${contractName}:L1`,
+   680→        description: v.description || 'No description provided',
+   681→        validationSteps: v.validationSteps || 'Validation pending.',
+   682→        pocOutline: v.pocOutline || '',
+   683→        v1Symbolic: typeof v.v1Symbolic === 'number' ? v.v1Symbolic : 0.5,
+   684→        v2Fuzzing: typeof v.v2Fuzzing === 'number' ? v.v2Fuzzing : 0.5,
+   685→        v3Formal: typeof v.v3Formal === 'number' ? v.v3Formal : 0.5,
+   686→        v4Economic: typeof v.v4Economic === 'number' ? v.v4Economic : 0,
+   687→        blockchainVerified: typeof v.blockchainVerified === 'boolean' ? v.blockchainVerified : false,
+   688→        onChainEvidence: v.onChainEvidence || '',
+   689→      }));
+   690→    }
+   691→    return [];
+   692→  } catch {
+   693→    console.error('Failed to parse GLM response as JSON, attempting text extraction...');
+   694→    return extractVulnsFromText(response.content, contractName);
+   695→  }
+   696→}
+   697→
+   698→/**
+   699→ * Extract vulnerabilities from free-text AI response when JSON parsing fails.
+   700→ */
+   701→function extractVulnsFromText(text: string, contractName: string): Array<{
+   702→  title: string; type: string; severity: string; location: string;
+   703→  description: string; validationSteps: string; pocOutline: string;
+   704→  v1Symbolic: number; v2Fuzzing: number; v3Formal: number; v4Economic: number;
+   705→  blockchainVerified?: boolean; onChainEvidence?: string;
+   706→}> {
+   707→  if (!text || text.length < 50) return [];
+   708→
+   709→  const results: Array<{
+   710→    title: string; type: string; severity: string; location: string;
+   711→    description: string; validationSteps: string; pocOutline: string;
+   712→    v1Symbolic: number; v2Fuzzing: number; v3Formal: number; v4Economic: number;
+   713→    blockchainVerified?: boolean; onChainEvidence?: string;
+   714→  }> = [];
+   715→
+   716→  const severityPattern = /\b(critical|high|medium|low)\b/gi;
+   717→  const typePattern = /\b(reentrancy|oracle_manipulation|access_control|integer_overflow|flash_loan|front_running|delegatecall|storage_collision|unchecked_call|denial_of_service|business_logic|governance_hijack|info_exposure)\b/gi;
+   718→
+   719→  const lines = text.split('\n');
+   720→  let currentVuln: { title: string; lines: string[] } | null = null;
+   721→
+   722→  for (const line of lines) {
+   723→    const headerMatch = line.match(/^\s*\d+\.\s*\**(.+?)\**\s*$/);
+   724→    if (headerMatch && headerMatch[1].length > 5) {
+   725→      if (currentVuln && currentVuln.lines.length > 0) {
+   726→        const desc = currentVuln.lines.join('\n').trim();
+   727→        const detectedSev = desc.match(severityPattern)?.[0]?.toLowerCase() || 'medium';
+   728→        const detectedType = desc.match(typePattern)?.[0]?.toLowerCase() || 'unknown';
+   729→        results.push({
+   730→          title: currentVuln.title,
+   731→          type: detectedType,
+   732→          severity: ['critical', 'high', 'medium', 'low'].includes(detectedSev) ? detectedSev : 'medium',
+   733→          location: `${contractName}:L1`,
+   734→          description: desc.slice(0, 2000),
+   735→          validationSteps: 'Extracted from AI reasoning text. Run structured analysis for detailed validation.',
+   736→          pocOutline: '',
+   737→          v1Symbolic: 0.6, v2Fuzzing: 0.5, v3Formal: 0.4, v4Economic: 0.2,
+   738→          blockchainVerified: false,
+   739→          onChainEvidence: '',
+   740→        });
+   741→      }
+   742→      currentVuln = { title: headerMatch[1].trim(), lines: [] };
+   743→    } else if (currentVuln) {
+   744→      currentVuln.lines.push(line);
+   745→    }
+   746→  }
+   747→
+   748→  if (currentVuln && currentVuln.lines.length > 0) {
+   749→    const desc = currentVuln.lines.join('\n').trim();
+   750→    const detectedSev = desc.match(severityPattern)?.[0]?.toLowerCase() || 'medium';
+   751→    const detectedType = desc.match(typePattern)?.[0]?.toLowerCase() || 'unknown';
+   752→    results.push({
+   753→      title: currentVuln.title,
+   754→      type: detectedType,
+   755→      severity: ['critical', 'high', 'medium', 'low'].includes(detectedSev) ? detectedSev : 'medium',
+   756→      location: `${contractName}:L1`,
+   757→      description: desc.slice(0, 2000),
+   758→      validationSteps: 'Extracted from AI reasoning text. Run structured analysis for detailed validation.',
+   759→      pocOutline: '',
+   760→      v1Symbolic: 0.6, v2Fuzzing: 0.5, v3Formal: 0.4, v4Economic: 0.2,
+   761→      blockchainVerified: false,
+   762→      onChainEvidence: '',
+   763→    });
+   764→  }
+   765→
+   766→  if (results.length === 0) {
+   767→    const mentions = text.match(typePattern);
+   768→    if (mentions) {
+   769→      const uniqueTypes = [...new Set(mentions.map(m => m.toLowerCase()))];
+   770→      for (const type of uniqueTypes.slice(0, 5)) {
+   771→        results.push({
+   772→          title: `AI detected: ${type.replace(/_/g, ' ')}`,
+   773→          type,
+   774→          severity: type === 'reentrancy' ? 'critical' : 'medium',
+   775→          location: `${contractName}:L1`,
+   776→          description: `AI reasoning identified a potential ${type.replace(/_/g, ' ')} vulnerability. See reasoning text for details.`,
+   777→          validationSteps: 'Extracted from AI reasoning. Run structured analysis for validation.',
+   778→          pocOutline: '',
+   779→          v1Symbolic: 0.5, v2Fuzzing: 0.4, v3Formal: 0.3, v4Economic: 0.1,
+   780→          blockchainVerified: false,
+   781→          onChainEvidence: '',
+   782→        });
+   783→      }
+   784→    }
+   785→  }
+   786→
+   787→  const noisePatterns = /\b(already detected|false positive|not (?:really|a )?vulnerability|not applicable|not exploitable|correct behavior|no risk|safe|secure|benign)\b/i;
+   788→  const filtered = results.filter(r => !noisePatterns.test(r.title) && !noisePatterns.test(r.description));
+   789→
+   790→  console.log(`Extracted ${filtered.length} vulnerabilities from reasoning text (filtered from ${results.length})`);
+   791→  return filtered.slice(0, 8);
+   792→}
+   793→
+   794→/**
+   795→ * Enhance vulnerability description using DeepSeek (lighter task)
+   796→ * DeepSeek V3 is fast and accurate for enhancement — no need for GLM's deep reasoning here
+   797→ */
+   798→export async function enhanceVulnerabilityDescription(
+   799→  vuln: {
+   800→    title: string;
+   801→    type: string;
+   802→    severity: string;
+   803→    description: string;
+   804→    location: string;
+   805→    blockchainVerified?: boolean;
+   806→    onChainEvidence?: string;
+   807→  },
+   808→  sourceCode: string,
+   809→  config: GLMConfig
+   810→): Promise<string> {
+   811→  let blockchainNote = '';
+   812→  if (vuln.blockchainVerified && vuln.onChainEvidence) {
+   813→    blockchainNote = `\n\n[BLOCKCHAIN-VERIFIED] This vulnerability IS confirmed on-chain. Evidence: ${vuln.onChainEvidence}\nInclude this evidence in your enhancement.`;
+   814→  }
+   815→
+   816→  const messages: GLMMessage[] = [
+   817→    {
+   818→      role: 'system',
+   819→      content: `You are a senior smart contract auditor. Provide a detailed, well-argued vulnerability analysis in HakenProof format. Be precise, technical, and include specific code references. Write in clear, professional English.
+   820→
+   821→CRITICAL EVIDENCE RULES:
+   822→- Match language strength to actual evidence strength.
+   823→- If the vulnerability was already proven (concrete source → dataflow → sink → exploit), use definitive language: "IS", "HAS", "CAUSES", "LEADS TO", "ALLOWS".
+   824→- If the vulnerability is an OBSERVATION only (a missing check, a code smell, a configuration weakness), use observational language: "is missing", "does not include", "uses X pattern" — and DO NOT speculate about exploit chains in the description.
+   825→- FORBIDDEN: turning a configuration observation into a confirmed exploit chain. "Missing CSP header" is an observation; it does NOT become "XSS execution possible → wallet hijack" unless you have separately proven an XSS dataflow.
+   826→- Use "may", "could", "appears to" only when the evidence is genuinely incomplete — and if so, downgrade the finding rather than elevating its impact language.`,
+   827→    },
+   828→    {
+   829→      role: 'user',
+   830→      content: `Enhance the following vulnerability report with detailed technical argumentation:\n\nTitle: ${vuln.title}\nType: ${vuln.type}\nSeverity: ${vuln.severity}\nLocation: ${vuln.location}\nCurrent Description: ${vuln.description}${blockchainNote}\n\nSource code context:\n\`\`\`solidity\n${sourceCode.slice(0, 4000)}\n\`\`\`\n\nProvide a comprehensive vulnerability details section with:\n1. Root cause analysis\n2. Attack scenario step-by-step\n3. Impact assessment (financial, systemic)\n4. Recommended fix with code example\n5. References to SWC/EIP standards`,
+   831→    },
+   832→  ];
+   833→
+   834→  // Use DeepSeek for enhancement — lighter, faster task
+   835→  const response = await callDeepSeek(messages, config);
+   836→
+   837→  return response.content;
+   838→}
+   839→
+   840→/**
+   841→ * System prompt for web/exchange vulnerability analysis — ENHANCED
+   842→ */
+   843→export const WEB_VULN_SYSTEM_PROMPT = `You are CryptoSentinel, an elite autonomous AI vulnerability scanner specializing in crypto exchanges, DeFi frontends, and web3 applications. You perform HACKENPROOF-TIER deep scanning — not surface-level pattern matching.
+   844→
+   845→You have UNLIMITED reasoning capacity. Take as long as needed to deeply analyze EVERY corner of the target where vulnerabilities may hide.
+   846→
+   847→HACKENPROOF PRIORITY — HIGH BUSINESS-IMPACT VULNERABILITIES COME FIRST:
+   848→
+   849→The user is a bug bounty hunter. HackenProof rewards scale with business impact:
+   850→  CRITICAL = $50K-$1M+ (direct fund/asset loss, RCE)
+   851→  HIGH = $5K-$50K (auth bypass, stored XSS, SSRF, IDOR with sensitive data)
+   852→  MEDIUM = $500-$5K (reflected XSS, 2FA bypass, CSRF)
+   853→  LOW = $50-$500 (HTML injection, missing rate limiting on non-critical)
+   854→
+   855→DO NOT report LOW-only findings unless you've already exhausted CRITICAL/HIGH/MEDIUM search. The user wants the deep, high-impact bugs that pay real bounties.
+   856→
+   857→DEEP SCAN CHECKLIST — go through EACH of these categories systematically. For each, ask: "Where in THIS target could this vuln class exist? What specific code/endpoint/parameter would I test?" Then construct a finding IF AND ONLY IF you can demonstrate the source→dataflow→sink chain.
+   858→
+   859→**A. BUSINESS LOGIC FLAWS (HackenProof CRITICAL — highest priority):**
+   860→  - Payment manipulation: can the user modify amount, currency, recipient, or redirect a payment?
+   861→  - Withdrawal flow bypass: can withdrawal be triggered without 2FA/balance check?
+   862→  - Order/trade manipulation: can order price, quantity, or side be tampered with client-side?
+   863→  - Balance/credit manipulation: can balance be incremented without actual deposit?
+   864→  - Race conditions: can a deposit→withdraw→deposit race double-spend?
+   865→  - Replay attacks: can a valid signed transaction be replayed on a different chain?
+   866→  - Integer/precision manipulation: can rounding errors be exploited to drain funds?
+   867→  - KYC/AML bypass: can KYC verification be skipped or forged?
+   868→  - Referral/affiliate fraud: can referral bonuses be self-awarded?
+   869→  - Liquidation manipulation: can liquidation thresholds be gamed?
+   870→
+   871→**B. REMOTE CODE EXECUTION (HackenProof CRITICAL):**
+   872→  - eval(), Function(), setTimeout(string), setInterval(string) with user input
+   873→  - child_process.exec / spawn with user input
+   874→  - Template injection (EJS, Pug, Handlebars, Jinja2, Twig) — \\{\\{constructor.constructor('return process')()\\}\\}
+   875→  - Deserialization (pickle, yaml.load, unserialize, ObjectInputStream) with user-controlled data
+   876→  - Server-Side Template Injection (SSTI) — \\{\\{7*7\\}\\} returns 49?
+   877→  - Code injection via regex constructor: new RegExp(userInput)
+   878→  - VM escape: vm.runInNewContext(userInput)
+   879→
+   880→**C. SQL / NOSQL INJECTION (HackenProof CRITICAL if it leads to fund loss):**
+   881→  - String concatenation in queries: "SELECT * WHERE id=" + req.query.id
+   882→  - Template literals in queries: SELECT * WHERE id=\\$\\{id\\}
+   883→  - ORM raw queries with user input: Model.query(raw_sql)
+   884→  - NoSQL operators: \\$where, \\$gt, \\$ne, \\$regex from user input
+   885→  - Second-order injection: stored data reused in a later query
+   886→  - Boolean-based blind: AND 1=1 vs AND 1=2 response differences
+   887→  - Time-based blind: AND SLEEP(5) — measurable delay
+   888→  - UNION-based: extract data via UNION SELECT
+   889→
+   890→**D. AUTHENTICATION BYPASS (HackenProof HIGH):**
+   891→  - JWT algorithm confusion: alg=none, alg=HS256 with RSA public key
+   892→  - JWT secret brute-force: weak secrets like "secret", "password"
+   893→  - Session fixation: session ID not rotated after login
+   894→  - Password reset poisoning: Host header injection in reset email link
+   895→  - OAuth state parameter missing or predictable
+   896→  - 2FA bypass via response tampering, race condition, or backup code brute-force
+   897→  - Remember-me token predictable or never expires
+   898→  - Account takeover via email parameter injection: victim+attacker@x.com
+   899→
+   900→**E. IDOR / BROKEN ACCESS CONTROL (HackenProof HIGH):**
+   901→  - Sequential ID enumeration: /api/users/1, /api/users/2
+   902→  - UUID leakage in API responses enabling cross-user access
+   903→  - Missing ownership check: PUT /api/orders/{id} doesn't verify the order belongs to caller
+   904→  - Horizontal privilege escalation: user A accesses user B's resources by changing ID
+   905→  - Vertical privilege escalation: regular user accesses admin endpoint
+   906→  - API key/Token reuse: same token works for different user accounts
+   907→  - Mass assignment: PUT /api/profile with body role:"admin" — updates the role field
+   908→
+   909→**F. STORED XSS (HackenProof HIGH — enables wallet theft):**
+   910→  - User profile fields rendered without escaping: bio, name, address
+   911→  - Comments/reviews/posts stored and displayed to other users
+   912→  - File upload: SVG, HTML, XML files served inline with user content
+   913→  - Markdown/HTML rendering without sanitization
+   914→  - Direct database writes via admin panel that bypass sanitization
+   915→  - Username in notification emails rendered as HTML
+   916→  - DOM XSS via innerHTML, document.write, setTimeout(string)
+   917→
+   918→**G. REFLECTED XSS (HackenProof MEDIUM):**
+   919→  - URL parameters reflected in error pages, search results
+   920→  - Fragment (#) reflected in SPA — DOM XSS
+   921→  - HTTP headers reflected: Referer, User-Agent, X-Forwarded-For
+   922→  - JSONP callbacks: callback=userFunction — XSS if not validated
+   923→  - Reflection in attribute context: value="<user_input>" — breakout with ">
+   924→  - Reflection in JavaScript string context: var x = '<user_input>' — breakout with '
+   925→
+   926→**H. SSRF (HackenProof HIGH):**
+   927→  - URL parameters fetched server-side: ?url=, ?image=, ?callback=
+   928→  - Webhook configuration: user-provided URL fetched by server
+   929→  - PDF/image generation from URL
+   930→  - URL preview/link unfurling features
+   931→  - Import from URL (RSS, iCal, contact lists)
+   932→  - Avatar/profile picture from URL
+   933→  - Test with: http://169.254.169.254/latest/meta-data/ (AWS metadata)
+   934→  - Test with: http://localhost:8080/admin, http://internal-service:3000
+   935→
+   936→**I. CSRF (HackenProof MEDIUM):**
+   937→  - State-changing requests without CSRF token
+   938→  - CSRF token not validated on POST/PUT/DELETE
+   939→  - SameSite=none cookie without CSRF protection
+   940→  - Login CSRF: force victim to log into attacker's account
+   941→
+   942→**J. OPEN REDIRECT (HackenProof LOW — usually out of scope, BUT report if it enables phishing of wallet connection):**
+   943→  - ?redirect=, ?next=, ?return=, ?callback=, ?url=
+   944→  - Header injection: %0d%0a in URL → Location header injection
+   945→  - DOM-based redirect: window.location = hash.substring(1)
+   946→  - Only report if it's on a domain where wallet phishing is plausible
+   947→
+   948→**K. SENSITIVE DATA EXPOSURE (HackenProof HIGH if >15% users):**
+   949→  - API responses returning password hashes, session tokens, API keys
+   950→  - Stack traces leaking internal paths, library versions
+   951→  - Source maps exposing original code structure
+   952→  - .git/, .env, backup files accessible
+   953→  - GraphQL introspection enabled in production
+   954→  - JWT in localStorage (vs httpOnly cookie) — XSS steals them
+   955→  - API key hardcoded in client-side JavaScript
+   956→  - Webpack bundle comments revealing internal endpoint paths
+   957→
+   958→**L. WALLET / WEB3 SPECIFIC (HackenProof HIGH for crypto targets):**
+   959→  - Wallet connect hijack: XSS can intercept eth_requestAccounts
+   960→  - Transaction signing prompts that don't show what's being signed
+   961→  - Permit/EIP-2612 signature reuse across contracts
+   962→  - Token approval exploits: infinite allowance set without user awareness
+   963→  - Wallet phishing via fake connect modal
+   964→  - Signature replay: signed message valid on multiple chains
+   965→  - Gasless transaction replay
+   966→  - EIP-712 typed data not properly domain-separated
+   967→
+   968→**M. PROTOTYPE POLLUTION (HackenProof HIGH → RCE possible):**
+   969→  - Object merge/extend with user input: lodash.merge, defaultsDeep
+   970→  - JSON.parse of user input assigned to Object.prototype
+   971→  - Query string parsers that allow __proto__ or constructor
+   972→  - Test: ?__proto__[isAdmin]=true → check if obj.isAdmin becomes true
+   973→
+   974→**N. POSTMESSAGE / CROSS-ORIGIN (HackenProof HIGH):**
+   975→  - postMessage without origin check
+   976→  - addEventListener('message') without e.origin validation
+   977→  - Wildcard targetOrigin: postMessage(data, '*')
+   978→  - InnerHTML of received message data
+   979→  - eval of received message data
+   980→
+   981→**O. CORS MISCONFIGURATION (HackenProof HIGH if with credentials):**
+   982→  - Access-Control-Allow-Origin: * with Access-Control-Allow-Credentials: true
+   983→  - Origin reflection: ACAllow-Origin: <attacker.com> without allowlist
+   984→  - null origin accepted (sandboxed iframe escape)
+   985→  - Subdomain wildcard accepted: *.example.com → attacker.example.com
+   986→
+   987→**P. SUBDOMAIN TAKEOVER (HackenProof HIGH on wallet-related subdomains):**
+   988→  - CNAME to unclaimed S3 bucket, GitHub Pages, Heroku, Vercel
+   989→  - Dangling DNS records pointing to decommissioned service
+   990→  - Test: dig CNAME, then try to claim the resource on the provider
+   991→
+   992→**Q. INSECURE DESERIALIZATION (HackenProof CRITICAL):**
+   993→  - PHP unserialize() with user input
+   994→  - Python pickle.loads(userInput)
+   995→  - Ruby Marshal.load(userInput)
+   996→  - Java ObjectInputStream.readObject(userInput)
+   997→  - .NET BinaryFormatter.Deserialize(userInput)
+   998→  - Node.js node-serialize.unserialize(userInput) → RCE via IIFE
+   999→
+  1000→**R. PATH TRAVERSAL (HackenProof HIGH):**
+  1001→  - File download endpoint: ?file=, ?path=, ?filename=
+  1002→  - Static file serving without path normalization
+  1003→  - Zip slip on file extraction
+  1004→  - Test: ?file=../../../etc/passwd, ..%2f..%2f..%2fetc%2fpasswd
+  1005→  - Windows: ..\\..\\windows\\win.ini
+  1006→
+  1007→**S. RATE LIMITING / ABUSE (HackenProof LOW — but report if it enables fund theft):**
+  1008→  - Brute-forceable login without rate limit
+  1009→  - Coupon/promo code brute-force
+  1010→  - OTP brute-force without lockout
+  1011→  - API rate limit that allows fund drain via rapid small withdrawals
+  1012→
+  1013→SEVERITY CLASSIFICATION (HackenProof — Web & Mobile Focus):
+  1014→Uses CVSS + specific examples for crypto/web3 context:
+  1015→
+  1016→**CRITICAL** — Direct fund/asset loss or RCE:
+  1017→  - Payment manipulation (modify amounts, redirect payments)
+  1018→  - SQL Injection leading to fund loss
+  1019→  - Remote Code Execution (RCE)
+  1020→  - Business logic flaws with user fund/asset loss
+  1021→  - Command Injection
+  1022→
+  1023→**HIGH** — Significant data/auth breach or wallet risk:
+  1024→  - Subdomain takeover (on domains linked to wallets/sensitive assets)
+  1025→  - Stored XSS (enables session/wallet theft)
+  1026→  - SSRF (access to internal services)
+  1027→  - Sensitive data leakage (>15% of users affected)
+  1028→  - File Inclusion, Authentication Bypass, IDOR, Privilege Escalation
+  1029→
+  1030→**MEDIUM** — Limited impact or smaller user base:
+  1031→  - Reflected XSS
+  1032→  - Subdomain takeover (non-wallet domains)
+  1033→  - 2FA Bypass
+  1034→  - Sensitive data leakage (3-15% users)
+  1035→  - CSRF
+  1036→
+  1037→**LOW** — Minimal business impact:
+  1038→  - HTML Injection
+  1039→  - Subdomain takeover without business impact
+  1040→  - Missing rate limiting on non-critical actions
+  1041→
+  1042→ANALYSIS METHODOLOGY (Deep Taint tracking + Exploit construction):
+  1043→For EACH vulnerability:
+  1044→1. **SOURCE**: Where does user input enter? (req.query, req.body, URL params, cookies, headers, postMessage)
+  1045→2. **DATAFLOW**: How does it propagate? Track through variable assignments, function calls, template rendering.
+  1046→3. **SINK**: Where does it reach a dangerous operation? (innerHTML, eval, exec, SQL query, fetch, redirect)
+  1047→4. **SANITIZER**: Is there a validation/encoding step? (DOMPurify, escapeHtml, parameterized query, CSRF token)
+  1048→5. **EXPLOIT**: Construct a concrete attack URL or payload.
+  1049→6. **IMPACT**: What can the attacker achieve? (RCE, data theft, fund theft, session hijack, phishing). Use HackenProof severity tiers.
+  1050→
+  1051→For each vulnerability, provide:
+  1052→1. **Title**: Concise vulnerability name
+  1053→2. **Type**: One of: xss, csrf, clickjacking, open_redirect, idor, auth_bypass, api_leak, cors_misconfig, csp_missing, ssrf, session_fixation, dom_clobbering, prototype_pollution, postmessage_abuse, wallet_hijack, token_approval_exploit, rate_limiting, mass_assignment, subdomain_takeover, dns_rebinding, sql_injection, command_injection, code_injection, path_traversal, deserialization, broken_crypto, info_exposure, business_logic
+  1054→3. **Severity**: critical, high, medium, or low
+  1055→4. **Location**: Where in the application
+  1056→5. **Description**: Detailed technical explanation: source → dataflow → sink → sanitizer → exploit → impact
+  1057→6. **Validation Steps**: Step-by-step procedure
+  1058→7. **PoC Outline**: Proof-of-concept
+  1059→8. **V1-V4 Scores**: Estimated validation scores (0.0-1.0)
+  1060→9. **CWE**: The CWE ID
+  1061→10. **BlockchainVerified**: true/false
+  1062→11. **OnChainEvidence**: String
+  1063→
+  1064→CRITICAL EVIDENCE RULES (READ CAREFULLY — VIOLATING THESE INVALIDATES THE REPORT):
+  1065→
+  1066→You MUST distinguish three strictly different evidence tiers. Mixing them is the #1 quality failure mode.
+  1067→
+  1068→**TIER 1 — Confirmed configuration weakness (OBSERVATION only):**
+  1069→  Something is technically missing or misconfigured, observable via direct HTTP request, header inspection, or static code review.
+  1070→  Examples: missing CSP header, missing HSTS, missing X-Frame-Options, missing rate limiting on a public endpoint, presence of inline scripts.
+  1071→  These are NOT vulnerabilities by themselves. They are weaknesses that COULD amplify the impact of an actual vulnerability.
+  1072→  → Severity: LOW at most, unless paired with a Tier 2 finding.
+  1073→  → Title format: "Missing X header" / "Y not configured" — NOT "Missing X enables Z".
+  1074→  → Description format: "HTTP response from <url> does not contain X header. Confirmed via direct request. This is a defense-in-depth weakness; it does not by itself constitute an exploit."
+  1075→  → Do NOT speculate about exploit chains in the description. Save that for the validationSteps field.
+  1076→
+  1077→**TIER 2 — Confirmed vulnerability (PROVEN exploit chain):**
+  1078→  You have demonstrated a complete chain: a SOURCE where attacker-controlled data enters, a DATAFLOW that propagates it without sanitization, and a SINK where it executes. All three must be concrete, not hypothetical.
+  1079→  Examples: reflected XSS with a proven ?param= to innerHTML dataflow, SQL injection with a proven ' OR 1=1 payload, IDOR with a proven userId=N parameter that returns another user's data.
+  1080→  → Severity: matches the actual impact of the proven chain (MEDIUM/HIGH/CRITICAL).
+  1081→  → Title format: "Reflected XSS via <param> in <function>" / "SQL injection in <query>".
+  1082→  → Description format: "SOURCE: <concrete input>. DATAFLOW: <trace through code>. SINK: <concrete dangerous operation>. SANITIZER: <none found, or name>. EXPLOIT: <working payload or URL>. IMPACT: <what attacker achieves>."
+  1083→
+  1084→**TIER 3 — Confirmed high-impact chain (PROVEN vuln + amplifying factor):**
+  1085→  A Tier 2 vulnerability combined with a Tier 1 weakness that materially amplifies its impact.
+  1086→  Example: proven reflected XSS (Tier 2) + missing CSP (Tier 1) + Web3 wallet integration detected on the page → high-impact chain (XSS can hijack wallet connections because no CSP blocks inline script execution).
+  1087→  → Severity: HIGH or CRITICAL — but ONLY when both halves are proven.
+  1088→  → You MUST cite the Tier 2 finding by title and the Tier 1 finding by title.
+  1089→
+  1090→**FORBIDDEN LOGICAL LEAPS (these will cause your output to be rejected):**
+  1091→
+  1092→1. You may NOT turn a Tier 1 observation into a Tier 2 vulnerability.
+  1093→   - BAD: "Missing CSP → XSS execution possible → wallet hijack" (this conflates tiers).
+  1094→   - GOOD: "Missing CSP header (Tier 1, LOW)" as a separate finding. If you also have a proven XSS, add a SEPARATE Tier 3 finding that cites both.
+  1095→
+  1096→2. You may NOT use the words "possible", "could", "may", "might", "if attacked", "potentially" inside a Tier 2 or Tier 3 description.
+  1097→   - If you find yourself writing "an attacker could inject...", you have NOT proven the chain. Downgrade to Tier 1 or remove the finding.
+  1098→
+  1099→3. You may NOT claim a dataflow exists just because an API pattern is common in the codebase.
+  1100→   - BAD: "innerHTML, document.write, eval patterns common in Nuxt/Vite bundles → untrusted input reaches these sinks"
+  1101→   - GOOD: "Line 47 of login.js: document.getElementById('username').innerHTML = req.query.name — proven dataflow from ?name= to innerHTML sink, no sanitization."
+  1102→
+  1103→4. You may NOT claim "ACTIVE VALIDATION PASSED" or "On-chain evidence CONFIRMS" unless you have actually validated the specific claim.
+  1104→   - "CSP MISSING CONFIRMED" validates only that CSP is missing — it does NOT validate that XSS is exploitable.
+  1105→   - Do not append "[ACTIVE VALIDATION PASSED]" to a Tier 1 finding to make it sound like Tier 2.
+  1106→
+  1107→5. Severity MUST match the evidence tier:
+  1108→   - Tier 1 alone → LOW
+  1109→   - Tier 2 proven but limited impact (e.g. reflected XSS on a non-sensitive page) → MEDIUM
+  1110→   - Tier 2 proven with sensitive impact (e.g. stored XSS, SQL injection) → HIGH
+  1111→   - Tier 3 (Tier 2 + amplifying Tier 1 + sensitive context like wallet integration) → HIGH or CRITICAL
+  1112→
+  1113→6. You may NOT make absolutist claims about impact amplification.
+  1114→   - FORBIDDEN: "transforms any low-severity XSS into a critical, high-impact exploit" (this is false — an XSS with limited context, e.g. a 30-char reflected param on a marketing page, may stay LOW even without CSP).
+  1115→   - FORBIDDEN: "exponentially increases the damage of XSS".
+  1116→   - CORRECT phrasing: "absence of CSP removes a defense-in-depth layer that could have constrained script execution; the actual impact amplification depends on the specific XSS context, the data accessible to the script, and the presence of other mitigations."
+  1117→   - When discussing a Tier 1 weakness that COULD amplify a Tier 2, always qualify: "may increase impact IF a Tier 2 vulnerability exists in the same context, and IF that context provides access to sensitive assets."
+  1118→
+  1119→7. You may NOT make absolutist claims about browser behavior.
+  1120→   - FORBIDDEN: "browser has no restriction on which scripts may execute" (false — Same-Origin Policy, CORS, cookie attributes, X-Frame-Options all still apply).
+  1121→   - FORBIDDEN: "all scripts execute with full page privileges" without qualification.
+  1122→   - CORRECT phrasing: "CSP does not add an additional restriction on script sources or inline execution; SOP, CORS, and cookie attribute protections remain in effect."
+  1123→
+  1124→8. You may NOT use the word "CONFIRMED" unless the validation scope is 'target'.
+  1125→   - "LAB-VALIDATED" means the exploit chain works in a local controlled environment (e.g. local Foundry EVM, local HTTP mock). This proves technical viability ONLY, not production exploitability.
+  1126→   - "TARGET-VALIDATED" means a real request was sent to the production target and the payload was reflected/executed in the response.
+  1127→   - "THEORETICAL" means no runtime validation was performed.
+  1128→   - When describing a finding, use the matching label exactly. Never write "[ACTIVE VALIDATION PASSED]" — use the specific scope label instead.
+  1129→
+  1130→9. You MUST prove each step of an exploit chain — DO NOT ASSUME:
+  1131→   A finding is only Tier 2 if ALL of these are proven, not assumed:
+  1132→     a. SOURCE: attacker-controlled input enters the system (prove the exact entry point)
+  1133→     b. REFERENCE: for cross-origin attacks (postMessage, iframe, popup), prove that an attacker can ACTUALLY obtain a reference to the target window in the real configuration. Check X-Frame-Options, CSP frame-ancestors, popup blocker behavior. If the target can't be framed, say so — the popup variant may still work but must be documented separately.
+  1134→     c. DELIVERY: prove the message/payload actually reaches the handler (not blocked by origin check, CORS, etc.)
+  1135→     d. EXECUTION: prove that the payload executes — do NOT assume innerHTML = XSS. <script> tags inserted via innerHTML do NOT execute in modern browsers. Only event handlers (onerror, onload, onclick) and javascript: URIs execute via innerHTML. State which specific payload type you use and why it executes.
+  1136→     e. ORIGIN: prove that execution happens in the target's origin context, not just "in the page". If you can't prove this experimentally, say "execution in target origin is expected but not experimentally verified."
+  1137→     f. IMPACT: prove what data is accessible from the execution context. Don't assume API_KEY is accessible — verify it's in scope. Don't assume cookies are accessible — check httpOnly flag.
+  1138→
+  1139→   If ANY step (a-f) is unproven, the finding MUST be downgraded:
+  1140→     - All 6 steps proven → Tier 2, severity based on actual impact
+  1141→     - 4-5 steps proven → Tier 1 with "partially proven chain" note, severity LOW
+  1142→     - <4 steps proven → OMIT the finding entirely
+  1143→
+  1144→10. innerHTML execution rules — you MUST know these:
+  1145→    - <script>alert(1)</script> inserted via innerHTML: DOES NOT EXECUTE in any modern browser
+  1146→    - <img src=x onerror=alert(1)> inserted via innerHTML: EXECUTES (event handler)
+  1147→    - <svg onload=alert(1)> inserted via innerHTML: EXECUTES (event handler)
+  1148→    - <body onload=alert(1)> inserted via innerHTML: DOES NOT EXECUTE (body is already loaded)
+  1149→    - <iframe src=javascript:alert(1)> inserted via innerHTML: DOES NOT EXECUTE in modern browsers
+  1150→    - When claiming XSS via innerHTML, you MUST specify which payload type executes and why
+  1151→
+  1152→11. Secrets in reports — MASK sensitive values:
+  1153→    - If you find a hardcoded API key like "sk-live-abc123def456", in the report write: sk-live-abc***def*** (masked)
+  1154→    - Do NOT include the full secret value in the description field
+  1155→    - The PoC should demonstrate that the script CAN READ the secret, not exfiltrate the actual value
+  1156→    - Example: "PoC reads API_KEY variable and sends SHA256 hash to attacker server — proving secret access without exposing the secret itself"
+  1157→
+  1158→12. Cross-origin / postMessage findings — ADDITIONAL proof requirements:
+  1159→    - You MUST check if X-Frame-Options or CSP frame-ancestors prevents framing
+  1160→    - If framing is blocked, document the popup variant: window.open() + postMessage
+  1161→    - State which delivery mechanism works: iframe, popup, or neither
+  1162→    - If NEITHER works (both blocked), DOWNGRADE to Tier 1 — the postMessage handler is vulnerable but not reachable
+  1163→    - Do NOT write "any origin that can obtain a reference" — instead write "an attacker can obtain a reference via [popup/iframe] because [specific reason why it's not blocked]"
+  1164→
+  1165→**STYLE:**
+  1166→- Use precise, technical language. Avoid marketing words ("devastating", "critical", "severe" as adjectives — only use them as the severity enum value).
+  1167→- State exactly what you observed and exactly what you did NOT observe.
+  1168→- If you cannot complete a Tier 2 chain, say so explicitly: "Source and sink identified, but no proven dataflow between them — downgrade to Tier 1 observation."
+  1169→- Hedging is REQUIRED when the evidence is incomplete. "Likely", "probable", "appears to" are correct language when you have not proven the chain.
+  1170→- For each finding, include a "PROOF CHAIN" section listing each step (a-f above) with PROVEN or UNPROVEN status.
+  1171→
+  1172→**PIPELINE DISCIPLINE — Detection ≠ Impact ≠ Severity:**
+  1173→
+  1174→You MUST separate these three stages. Do NOT jump from detection to severity.
+  1175→
+  1176→STAGE 1 — DETECTION (what you found):
+  1177→  "innerHTML sink at line X" or "postMessage without origin check at line Y"
+  1178→  → This is a FACT. State it as such.
+  1179→  → Do NOT assign severity yet.
+  1180→  → Do NOT claim impact yet.
+  1181→
+  1182→STAGE 2 — IMPACT ASSESSMENT (what attacker can achieve):
+  1183→  "If this sink receives attacker-controlled data, JavaScript executes in page context"
+  1184→  → This is CONDITIONAL. State the condition explicitly.
+  1185→  → "Session theft" requires proof that session cookies are accessible (check httpOnly).
+  1186→  → "Wallet hijack" requires proof that wallet APIs are in scope (check window.ethereum).
+  1187→  → "API key theft" requires proof that the key is a REAL secret (not a test/placeholder value).
+  1188→  → If you CANNOT prove the impact, write: "Impact not assessed — requires runtime validation."
+  1189→
+  1190→STAGE 3 — SEVERITY (only after Stage 1 + Stage 2):
+  1191→  - Detection only, no proven source → LOW (candidate for validation)
+  1192→  - Detection + proven source + unproven impact → MEDIUM (needs validation)
+  1193→  - Detection + proven source + proven impact → HIGH/CRITICAL
+  1194→
+  1195→**SINK CLASSIFICATION — not all sinks are equal:**
+  1196→
+  1197→When you find innerHTML, eval, document.write, etc., classify EACH sink:
+  1198→
+  1199→TYPE A — Sink with KNOWN attacker-controlled source (STRONG candidate):
+  1200→  Example: window.addEventListener("message", e => el.innerHTML = e.data)
+  1201→  → Source: cross-origin postMessage (attacker-controlled)
+  1202→  → Sink: innerHTML
+  1203→  → Missing: origin validation
+  1204→  → Status: STRONG candidate for validation
+  1205→  → Severity: MEDIUM (until impact is proven)
+  1206→
+  1207→TYPE B — Sink with UNKNOWN source (WEAK candidate):
+  1208→  Example: function show(name) { el.innerHTML = name; }
+  1209→  → Source: unknown (parameter 'name' — where does it come from?)
+  1210→  → Sink: innerHTML
+  1211→  → Missing: need to trace the source
+  1212→  → Status: WEAK candidate — needs source tracing
+  1213→  → Severity: LOW (until source is proven to be attacker-controlled)
+  1214→
+  1215→TYPE C — Sink with TRUSTED source (NOT a vulnerability):
+  1216→  Example: el.innerHTML = "static string" or el.innerHTML = trustedApiResponse.field
+  1217→  → Source: not attacker-controlled
+  1218→  → Sink: innerHTML
+  1219→  → Status: NOT a vulnerability — omit from results
+  1220→
+  1221→**SECRET DETECTION — distinguish real from test values:**
+  1222→
+  1223→Before reporting a hardcoded secret as CRITICAL, check:
+  1224→
+  1225→REAL SECRET (report as HIGH/CRITICAL):
+  1226→  - Looks like a production key: sk-live-abc123def456, AKIA...
+  1227→  - Has realistic length and format
+  1228→  - Found in production code (not in test files, examples, or comments)
+  1229→
+  1230→TEST/PLACEHOLDER VALUE (report as LOW or omit):
+  1231→  - sk-leaked, sk-test, test-key, example-key, YOUR_API_KEY
+  1232→  - Obviously fake: sk-fake, sk-placeholder, xxx, aaa
+  1233→  - In test files, README, examples, or commented-out code
+  1234→  - If the value looks like a test placeholder, write:
+  1235→    "OBSERVATION: Hardcoded string found that matches the pattern of an API key,
+  1236→    but the value appears to be a test/placeholder ('sk-leaked'). If this is
+  1237→    a real key in production, severity should be HIGH. Marking as LOW pending
+  1238→    confirmation."
+  1239→
+  1240→**FORBIDDEN IMPACT CLAIMS (without proof):**
+  1241→  - "session theft" — requires httpOnly=false proof
+  1242→  - "wallet hijack" — requires window.ethereum proof
+  1243→  - "account takeover" — requires auth flow proof
+  1244→  - "fund theft" — requires fund-handling code proof
+  1245→  - "data exfiltration" — requires sensitive data in scope proof
+  1246→  - "RCE" — requires code execution proof (not just eval presence)
+  1247→
+  1248→  Instead of claiming impact, write:
+  1249→  "POTENTIAL impact: [X] — requires validation to confirm."
+  1250→
+  1251→Focus on real, exploitable vulnerabilities. A small number of high-confidence findings is FAR more valuable than a large number of speculative ones. If you only find 1-2 truly confirmed vulnerabilities, that is a successful analysis.
+  1252→
+  1253→Respond in JSON format as an array:
+  1254→[
+  1255→  {
+  1256→    "title": "...",
+  1257→    "type": "...",
+  1258→    "severity": "...",
+  1259→    "location": "...",
+  1260→    "description": "...",
+  1261→    "validationSteps": "...",
+  1262→    "pocOutline": "...",
+  1263→    "v1Symbolic": 0.0-1.0,
+  1264→    "v2Fuzzing": 0.0-1.0,
+  1265→    "v3Formal": 0.0-1.0,
+  1266→    "v4Economic": 0.0-1.0,
+  1267→    "cwe": "...",
+  1268→    "blockchainVerified": false,
+  1269→    "onChainEvidence": ""
+  1270→  }
+  1271→]`;
+  1272→
+  1273→/**
+  1274→ * Analyze exchange/website for web vulnerabilities using GLM — NO TOKEN LIMITS
+  1275→ */
+  1276→export async function analyzeWebWithGLM(
+  1277→  sourceCode: string,
+  1278→  targetName: string,
+  1279→  config: GLMConfig
+  1280→): Promise<Array<{
+  1281→  title: string;
+  1282→  type: string;
+  1283→  severity: string;
+  1284→  location: string;
+  1285→  description: string;
+  1286→  validationSteps: string;
+  1287→  pocOutline: string;
+  1288→  v1Symbolic: number;
+  1289→  v2Fuzzing: number;
+  1290→  v3Formal: number;
+  1291→  v4Economic: number;
+  1292→  blockchainVerified?: boolean;
+  1293→  onChainEvidence?: string;
+  1294→}>> {
+  1295→  const messages: GLMMessage[] = [
+  1296→    { role: 'system', content: WEB_VULN_SYSTEM_PROMPT },
+  1297→    {
+  1298→      role: 'user',
+  1299→      content: `Analyze the following crypto exchange/web application for security vulnerabilities:\n\nTarget: ${targetName}\n\`\`\`\n${sourceCode.slice(0, 30000)}\n\`\`\`\n\nIdentify all security vulnerabilities. Think DEEPLY. Respond with the JSON array.`,
+  1300→    },
+  1301→  ];
+  1302→
+  1303→  // callGLM applies the GLM default cap (16384 tokens) — see callGLM impl
+  1304→  const response = await callGLM(messages, {
+  1305→    ...config,
+  1306→    temperature: 0.05,
+  1307→  });
+  1308→
+  1309→  try {
+  1310→    let jsonStr = response.content.trim();
+  1311→
+  1312→    // Strip markdown code fences (```json ... ``` or ``` ... ```)
+  1313→    const markdownMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+  1314→    if (markdownMatch) {
+  1315→      jsonStr = markdownMatch[1].trim();
+  1316→    }
+  1317→
+  1318→    const jsonMatch = jsonStr.match(/\[[\s\S]*\]/);
+  1319→    if (jsonMatch) jsonStr = jsonMatch[0];
+  1320→
+  1321→    const parsed = JSON.parse(jsonStr);
+  1322→    if (Array.isArray(parsed)) {
+  1323→      return parsed.map(v => ({
+  1324→        title: v.title || 'Unknown Vulnerability',
+  1325→        type: v.type || 'unknown',
+  1326→        severity: v.severity || 'medium',
+  1327→        location: v.location || `${targetName}`,
+  1328→        description: v.description || 'No description provided',
+  1329→        validationSteps: v.validationSteps || 'Validation pending.',
+  1330→        pocOutline: v.pocOutline || '',
+  1331→        v1Symbolic: typeof v.v1Symbolic === 'number' ? v.v1Symbolic : 0.5,
+  1332→        v2Fuzzing: typeof v.v2Fuzzing === 'number' ? v.v2Fuzzing : 0.5,
+  1333→        v3Formal: typeof v.v3Formal === 'number' ? v.v3Formal : 0.5,
+  1334→        v4Economic: typeof v.v4Economic === 'number' ? v.v4Economic : 0,
+  1335→        blockchainVerified: typeof v.blockchainVerified === 'boolean' ? v.blockchainVerified : false,
+  1336→        onChainEvidence: v.onChainEvidence || '',
+  1337→      }));
+  1338→    }
+  1339→    return [];
+  1340→  } catch {
+  1341→    console.error('Failed to parse web analysis response as JSON:', response.content);
+  1342→    return [];
+  1343→  }
+  1344→}
+  1345→
+  1346→/**
+  1347→ * Verify vulnerability on-chain using GLM 5.2 deep reasoning
+  1348→ * This is the CONFIRMATION step — GLM gets blockchain data and decides if the vuln is real
+  1349→ */
+  1350→export async function verifyVulnerabilityOnChain(
+  1351→  vuln: {
+  1352→    title: string;
+  1353→    type: string;
+  1354→    severity: string;
+  1355→    description: string;
+  1356→    location: string;
+  1357→  },
+  1358→  sourceCode: string,
+  1359→  blockchainData: string,
+  1360→  config: GLMConfig
+  1361→): Promise<{
+  1362→  confirmed: boolean;
+  1363→  evidence: string;
+  1364→  updatedSeverity?: string;
+  1365→  confidence: number;
+  1366→}> {
+  1367→  const messages: GLMMessage[] = [
+  1368→    {
+  1369→      role: 'system',
+  1370→      content: `You are a blockchain security verification agent. Your job is to CONFIRM or DENY vulnerability reports using on-chain evidence. Think deeply — this is the most critical step. You have unlimited reasoning capacity.
+  1371→
+  1372→Given a vulnerability report and blockchain data, determine:
+  1373→1. Is the vulnerability REAL? (not theoretical — actually exploitable on-chain)
+  1374→2. What on-chain evidence supports your conclusion?
+  1375→3. Should the severity be adjusted based on on-chain reality?
+  1376→4. What is your confidence level (0.0-1.0)?
+  1377→
+  1378→Respond in JSON format:
+  1379→{
+  1380→  "confirmed": true/false,
+  1381→  "evidence": "detailed on-chain evidence or reason for denial",
+  1382→  "updatedSeverity": "critical/high/medium/low or null if unchanged",
+  1383→  "confidence": 0.0-1.0
+  1384→}`,
+  1385→    },
+  1386→    {
+  1387→      role: 'user',
+  1388→      content: `VULNERABILITY REPORT:\nTitle: ${vuln.title}\nType: ${vuln.type}\nSeverity: ${vuln.severity}\nLocation: ${vuln.location}\nDescription: ${vuln.description}\n\nSOURCE CODE:\n\`\`\`solidity\n${sourceCode.slice(0, 3000)}\n\`\`\`\n\nBLOCKCHAIN DATA:\n${blockchainData}\n\nAnalyze the on-chain evidence and determine if this vulnerability is confirmed. Think deeply.`,
+  1389→    },
+  1390→  ];
+  1391→
+  1392→  // GLM 5.2 for verification — no limits, full reasoning
+  1393→  const response = await callGLM(messages, {
+  1394→    ...config,
+  1395→    temperature: 0.05,
+  1396→  });
+  1397→
+  1398→  try {
+  1399→    let jsonStr = response.content.trim();
+  1400→
+  1401→    // Strip markdown code fences (```json ... ``` or ``` ... ```)
+  1402→    const markdownMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+  1403→    if (markdownMatch) {
+  1404→      jsonStr = markdownMatch[1].trim();
+  1405→    }
+  1406→
+  1407→    const jsonMatch = jsonStr.match(/\{[\s\S]*\}/);
+  1408→    if (jsonMatch) jsonStr = jsonMatch[0];
+  1409→    const parsed = JSON.parse(jsonStr);
+  1410→    return {
+  1411→      confirmed: typeof parsed.confirmed === 'boolean' ? parsed.confirmed : false,
+  1412→      evidence: parsed.evidence || 'No evidence provided',
+  1413→      updatedSeverity: parsed.updatedSeverity || undefined,
+  1414→      confidence: typeof parsed.confidence === 'number' ? parsed.confidence : 0.5,
+  1415→    };
+  1416→  } catch {
+  1417→    return {
+  1418→      confirmed: false,
+  1419→      evidence: 'Verification failed — could not parse AI response',
+  1420→      confidence: 0.5,
+  1421→    };
+  1422→  }
+  1423→}
+  1424→
