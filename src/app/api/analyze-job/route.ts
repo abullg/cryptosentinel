@@ -130,15 +130,21 @@ async function runAnalysisInBackground(jobId: string, config: {
 
     await updateJob(20, `Static analysis: ${savedStatic.length} findings`);
 
-    // Phase 2: AI
+    // Phase 2: AI (with 90s hard timeout — if GLM hangs, continue with static)
     await updateJob(30, 'Starting AI deep analysis...');
     let aiVulns: any[] = [];
     try {
-      aiVulns = isWeb
-        ? await analyzeWebWithGLM(sourceCode.slice(0, 30000), contractName, { apiKey, model })
-        : await analyzeWithGLM(sourceCode, contractName, { apiKey, model }, undefined);
+      // Race GLM against 90s timeout — if it loses, we still have static results
+      const aiPromise = isWeb
+        ? analyzeWebWithGLM(sourceCode.slice(0, 30000), contractName, { apiKey, model })
+        : analyzeWithGLM(sourceCode, contractName, { apiKey, model }, undefined);
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('AI timeout after 90s')), 90_000)
+      );
+      aiVulns = await Promise.race([aiPromise, timeoutPromise]);
     } catch (err: any) {
-      await updateJob(50, `AI error: ${String(err).slice(0, 100)}`);
+      await updateJob(50, `AI error (continuing with static): ${String(err).slice(0, 100)}`);
+      // Don't throw — continue with static findings only
     }
 
     await updateJob(60, `AI found ${aiVulns.length} potential vulnerabilities`);

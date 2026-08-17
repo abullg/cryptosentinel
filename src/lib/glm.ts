@@ -140,7 +140,7 @@ export async function callGLM(
   //   - Construct concrete exploit scenarios
   //   - Cross-reference with known exploits (DAO, bZx, etc.)
   // If still running at 5 min, model is stuck — abort and use partial.
-  const callTimeout = config.timeoutMs || 120_000; // 2 min — enough for deep analysis, prevents 30-min hangs
+  const callTimeout = config.timeoutMs || 60_000; // 60s — if GLM hasn't responded, abort and use static results
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), callTimeout);
   let response: Response;
