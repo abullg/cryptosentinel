@@ -551,9 +551,9 @@ async function validateWebVulnerability(targetUrl: string, vuln: any, sourceCode
           } catch {}
         }
       }
-      // Can't test against API, but key looks real
-      return { confirmed: true, validationScope: 'target',
-        evidence: `Hardcoded key "${value.slice(0,3)}***${value.slice(-3)}" does not match test patterns. It may be a real credential. Could not verify against an API endpoint (no API URL found in source).`,
+      // Can't test against API — NOT CONFIRMED, just observed
+      return { confirmed: false, validationScope: 'target',
+        evidence: `Hardcoded key "${value.slice(0,3)}***${value.slice(-3)}" does not match test patterns — may be real. However, could not verify against an API endpoint (no API URL found in source). SECRET FOUND: YES. CREDENTIAL VALIDATED: NO. EXPLOIT CONFIRMED: NO. Verdict: NOT_CONFIRMED.`,
         requestUrl: targetUrl };
     }
     return { confirmed: false, validationScope: 'target',

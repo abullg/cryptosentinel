@@ -194,25 +194,29 @@ async function runAnalysisInBackground(jobId: string, config: {
           const scope = verification.validationScope || 'theoretical';
 
           if (verification.confirmed) {
-            // EXPLOIT WORKS — binary YES
+            // EXPLOIT CONFIRMED — exploit works
             const newStatus = scope === 'target' ? 'confirmed' : 'validated';
             const label = scope === 'target'
-              ? '[EXPLOIT CONFIRMED ON PRODUCTION] Real HTTP request sent, payload reflected/executed. This vulnerability IS exploitable.'
-              : '[EXPLOIT CONFIRMED IN LAB] Foundry test passed. Exploit chain is viable.';
+              ? '[EXPLOITABLE] Exploit confirmed against production target via real HTTP request.'
+              : '[EXPLOITABLE] Exploit confirmed in lab (Foundry test passed).';
             await db.vulnerability.update({ where: { id: vuln.id },
               data: { confidence: 1, status: newStatus, validationScope: scope,
                 description: vuln.description + `\n\n${label}\n${verification.evidence}` } }).catch(() => {});
             vuln.confidence = 1; vuln.status = newStatus; vuln.validationScope = scope;
-          } else {
-            // EXPLOIT DOES NOT WORK — binary NO
-            const label = scope === 'target'
-              ? '[NOT EXPLOITABLE] Real HTTP request sent to production target. Exploit did NOT succeed. This vulnerability is NOT exploitable.'
-              : '[NOT EXPLOITABLE] Foundry test failed. Exploit does not work.';
+          } else if (scope === 'target' || scope === 'lab') {
+            // TESTED BUT NOT CONFIRMED — either NOT_EXPLOITABLE or NOT_CONFIRMED
+            // If evidence says "NOT_CONFIRMED" → couldn't verify (like API key without endpoint)
+            // If evidence says exploit failed → NOT_EXPLOITABLE
+            const isNotConfirmed = verification.evidence.includes('NOT_CONFIRMED') || verification.evidence.includes('could not verify');
+            const label = isNotConfirmed
+              ? '[NOT_CONFIRMED] Validation ran but could not verify exploit. Finding is suspicious but unproven.'
+              : '[NOT_EXPLOITABLE] Exploit tested and did NOT succeed.';
+            const newStatus = isNotConfirmed ? 'candidate' : 'refuted';
             await db.vulnerability.update({ where: { id: vuln.id },
-              data: { confidence: 0, status: 'refuted',
+              data: { confidence: 0, status: newStatus,
                 validationScope: scope,
                 description: vuln.description + `\n\n${label}\n${verification.evidence}` } }).catch(() => {});
-            vuln.confidence = 0; vuln.validationScope = scope; vuln.status = 'refuted';
+            vuln.confidence = 0; vuln.validationScope = scope; vuln.status = newStatus;
           }
         } catch {
           // VALIDATION ERROR — can't determine, leave as candidate
@@ -226,11 +230,11 @@ async function runAnalysisInBackground(jobId: string, config: {
     }
 
     const allResults = [...savedStatic.map(s => s.vuln), ...savedAi.map(s => s.vuln)];
-    const resultCount = allResults.filter((r: any) => r.status === 'confirmed' || r.status === 'validated').length;
+    const confirmedCount = allResults.filter((r: any) => r.status === 'confirmed' || r.status === 'validated').length;
 
-    await updateJob(100, `Analysis complete: ${allResults.length} total, ${resultCount} high-confidence`);
+    await updateJob(100, `Analysis complete: ${confirmedCount} confirmed exploits, ${allResults.length - confirmedCount} not confirmed`);
     await db.audit.update({ where: { id: auditId }, data: { status: 'completed', findings: allResults.length, completedAt: new Date() } }).catch(() => {});
-    await db.analysisJob.update({ where: { id: jobId }, data: { status: 'completed', resultCount } }).catch(() => {});
+    await db.analysisJob.update({ where: { id: jobId }, data: { status: 'completed', resultCount: confirmedCount } }).catch(() => {});
 
   } catch (err: any) {
     // Fix bug #1: audit lifecycle — always mark as completed or failed
