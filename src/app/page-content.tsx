@@ -520,27 +520,12 @@ export default function CryptoSentinelDashboard() {
     } finally { setLoading(false); }
   };
 
-  /** Fetch with timeout — prevents infinite loading if server hangs
-   *  Default 45s timeout for fetches — generous enough for slow networks.
-   *  Override for specific calls: 15s for 202 status, 10s for polls
-   *  IMPORTANT: Also respects the analysis AbortController signal */
+  /** Fetch with timeout — simple, no abort linking.
+   *  The old analysisAbortRef linking caused 'signal is aborted without reason'
+   *  errors because the ref was never set in the background-job path. */
   const fetchWithTimeout = (url: string, options: RequestInit = {}, timeoutMs: number = 45_000): Promise<Response> => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
-    // Link to analysis abort: if analysis is aborted, this fetch aborts too.
-    // BUT only abort if the analysis signal is ACTUALLY aborted (not just
-    // because the ref changed). This prevents false-positive aborts when
-    // a previous analysis's ref is cleared during cleanup.
-    const analysisSignal = analysisAbortRef.current?.signal;
-    if (analysisSignal) {
-      if (analysisSignal.aborted) {
-        // Analysis already aborted — abort this fetch immediately
-        controller.abort();
-      } else {
-        // Only abort if the SAME signal fires (not a new one)
-        analysisSignal.addEventListener('abort', () => controller.abort(), { once: true });
-      }
-    }
     return fetch(url, { ...options, signal: controller.signal }).finally(() => clearTimeout(timer));
   };
 
