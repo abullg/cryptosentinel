@@ -201,7 +201,7 @@ export async function callGLM(
     // GLM 5.2 reasoning often wraps JSON in markdown fences — strip them
     // before extracting the JSON array.
     let reasoning = message.reasoning;
-    const mdMatch = reasoning.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);
+    const mdMatch = reasoning.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
     if (mdMatch) reasoning = mdMatch[1].trim();
     // Try to extract JSON array from reasoning (some models put the answer there)
     const jsonMatch = reasoning.match(/\[[\s\S]*\]/);
@@ -653,9 +653,15 @@ export async function analyzeWithGLM(
     // GLM 5.2 often wraps JSON responses in markdown blocks despite
     // instructions not to. Without stripping, the JSON.parse fails and
     // all findings are silently dropped.
-    const markdownMatch = jsonStr.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);
-    if (markdownMatch) {
-      jsonStr = markdownMatch[1].trim();
+    // Try multiple approaches to extract JSON from markdown:
+    // 1. Match ```json ... ``` or ``` ... ```
+    // 2. If that fails, just strip all backtick sequences
+    const mdMatch1 = jsonStr.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+    if (mdMatch1) {
+      jsonStr = mdMatch1[1].trim();
+    } else if (jsonStr.includes('```')) {
+      // Fallback: remove all ```json and ``` markers
+      jsonStr = jsonStr.replace(/```(?:json)?/gi, '').trim();
     }
 
     // Find the JSON array — look for the outermost [...] matching
@@ -1304,7 +1310,7 @@ export async function analyzeWebWithGLM(
     let jsonStr = response.content.trim();
 
     // Strip markdown code fences (```json ... ``` or ``` ... ```)
-    const markdownMatch = jsonStr.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);
+    const markdownMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
     if (markdownMatch) {
       jsonStr = markdownMatch[1].trim();
     }
@@ -1393,7 +1399,7 @@ Respond in JSON format:
     let jsonStr = response.content.trim();
 
     // Strip markdown code fences (```json ... ``` or ``` ... ```)
-    const markdownMatch = jsonStr.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);
+    const markdownMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
     if (markdownMatch) {
       jsonStr = markdownMatch[1].trim();
     }
