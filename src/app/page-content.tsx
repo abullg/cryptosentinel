@@ -1116,22 +1116,24 @@ export default function CryptoSentinelDashboard() {
 
           if (status.status === 'completed') {
             addActivity('scan', `Analysis complete: ${status.resultCount} high-confidence findings`, 'success', 'Done', 100);
-            // Fetch results — with retry
+            // Fetch results — with cache-busting timestamp to bypass browser cache
             try {
-              const vulnsRes = await fetch('/api/vulnerabilities');
+              const vulnsRes = await fetch(`/api/vulnerabilities?t=${Date.now()}`);
               if (vulnsRes.ok) {
                 const serverVulns: Vulnerability[] = await vulnsRes.json();
-                const highConf = serverVulns.filter(v => (v.confidence || 0) >= 0.90);
+                const highConf = serverVulns.filter(v => (v.confidence || 0) >= 0.70);
                 if (highConf.length > 0) {
                   setVulns(prev => {
                     const existingIds = new Set(prev.map(v => v.id));
                     const toAdd = highConf.filter((f: any) => !existingIds.has(f.id));
                     return toAdd.length > 0 ? [...toAdd, ...prev] : prev;
                   });
+                  addActivity('scan', `Loaded ${highConf.length} findings into UI`, 'success', `${highConf.length} results`, 100);
+                } else {
+                  addActivity('scan', 'No findings above 70% confidence — try with different input', 'warning', '', 100);
                 }
               }
             } catch (e) {
-              // Results fetch failed — but job completed, don't fail the whole thing
               addActivity('scan', 'Results loaded (some may need refresh)', 'warning', '', 95);
             }
             resolve();
