@@ -153,20 +153,16 @@ async function runAnalysisInBackground(jobId: string, config: {
     for (const v of aiVulns) {
       const hashSig = makeVulnHash(contractId, v.type, v.title);
       try {
-        // AI findings start with LOW confidence — they are HYPOTHESES until validated
-        // The formula gives a baseline, but capped at 0.30 (theoretical)
-        // Only practical validation (Phase 3) can raise confidence above 0.30
-        const raw = 0.30 * (v.v1Symbolic || 0) + 0.25 * (v.v2Fuzzing || 0) + 0.25 * (v.v3Formal || 0) + 0.20 * (v.v4Economic || 0);
-        let confidence = Math.min(raw, 0.30); // Capped at 0.30 — theoretical only
-        let status = 'candidate'; // All AI findings start as candidates
-
         const existing = await db.vulnerability.findFirst({ where: { hashSignature: hashSig } });
         if (existing) continue;
 
+        // BINARY model: no confidence percentages. Status tells the truth.
+        // 'candidate' = AI found something, NOT YET TESTED
         const vuln = await db.vulnerability.create({
           data: { contractId, type: v.type, severity: v.severity || 'medium', title: v.title,
             description: v.description || '', location: v.location || `${contractName}:L1`,
-            confidence, status, v1Symbolic: v.v1Symbolic || null, v2Fuzzing: v.v2Fuzzing || null,
+            confidence: 0, status: 'candidate', // 0 = untested, will be replaced by validation
+            v1Symbolic: v.v1Symbolic || null, v2Fuzzing: v.v2Fuzzing || null,
             v3Formal: v.v3Formal || null, v4Economic: v.v4Economic || null,
             hashSignature: hashSig, patternTag: v.type, target: contractName,
             vulnCategory: CATEGORY_MAP[v.type] || v.type,
@@ -179,20 +175,13 @@ async function runAnalysisInBackground(jobId: string, config: {
 
     await updateJob(75, `Saved ${savedAi.length} AI findings. Starting validation...`);
 
-    // Phase 3: Active validation — PRACTICAL proof, not theoretical scores
-    // This is where we separate THEORETICAL from CONFIRMED:
-    //   - Send real HTTP payloads to the target URL (if available)
-    //   - Run Foundry exploit on local EVM (for smart contracts)
-    //   - Check if the exploit ACTUALLY works
-    //
-    // Confidence model:
-    //   THEORETICAL (no validation): 0.10-0.30 — "AI thinks this might be vulnerable"
-    //   LAB-VALIDATED (Foundry passed): 0.50-0.70 — "exploit works in local EVM"
-    //   TARGET-VALIDATED (HTTP payload confirmed): 0.80-0.95 — "exploit works on production"
+    // Phase 3: BINARY VALIDATION — exploit works or it doesn't. No percentages.
+    //   confirmed = exploit WORKS (real HTTP payload reflected, or Foundry test passed)
+    //   refuted   = exploit DOES NOT WORK (tested, failed)
+    //   candidate = NOT TESTED (no URL, no Solidity, or validation error)
     if (savedAi.length > 0) {
       const verifyPromises = savedAi.map(async ({ vuln, rawFinding: v }: any) => {
         try {
-          // Pass targetUrl in the vuln description so active-validator can find it
           const vulnDesc = targetUrl ? `${v.description}\n\nTarget URL: ${targetUrl}` : v.description;
           const vulnLoc = targetUrl ? `${v.location}\nURL: ${targetUrl}` : v.location;
 
@@ -204,32 +193,31 @@ async function runAnalysisInBackground(jobId: string, config: {
           const scope = verification.validationScope || 'theoretical';
 
           if (verification.confirmed) {
-            // PRACTICALLY CONFIRMED — exploit works
-            // Override theoretical confidence with practical evidence
-            const newConf = scope === 'target' ? 0.90 : scope === 'lab' ? 0.65 : 0.30;
-            const newStatus = scope === 'target' ? 'confirmed' : scope === 'lab' ? 'validated' : 'candidate';
-            const label = scope === 'target' ? '[TARGET-VALIDATED]' : scope === 'lab' ? '[LAB-VALIDATED]' : '[THEORETICAL]';
-            await db.vulnerability.update({ where: { id: vuln.id },
-              data: { confidence: newConf, status: newStatus, validationScope: scope,
-                description: vuln.description + `\n\n${label}\n${verification.evidence}` } }).catch(() => {});
-            vuln.confidence = newConf; vuln.status = newStatus; vuln.validationScope = scope;
-          } else {
-            // Validation ran but exploit did NOT succeed
-            // This is MEANINGFUL NEGATIVE EVIDENCE — if target-validated,
-            // the vulnerability is NOT exploitable on production
-            const newConf = scope === 'target' ? 0.10 : Math.max(vuln.confidence * 0.3, 0.05);
-            const newStatus = 'refuted';
+            // EXPLOIT WORKS — binary YES
+            const newStatus = scope === 'target' ? 'confirmed' : 'validated';
             const label = scope === 'target'
-              ? '[TARGET-TESTED] Exploit did NOT succeed against production target — vulnerability NOT exploitable'
-              : '[LAB-TESTED] Exploit did NOT succeed in lab — likely false positive';
+              ? '[EXPLOIT CONFIRMED ON PRODUCTION] Real HTTP request sent, payload reflected/executed. This vulnerability IS exploitable.'
+              : '[EXPLOIT CONFIRMED IN LAB] Foundry test passed. Exploit chain is viable.';
             await db.vulnerability.update({ where: { id: vuln.id },
-              data: { confidence: newConf, status: newStatus,
+              data: { confidence: 1, status: newStatus, validationScope: scope,
+                description: vuln.description + `\n\n${label}\n${verification.evidence}` } }).catch(() => {});
+            vuln.confidence = 1; vuln.status = newStatus; vuln.validationScope = scope;
+          } else {
+            // EXPLOIT DOES NOT WORK — binary NO
+            const label = scope === 'target'
+              ? '[NOT EXPLOITABLE] Real HTTP request sent to production target. Exploit did NOT succeed. This vulnerability is NOT exploitable.'
+              : '[NOT EXPLOITABLE] Foundry test failed. Exploit does not work.';
+            await db.vulnerability.update({ where: { id: vuln.id },
+              data: { confidence: 0, status: 'refuted',
                 validationScope: scope,
                 description: vuln.description + `\n\n${label}\n${verification.evidence}` } }).catch(() => {});
-            vuln.confidence = newConf; vuln.validationScope = scope; vuln.status = newStatus;
+            vuln.confidence = 0; vuln.validationScope = scope; vuln.status = 'refuted';
           }
         } catch {
-          await db.vulnerability.update({ where: { id: vuln.id }, data: { validationScope: 'theoretical' } }).catch(() => {});
+          // VALIDATION ERROR — can't determine, leave as candidate
+          await db.vulnerability.update({ where: { id: vuln.id },
+            data: { validationScope: 'theoretical',
+              description: vuln.description + '\n\n[UNTESTED] Validation could not run — no URL or test suite available.' } }).catch(() => {});
           vuln.validationScope = 'theoretical';
         }
       });
@@ -237,7 +225,7 @@ async function runAnalysisInBackground(jobId: string, config: {
     }
 
     const allResults = [...savedStatic.map(s => s.vuln), ...savedAi.map(s => s.vuln)];
-    const resultCount = allResults.filter((r: any) => (r.confidence || 0) >= 0.90).length;
+    const resultCount = allResults.filter((r: any) => r.status === 'confirmed' || r.status === 'validated').length;
 
     await updateJob(100, `Analysis complete: ${allResults.length} total, ${resultCount} high-confidence`);
     await db.audit.update({ where: { id: auditId }, data: { status: 'completed', findings: allResults.length, completedAt: new Date() } }).catch(() => {});
