@@ -105,6 +105,41 @@ export function formatOpenRouterError(status: number, body: string, model: strin
 }
 
 /**
+ * Normalize a field value to a string.
+ *
+ * AI models sometimes return string fields as arrays of strings (e.g.
+ * validationSteps: ["1. ...", "2. ..."] instead of a single string).
+ * Prisma schema expects String, so we must coerce. This also handles
+ * the case where the field is missing or null.
+ *
+ * - string → returned as-is
+ * - array  → joined with "\n"
+ * - object → JSON.stringify
+ * - null/undefined → fallback
+ */
+function normalizeString(value: unknown, fallback = ''): string {
+  if (value == null) return fallback;
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) return value.map(s => normalizeString(s, '')).join('\n');
+  if (typeof value === 'object') {
+    try { return JSON.stringify(value); } catch { return fallback; }
+  }
+  return String(value);
+}
+
+/**
+ * Normalize a numeric field — AI sometimes returns numbers as strings.
+ */
+function normalizeNumber(value: unknown, fallback = 0.5): number {
+  if (typeof value === 'number' && !isNaN(value)) return value;
+  if (typeof value === 'string') {
+    const n = parseFloat(value);
+    if (!isNaN(n)) return n;
+  }
+  return fallback;
+}
+
+/**
  * Call GLM via OpenRouter API — NO TOKEN LIMITS by default
  * The model decides how many tokens it needs for full reasoning
  *
@@ -704,19 +739,19 @@ export async function analyzeWithGLM(
     const parsed = JSON.parse(jsonStr);
     if (Array.isArray(parsed)) {
       return parsed.map(v => ({
-        title: v.title || 'Unknown Vulnerability',
-        type: v.type || 'unknown',
-        severity: v.severity || 'medium',
-        location: v.location || `${contractName}:L1`,
-        description: v.description || 'No description provided',
-        validationSteps: v.validationSteps || 'Validation pending.',
-        pocOutline: v.pocOutline || '',
-        v1Symbolic: typeof v.v1Symbolic === 'number' ? v.v1Symbolic : 0.5,
-        v2Fuzzing: typeof v.v2Fuzzing === 'number' ? v.v2Fuzzing : 0.5,
-        v3Formal: typeof v.v3Formal === 'number' ? v.v3Formal : 0.5,
-        v4Economic: typeof v.v4Economic === 'number' ? v.v4Economic : 0,
+        title: normalizeString(v.title, 'Unknown Vulnerability'),
+        type: normalizeString(v.type, 'unknown'),
+        severity: normalizeString(v.severity, 'medium'),
+        location: normalizeString(v.location, `${contractName}:L1`),
+        description: normalizeString(v.description, 'No description provided'),
+        validationSteps: normalizeString(v.validationSteps, 'Validation pending.'),
+        pocOutline: normalizeString(v.pocOutline, ''),
+        v1Symbolic: normalizeNumber(v.v1Symbolic, 0.5),
+        v2Fuzzing: normalizeNumber(v.v2Fuzzing, 0.5),
+        v3Formal: normalizeNumber(v.v3Formal, 0.5),
+        v4Economic: normalizeNumber(v.v4Economic, 0),
         blockchainVerified: typeof v.blockchainVerified === 'boolean' ? v.blockchainVerified : false,
-        onChainEvidence: v.onChainEvidence || '',
+        onChainEvidence: normalizeString(v.onChainEvidence, ''),
       }));
     }
     return [];
@@ -1467,17 +1502,17 @@ export async function analyzeWithGLMDeep(
     const parsed = JSON.parse(jsonStr);
     if (Array.isArray(parsed)) {
       return parsed.map(v => ({
-        title: v.title || 'Deep Vulnerability',
-        type: v.type || 'business_logic',
-        severity: v.severity || 'medium',
-        location: v.location || `${contractName}:L1`,
-        description: v.description || 'No description provided',
-        validationSteps: v.validationSteps || 'Deep validation needed.',
-        pocOutline: v.pocOutline || '',
-        v1Symbolic: typeof v.v1Symbolic === 'number' ? v.v1Symbolic : 0.5,
-        v2Fuzzing: typeof v.v2Fuzzing === 'number' ? v.v2Fuzzing : 0.5,
-        v3Formal: typeof v.v3Formal === 'number' ? v.v3Formal : 0.5,
-        v4Economic: typeof v.v4Economic === 'number' ? v.v4Economic : 0.3,
+        title: normalizeString(v.title, 'Deep Vulnerability'),
+        type: normalizeString(v.type, 'business_logic'),
+        severity: normalizeString(v.severity, 'medium'),
+        location: normalizeString(v.location, `${contractName}:L1`),
+        description: normalizeString(v.description, 'No description provided'),
+        validationSteps: normalizeString(v.validationSteps, 'Deep validation needed.'),
+        pocOutline: normalizeString(v.pocOutline, ''),
+        v1Symbolic: normalizeNumber(v.v1Symbolic, 0.5),
+        v2Fuzzing: normalizeNumber(v.v2Fuzzing, 0.5),
+        v3Formal: normalizeNumber(v.v3Formal, 0.5),
+        v4Economic: normalizeNumber(v.v4Economic, 0.3),
       }));
     }
     return [];
@@ -1525,17 +1560,17 @@ export async function analyzeWebWithGLMDeep(
     const parsed = JSON.parse(jsonStr);
     if (Array.isArray(parsed)) {
       return parsed.map(v => ({
-        title: v.title || 'Deep Vulnerability',
-        type: v.type || 'business_logic',
-        severity: v.severity || 'medium',
-        location: v.location || `${targetName}`,
-        description: v.description || 'No description provided',
-        validationSteps: v.validationSteps || 'Deep validation needed.',
-        pocOutline: v.pocOutline || '',
-        v1Symbolic: typeof v.v1Symbolic === 'number' ? v.v1Symbolic : 0.5,
-        v2Fuzzing: typeof v.v2Fuzzing === 'number' ? v.v2Fuzzing : 0.5,
-        v3Formal: typeof v.v3Formal === 'number' ? v.v3Formal : 0.5,
-        v4Economic: typeof v.v4Economic === 'number' ? v.v4Economic : 0.3,
+        title: normalizeString(v.title, 'Deep Vulnerability'),
+        type: normalizeString(v.type, 'business_logic'),
+        severity: normalizeString(v.severity, 'medium'),
+        location: normalizeString(v.location, `${targetName}`),
+        description: normalizeString(v.description, 'No description provided'),
+        validationSteps: normalizeString(v.validationSteps, 'Deep validation needed.'),
+        pocOutline: normalizeString(v.pocOutline, ''),
+        v1Symbolic: normalizeNumber(v.v1Symbolic, 0.5),
+        v2Fuzzing: normalizeNumber(v.v2Fuzzing, 0.5),
+        v3Formal: normalizeNumber(v.v3Formal, 0.5),
+        v4Economic: normalizeNumber(v.v4Economic, 0.3),
       }));
     }
     return [];
@@ -1596,19 +1631,19 @@ export async function analyzeWebWithGLM(
     const parsed = JSON.parse(jsonStr);
     if (Array.isArray(parsed)) {
       return parsed.map(v => ({
-        title: v.title || 'Unknown Vulnerability',
-        type: v.type || 'unknown',
-        severity: v.severity || 'medium',
-        location: v.location || `${targetName}`,
-        description: v.description || 'No description provided',
-        validationSteps: v.validationSteps || 'Validation pending.',
-        pocOutline: v.pocOutline || '',
-        v1Symbolic: typeof v.v1Symbolic === 'number' ? v.v1Symbolic : 0.5,
-        v2Fuzzing: typeof v.v2Fuzzing === 'number' ? v.v2Fuzzing : 0.5,
-        v3Formal: typeof v.v3Formal === 'number' ? v.v3Formal : 0.5,
-        v4Economic: typeof v.v4Economic === 'number' ? v.v4Economic : 0,
+        title: normalizeString(v.title, 'Unknown Vulnerability'),
+        type: normalizeString(v.type, 'unknown'),
+        severity: normalizeString(v.severity, 'medium'),
+        location: normalizeString(v.location, `${targetName}`),
+        description: normalizeString(v.description, 'No description provided'),
+        validationSteps: normalizeString(v.validationSteps, 'Validation pending.'),
+        pocOutline: normalizeString(v.pocOutline, ''),
+        v1Symbolic: normalizeNumber(v.v1Symbolic, 0.5),
+        v2Fuzzing: normalizeNumber(v.v2Fuzzing, 0.5),
+        v3Formal: normalizeNumber(v.v3Formal, 0.5),
+        v4Economic: normalizeNumber(v.v4Economic, 0),
         blockchainVerified: typeof v.blockchainVerified === 'boolean' ? v.blockchainVerified : false,
-        onChainEvidence: v.onChainEvidence || '',
+        onChainEvidence: normalizeString(v.onChainEvidence, ''),
       }));
     }
     return [];

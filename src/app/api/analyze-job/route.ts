@@ -199,19 +199,40 @@ async function runAnalysisInBackground(jobId: string, config: {
 
         // BINARY model: no confidence percentages. Status tells the truth.
         // 'candidate' = AI found something, NOT YET TESTED
+        // Normalize all string fields — AI sometimes returns arrays for
+        // validationSteps/pocOutline/description. Prisma expects String.
+        const str = (val: any): string => {
+          if (val == null) return '';
+          if (typeof val === 'string') return val;
+          if (Array.isArray(val)) return val.map(s => typeof s === 'string' ? s : String(s)).join('\n');
+          return String(val);
+        };
+        const num = (val: any, fallback = 0.5): number => {
+          if (typeof val === 'number' && !isNaN(val)) return val;
+          if (typeof val === 'string') { const n = parseFloat(val); if (!isNaN(n)) return n; }
+          return fallback;
+        };
         const vuln = await db.vulnerability.create({
-          data: { contractId, type: v.type, severity: v.severity || 'medium', title: v.title,
-            description: v.description || '', location: v.location || `${contractName}:L1`,
-            confidence: 0, status: 'candidate', // 0 = untested, will be replaced by validation
-            v1Symbolic: v.v1Symbolic || null, v2Fuzzing: v.v2Fuzzing || null,
-            v3Formal: v.v3Formal || null, v4Economic: v.v4Economic || null,
-            hashSignature: hashSig, patternTag: v.type, target: contractName,
-            vulnCategory: CATEGORY_MAP[v.type] || v.type,
-            validationSteps: v.validationSteps || '', poc: v.pocOutline || '',
-            pocFilename: `${v.type}_attack.t.sol`, codeSnippet: sourceCode ? sourceCode.slice(0, 200) : null },
+          data: { contractId,
+            type: str(v.type) || 'unknown',
+            severity: str(v.severity) || 'medium',
+            title: str(v.title) || 'Untitled Finding',
+            description: str(v.description) || '',
+            location: str(v.location) || `${contractName}:L1`,
+            confidence: 0, status: 'candidate',
+            v1Symbolic: num(v.v1Symbolic, 0.5), v2Fuzzing: num(v.v2Fuzzing, 0.5),
+            v3Formal: num(v.v3Formal, 0.5), v4Economic: num(v.v4Economic, 0),
+            hashSignature: hashSig, patternTag: str(v.type) || 'unknown', target: contractName,
+            vulnCategory: CATEGORY_MAP[str(v.type)] || str(v.type) || 'unknown',
+            validationSteps: str(v.validationSteps), poc: str(v.pocOutline || v.poc),
+            pocFilename: `${str(v.type) || 'unknown'}_attack.t.sol`,
+            codeSnippet: sourceCode ? sourceCode.slice(0, 200) : null },
         });
         savedAi.push({ vuln, rawFinding: v });
-      } catch {}
+      } catch (err: any) {
+        // Log the error but don't crash — continue saving other findings
+        console.error(`[analyze-job] Failed to save finding "${v?.title}": ${String(err?.message || err).slice(0, 200)}`);
+      }
     }
 
     if (droppedLowSeverity > 0) {
