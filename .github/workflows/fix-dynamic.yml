@@ -1,0 +1,107 @@
+name: Fix Dynamic
+
+on:
+  workflow_dispatch:
+
+jobs:
+  fix:
+    name: Add dynamic=force-dynamic to /api/health and /api/login
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          HOST="${{ secrets.VPS_HOST }}"
+          ssh-keyscan -p 22 -H $HOST >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Add force-dynamic + rebuild + test
+        run: |
+          HOST="${{ secrets.VPS_HOST }}"
+          USER="${{ secrets.VPS_USER || 'root' }}"
+          PORT=22
+          ssh -p $PORT -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 $USER@$HOST bash -s <<'DYN'
+          set -e
+          cd /opt/cryptosentinel
+
+          echo "=== 1. Add force-dynamic to /api/health/route.ts ==="
+          cat > src/app/api/health/route.ts << 'EOF'
+          import { NextResponse } from 'next/server';
+
+          export const dynamic = 'force-dynamic';
+          export const revalidate = 0;
+
+          export async function GET() {
+            const start = Date.now();
+            try {
+              const { db } = await import('@/lib/db');
+              await db.$queryRaw`SELECT 1`;
+              return NextResponse.json({
+                status: 'ok',
+                uptime: process.uptime(),
+                db: 'ok',
+                ms: Date.now() - start,
+                ts: new Date().toISOString(),
+              });
+            } catch (e) {
+              return NextResponse.json({
+                status: 'degraded',
+                db: 'error',
+                error: String(e).slice(0, 200),
+                ms: Date.now() - start,
+                ts: new Date().toISOString(),
+              }, { status: 503 });
+            }
+          }
+          EOF
+          head -5 src/app/api/health/route.ts
+
+          echo ""
+          echo "=== 2. Add force-dynamic to /api/login/route.ts ==="
+          # Insert force-dynamic at the top of the file (after imports)
+          sed -i "/^import { NextRequest/a export const dynamic = 'force-dynamic';\nexport const revalidate = 0;" src/app/api/login/route.ts
+          head -10 src/app/api/login/route.ts
+
+          echo ""
+          echo "=== 3. Stop PM2 + clean cache ==="
+          pm2 delete cryptosentinel 2>&1 | tail -2 || true
+          rm -rf .next/cache .next/server/cache 2>/dev/null || true
+          rm -rf .next  # full clean to bust all caches
+
+          echo ""
+          echo "=== 4. Rebuild ==="
+          export NODE_OPTIONS=--max-old-space-size=2048
+          npx next build 2>&1 | tail -25
+
+          echo ""
+          echo "=== 5. Restart PM2 ==="
+          set -a; . /etc/cryptosentinel.env 2>/dev/null; set +a
+          pm2 start ecosystem.config.js --env production 2>&1 | tail -5
+          pm2 save 2>&1 | tail -2
+          sleep 8
+
+          echo ""
+          echo "=== 6. Test endpoints ==="
+          for path in /api/health /api/login /api/test-key /api/settings /; do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 http://localhost:3000$path 2>/dev/null || echo "000")
+            echo "  $path -> HTTP $CODE"
+          done
+
+          echo ""
+          echo "=== 7. /api/health body ==="
+          curl -s --max-time 10 http://localhost:3000/api/health 2>&1 | head -10
+
+          echo ""
+          echo "=== 8. /api/login GET body ==="
+          curl -s --max-time 10 http://localhost:3000/api/login 2>&1 | head -10
+
+          echo ""
+          echo "=== 9. Headers for /api/health (cache status) ==="
+          curl -sI --max-time 10 http://localhost:3000/api/health 2>&1 | head -15
+
+          echo ""
+          echo "=== DONE ==="
+          DYN
