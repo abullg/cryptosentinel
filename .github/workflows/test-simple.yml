@@ -1,0 +1,85 @@
+name: Test Simple Route
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Replace /api/health with simple version
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          HOST="${{ secrets.VPS_HOST }}"
+          ssh-keyscan -p 22 -H $HOST >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Try simple /api/health + check chunk files
+        run: |
+          HOST="${{ secrets.VPS_HOST }}"
+          USER="${{ secrets.VPS_USER || 'root' }}"
+          PORT=22
+          ssh -p $PORT -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 $USER@$HOST bash -s <<'SMP'
+          set -e
+          cd /opt/cryptosentinel
+
+          echo "=== 1. List ALL route.js files in build ==="
+          find .next/standalone/.next/server -name "route.js" 2>&1
+
+          echo ""
+          echo "=== 2. Read /api/health/route.js content (full) ==="
+          cat .next/standalone/.next/server/app/api/health/route.js 2>&1
+
+          echo ""
+          echo "=== 3. List chunks directory ==="
+          ls -la .next/standalone/.next/server/chunks/ 2>&1 | head -30
+
+          echo ""
+          echo "=== 4. Find any reference to 'health' or 'login' in build files ==="
+          grep -rln "api/health\|api/login" .next/standalone/.next/server/ 2>&1 | head -10
+
+          echo ""
+          echo "=== 5. Find routes-manifest ==="
+          find .next -name "routes-manifest*" -o -name "manifest*" -o -name "*routes*" 2>&1 | head -10
+
+          echo ""
+          echo "=== 6. Check app-paths-manifest ==="
+          find .next -name "app-paths-manifest*" 2>&1
+          cat .next/server/app-paths-manifest.json 2>&1 | head -30
+
+          echo ""
+          echo "=== 7. Replace /api/health with SUPER simple version (no DB import) ==="
+          cat > src/app/api/health/route.ts << 'SIMPLE'
+          import { NextResponse } from 'next/server';
+
+          export async function GET() {
+            return NextResponse.json({
+              status: 'ok',
+              ts: new Date().toISOString(),
+              uptime: process.uptime()
+            });
+          }
+          SIMPLE
+          cat src/app/api/health/route.ts
+
+          echo ""
+          echo "=== 8. Rebuild (just /api/health changed) ==="
+          export NODE_OPTIONS=--max-old-space-size=2048
+          npx next build 2>&1 | tail -15
+
+          echo ""
+          echo "=== 9. Restart PM2 ==="
+          pm2 restart cryptosentinel 2>&1 | tail -3
+          sleep 5
+
+          echo ""
+          echo "=== 10. Test /api/health (simple version) ==="
+          curl -sv --max-time 10 http://localhost:3000/api/health 2>&1 | tail -15
+
+          echo ""
+          echo "=== DONE ==="
+          SMP
