@@ -1,6 +1,5 @@
 name: Deploy to VPS
 
-# Trigger manually via GitHub Actions UI ("Run workflow" button) or on push to main.
 on:
   workflow_dispatch:
     inputs:
@@ -11,7 +10,6 @@ on:
   push:
     branches: [main]
 
-# Cancel in-flight deploys when a new one starts
 concurrency:
   group: vps-deploy
   cancel-in-progress: false
@@ -21,7 +19,6 @@ jobs:
     name: Deploy to VPS
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Only allow deploy from main branch
     if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
 
     steps:
@@ -54,41 +51,61 @@ jobs:
         run: npm run lint
         continue-on-error: true
 
-      - name: Build (TypeScript strict)
+      - name: Build
         run: npm run build
         env:
           DATABASE_URL: file:/tmp/build.db
           OPENROUTER_API_KEY: ''
 
-      - name: Setup SSH
+      - name: Install sshpass (for initial password-based auth)
         run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          # Auto-detect SSH port (Hostinger sometimes uses non-22 ports)
-          HOST="${{ secrets.VPS_HOST }}"
-          for p in 22 2222 65022 6022 1022 3022 5022 22222 2200 22000 65535; do
-            timeout 5 ssh-keyscan -p $p -H $HOST >> ~/.ssh/known_hosts 2>/dev/null || true
-          done
-          cat ~/.ssh/known_hosts | wc -l
-          echo "SSH key + known_hosts configured."
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+          which sshpass
 
-      - name: Detect SSH port
+      - name: Detect SSH port and configure access
         id: ssh_port
         run: |
           HOST="${{ secrets.VPS_HOST }}"
           USER="${{ secrets.VPS_USER || 'root' }}"
+          PASS="${{ secrets.VPS_PASS }}"
           PORT=22
+          # Try common SSH ports
           for p in 22 2222 65022 6022 1022 3022 5022 22222 2200 22000 65535; do
-            echo "Trying port $p..."
-            if timeout 8 ssh -p $p -o StrictHostKeyChecking=no -o ConnectTimeout=6 -o PasswordAuthentication=no -i ~/.ssh/id_ed25519 $USER@$HOST "echo CONNECTED_$p" 2>/dev/null | grep -q "CONNECTED_$p"; then
+            echo "Trying port $p with password auth..."
+            if timeout 10 sshpass -p "$PASS" ssh -p $p -o StrictHostKeyChecking=no -o ConnectTimeout=6 -o PreferredAuthentications=password -o PubkeyAuthentication=no $USER@$HOST "echo CONNECTED_$p" 2>/dev/null | grep -q "CONNECTED_$p"; then
               PORT=$p
-              echo "Found SSH on port $p"
+              echo "Found SSH on port $p (password auth works)"
               break
             fi
           done
           echo "port=$PORT" >> "$GITHUB_OUTPUT"
           echo "user=$USER" >> "$GITHUB_OUTPUT"
+          if [ "$PORT" = "22" ] && ! timeout 10 sshpass -p "$PASS" ssh -p 22 -o StrictHostKeyChecking=no -o ConnectTimeout=6 -o PreferredAuthentications=password -o PubkeyAuthentication=no $USER@$HOST "echo CONNECTED" 2>/dev/null | grep -q CONNECTED; then
+            echo "::error::Could not connect to VPS via password auth on any port."
+            exit 1
+          fi
+
+      - name: Install SSH public key on VPS (so subsequent SSH uses key auth)
+        run: |
+          HOST="${{ secrets.VPS_HOST }}"
+          USER="${{ steps.ssh_port.outputs.user }}"
+          PASS="${{ secrets.VPS_PASS }}"
+          PORT=${{ steps.ssh_port.outputs.port }}
+          # Write the private key to file
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          # Get the public key from the private key
+          PUBKEY=$(ssh-keygen -y -f ~/.ssh/id_ed25519 2>/dev/null)
+          echo "Public key to install: $PUBKEY"
+          # Use sshpass to add the public key to authorized_keys on VPS
+          sshpass -p "$PASS" ssh -p $PORT -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no $USER@$HOST \
+            "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && grep -qF '$PUBKEY' ~/.ssh/authorized_keys || echo '$PUBKEY' >> ~/.ssh/authorized_keys && echo INSTALLED"
+          # Update known_hosts
+          ssh-keyscan -p $PORT -H $HOST >> ~/.ssh/known_hosts 2>/dev/null || true
+          # Test that SSH key auth now works
+          ssh -p $PORT -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 $USER@$HOST "echo KEY_AUTH_WORKS"
 
       - name: Sync repo to VPS
         run: |
@@ -96,12 +113,12 @@ jobs:
           USER=${{ steps.ssh_port.outputs.user }}
           HOST="${{ secrets.VPS_HOST }}"
           REMOTE_DIR="/opt/cryptosentinel"
-          ssh -p $PORT -o StrictHostKeyChecking=no $USER@$HOST "mkdir -p $REMOTE_DIR"
+          ssh -p $PORT -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 $USER@$HOST "mkdir -p $REMOTE_DIR"
           rsync -azP --delete \
             --exclude '.git' \
             --exclude 'node_modules' \
             --exclude '.next' \
-            -e "ssh -p $PORT -o StrictHostKeyChecking=no" \
+            -e "ssh -p $PORT -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519" \
             ./ $USER@$HOST:$REMOTE_DIR/
 
       - name: Install + build + restart on VPS
@@ -110,7 +127,7 @@ jobs:
           USER=${{ steps.ssh_port.outputs.user }}
           HOST="${{ secrets.VPS_HOST }}"
           REMOTE_DIR="/opt/cryptosentinel"
-          ssh -p $PORT -o StrictHostKeyChecking=no $USER@$HOST bash -s << "REMOTE_SCRIPT"
+          ssh -p $PORT -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 $USER@$HOST bash -s << "REMOTE_SCRIPT"
           set -e
           cd $REMOTE_DIR
 
@@ -153,7 +170,6 @@ jobs:
 
       - name: Health check
         run: |
-          # Poll /api/health for up to 2 minutes
           for try in $(seq 1 24); do
             for port in 81 3000 80 443; do
               CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 \
