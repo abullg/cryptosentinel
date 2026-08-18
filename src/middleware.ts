@@ -95,8 +95,11 @@ export function middleware(req: NextRequest) {
   return NextResponse.redirect(loginUrl);
 }
 
+// Run middleware on Node.js runtime (not Edge) — `crypto.timingSafeEqual`
+// is a Node-only API. Edge Runtime doesn't support it.
 // Run on /api/* and root page (not on /_next/* static assets)
 export const config = {
+  runtime: 'nodejs',
   matcher: [
     // Match all API routes
     '/api/:path*',
