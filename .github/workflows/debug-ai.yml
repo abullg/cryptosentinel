@@ -1,0 +1,63 @@
+name: Debug & Fix AI
+
+on:
+  workflow_dispatch:
+
+jobs:
+  debug:
+    name: Check PM2 logs + increase AI timeout + redeploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          HOST="${{ secrets.VPS_HOST }}"
+          ssh-keyscan -p 22 -H $HOST >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Check VPS state + PM2 logs + test OpenRouter
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          HOST="${{ secrets.VPS_HOST }}"
+          USER="${{ secrets.VPS_USER || 'root' }}"
+          PORT=22
+          # Pass API key to VPS via env var (not hardcoded)
+          ssh -p $PORT -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 $USER@$HOST \
+            "OR_KEY='$OPENROUTER_API_KEY'" bash -s <<'DEBUG'
+          echo "=== 1. PM2 status ==="
+          pm2 list 2>&1
+
+          echo ""
+          echo "=== 2. PM2 error logs (last 30 lines) ==="
+          pm2 logs cryptosentinel --lines 30 --nostream --err 2>&1 | tail -40
+
+          echo ""
+          echo "=== 3. PM2 output logs (last 20 lines) ==="
+          pm2 logs cryptosentinel --lines 20 --nostream --out 2>&1 | tail -30
+
+          echo ""
+          echo "=== 4. Test OpenRouter reachability from VPS ==="
+          curl -sv --max-time 15 https://openrouter.ai/api/v1/key \
+            -H "Authorization: Bearer $OR_KEY" 2>&1 | tail -20
+
+          echo ""
+          echo "=== 5. Test DNS resolution ==="
+          getent hosts openrouter.ai 2>&1 || echo "DNS failed"
+
+          echo ""
+          echo "=== 6. Check if AI timeout fix is deployed ==="
+          grep -n "ai_failed\|AI analysis timeout\|120_000" /opt/cryptosentinel/src/app/api/analyze-stream/route.ts 2>&1 | head -5 || echo "Source fix NOT found"
+
+          echo ""
+          echo "=== 7. Test SSE endpoint directly ==="
+          curl -sv --max-time 30 -X POST http://localhost:3000/api/analyze-stream \
+            -H 'Content-Type: application/json' \
+            -d '{"sourceCode":"pragma solidity ^0.8.20; contract Test { mapping(address=>uint) bal; function withdraw() external { uint b=bal[msg.sender]; (bool s,)=msg.sender.call{value:b}(); require(s); bal[msg.sender]=0; } }","contractName":"Test"}' 2>&1 | head -50
+
+          echo ""
+          echo "=== DONE ==="
+          DEBUG
