@@ -1,0 +1,73 @@
+name: Direct Deploy
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: SSH + git pull + rebuild + restart
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          HOST="${{ secrets.VPS_HOST }}"
+          ssh-keyscan -p 22 -H $HOST >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Git pull + rebuild + restart on VPS directly
+        run: |
+          HOST="${{ secrets.VPS_HOST }}"
+          USER="${{ secrets.VPS_USER || 'root' }}"
+          PORT=22
+          ssh -p $PORT -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 $USER@$HOST bash -s <<'DIRECT'
+          set -e
+          cd /opt/cryptosentinel
+
+          echo "=== 1. Git pull latest ==="
+          git fetch origin main 2>&1 | tail -3
+          git reset --hard origin/main 2>&1 | tail -3
+          git log --oneline -3
+
+          echo ""
+          echo "=== 2. Clean + install deps ==="
+          rm -rf .next node_modules
+          npm install 2>&1 | tail -5
+
+          echo ""
+          echo "=== 3. Generate Prisma ==="
+          npx prisma generate 2>&1 | tail -3
+
+          echo ""
+          echo "=== 4. Build ==="
+          export NODE_OPTIONS=--max-old-space-size=2048
+          npx next build 2>&1 | tail -20
+
+          echo ""
+          echo "=== 5. Apply DB schema ==="
+          export DATABASE_URL=file:/data/cryptosentinel.db
+          npx prisma db push 2>&1 | tail -5
+
+          echo ""
+          echo "=== 6. Restart PM2 ==="
+          pm2 delete cryptosentinel 2>&1 | tail -2 || true
+          set -a; . /etc/cryptosentinel.env 2>/dev/null; set +a
+          pm2 start ecosystem.config.js --env production 2>&1 | tail -5
+          pm2 save 2>&1 | tail -2
+          sleep 8
+
+          echo ""
+          echo "=== 7. Verify ==="
+          pm2 list 2>&1 | head -10
+          curl -s --max-time 10 http://localhost:3000/api/settings 2>&1 | head -5
+
+          echo ""
+          echo "=== 8. Check global timeout deployed ==="
+          grep -c "600_000\|GLOBAL TIMEOUT" /opt/cryptosentinel/src/app/api/analyze-stream/route.ts 2>&1 || echo "NOT FOUND"
+
+          echo ""
+          echo "=== DONE ==="
+          DIRECT
