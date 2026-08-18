@@ -227,6 +227,15 @@ export async function analyzeWebApp(
   // ── Phase 6: Crypto/Web3 Pattern Detection ──
   const cryptoPatterns = detectCryptoPatterns(crawlResult.pages, jsResult.bundles);
 
+  // ── Phase 6.5: Extended Detectors (per user request 2026-08-18 — find MORE findings) ──
+  // 13 new detector types: JS library CVEs, WebSocket endpoints, SRI missing,
+  // mixed content, localStorage misuse, autocomplete issues, tabnabbing,
+  // javascript: URIs, comment leaks, internal IP disclosure, cloud buckets,
+  // GraphQL endpoints, inline event handlers.
+  const { runAllExtendedDetectors } = await import('./extended-detectors');
+  const extendedFindings = runAllExtendedDetectors(crawlResult.pages, jsResult.bundles);
+  console.log(`[WebAppAnalyzer] Extended detectors found ${extendedFindings.length} additional patterns`);
+
   // ── Phase 7-10: AI Deep Analysis (if GLM config provided) ──
   // MERGED from 4 passes to 2 passes to halve API round-trips:
   //   Merged Pass 1: Architecture + Vulnerability Hunting (was Pass 1+2)
@@ -237,7 +246,7 @@ export async function analyzeWebApp(
   let aiExploitAnalysis: AiExploitFinding[] = [];
 
   if (glmConfig) {
-    const context = buildAiContext(crawlResult, jsResult, xssSinks, securityHeaders, cryptoPatterns, hostname);
+    const context = buildAiContext(crawlResult, jsResult, xssSinks, securityHeaders, cryptoPatterns, hostname, extendedFindings);
 
     // Merged Pass 1: Architecture + Vuln Hunting in one LLM call
     console.log('[WebAppAnalyzer] Merged AI Pass 1: Architecture + Vulnerability Hunting');
@@ -933,7 +942,7 @@ async function analyzeSecurityHeaders(url: string): Promise<SecurityHeaderAnalys
 
     res.headers.forEach((value, key) => { headers[key.toLowerCase()] = value; });
 
-    // Check critical security headers
+    // Check critical security headers (extended list per user request 2026-08-18)
     if (!headers['content-security-policy']) {
       missing.push('Content-Security-Policy');
       issues.push('No CSP — XSS attacks not mitigated');
@@ -952,7 +961,57 @@ async function analyzeSecurityHeaders(url: string): Promise<SecurityHeaderAnalys
     }
     if (!headers['referrer-policy']) {
       missing.push('Referrer-Policy');
-      issues.push('No Referrer-Policy — potential info leak');
+      issues.push('No Referrer-Policy — potential info leak via Referer');
+    }
+    // NEW: Permissions-Policy (Feature-Policy successor)
+    if (!headers['permissions-policy'] && !headers['feature-policy']) {
+      missing.push('Permissions-Policy');
+      issues.push('No Permissions-Policy — browser features (camera, mic, geolocation) not restricted');
+    }
+    // NEW: X-XSS-Protection (legacy but still relevant for old browsers)
+    if (!headers['x-xss-protection']) {
+      missing.push('X-XSS-Protection');
+      issues.push('No X-XSS-Protection — legacy browsers lack XSS auditor');
+    }
+    // NEW: X-Download-Options (IE-specific, prevents file open directly)
+    if (!headers['x-download-options']) {
+      missing.push('X-Download-Options');
+      issues.push('No X-Download-Options — file downloads may auto-open in IE');
+    }
+    // NEW: Cross-Domain policies (Flash/PDF)
+    if (!headers['x-permitted-cross-domain-policies']) {
+      missing.push('X-Permitted-Cross-Domain-Policies');
+      issues.push('No X-Permitted-Cross-Domain-Policies — Flash/PDF may access domain');
+    }
+    // NEW: X-DNS-Prefetch-Control
+    if (!headers['x-dns-prefetch-control']) {
+      missing.push('X-DNS-Prefetch-Control');
+      issues.push('No X-DNS-Prefetch-Control — DNS prefetch may leak to attackers');
+    }
+    // NEW: Expect-CT (Certificate Transparency)
+    if (!headers['expect-ct']) {
+      missing.push('Expect-CT');
+      issues.push('No Expect-CT — Certificate Transparency not enforced');
+    }
+    // NEW: Cross-Origin-Opener-Policy (process isolation)
+    if (!headers['cross-origin-opener-policy']) {
+      missing.push('Cross-Origin-Opener-Policy');
+      issues.push('No Cross-Origin-Opener-Policy — no process isolation against Spectre');
+    }
+    // NEW: Cross-Origin-Embedder-Policy
+    if (!headers['cross-origin-embedder-policy']) {
+      missing.push('Cross-Origin-Embedder-Policy');
+      issues.push('No Cross-Origin-Embedder-Policy — cross-origin resources not gated');
+    }
+    // NEW: Cross-Origin-Resource-Policy
+    if (!headers['cross-origin-resource-policy']) {
+      missing.push('Cross-Origin-Resource-Policy');
+      issues.push('No Cross-Origin-Resource-Policy — cross-origin no-cors requests allowed');
+    }
+    // NEW: Origin-Agent-Cluster
+    if (!headers['origin-agent-cluster']) {
+      missing.push('Origin-Agent-Cluster');
+      issues.push('No Origin-Agent-Cluster — no origin-level process isolation');
     }
 
     // Flag exposed server info
@@ -962,15 +1021,58 @@ async function analyzeSecurityHeaders(url: string): Promise<SecurityHeaderAnalys
     if (headers['server']) {
       issues.push(`Server: ${headers['server']} — tech fingerprint exposed`);
     }
+    // NEW: X-AspNet-Version
+    if (headers['x-aspnet-version']) {
+      issues.push(`X-AspNet-Version: ${headers['x-aspnet-version']} — .NET version exposed`);
+    }
+    // NEW: X-Generator (Drupal, etc.)
+    if (headers['x-generator']) {
+      issues.push(`X-Generator: ${headers['x-generator']} — CMS version exposed`);
+    }
+    // NEW: Via (proxy disclosure)
+    if (headers['via']) {
+      issues.push(`Via: ${headers['via']} — proxy/CDN disclosed`);
+    }
+    // NEW: Set-Cookie without Secure
+    const setCookie = headers['set-cookie'] || '';
+    if (setCookie && !setCookie.toLowerCase().includes('secure')) {
+      issues.push('Cookie without Secure flag — may be sent over HTTP');
+    }
+    if (setCookie && !setCookie.toLowerCase().includes('httponly')) {
+      issues.push('Cookie without HttpOnly — accessible via JavaScript');
+    }
+    if (setCookie && !setCookie.toLowerCase().includes('samesite')) {
+      issues.push('Cookie without SameSite — vulnerable to CSRF');
+    }
 
-    // Check for weak CSP
+    // Check for weak CSP (extended)
     if (headers['content-security-policy']) {
       const csp = headers['content-security-policy'];
-      if (csp.includes("'unsafe-inline'") || csp.includes("'unsafe-eval'")) {
-        issues.push('CSP contains unsafe-inline or unsafe-eval — weakens XSS protection');
+      if (csp.includes("'unsafe-inline'")) {
+        // Identify which directive has unsafe-inline
+        const directive = csp.match(/(style-src|script-src|default-src)[^;]*'unsafe-inline'/)?.[1] || 'a directive';
+        issues.push(`CSP 'unsafe-inline' in ${directive} — allows inline ${directive === 'style-src' ? 'styles (CSS)' : directive === 'script-src' ? 'scripts (JS)' : 'both'}`);
+      }
+      if (csp.includes("'unsafe-eval'")) {
+        issues.push("CSP 'unsafe-eval' — allows eval() and similar code execution");
       }
       if (csp.includes('*')) {
         issues.push('CSP contains wildcard (*) — effectively no restriction');
+      }
+      if (csp.includes('http:')) {
+        issues.push('CSP allows http: — mixed content attacks possible');
+      }
+      if (csp.includes('data:')) {
+        issues.push('CSP allows data: URIs — XSS via data: URIs possible');
+      }
+      if (!csp.includes("frame-ancestors") && !csp.includes("default-src 'none'")) {
+        issues.push('CSP has no frame-ancestors — clickjacking not CSP-mitigated');
+      }
+      if (!csp.includes('upgrade-insecure-requests')) {
+        issues.push('CSP has no upgrade-insecure-requests — HTTP content not upgraded');
+      }
+      if (!csp.includes('report-uri') && !csp.includes('report-to')) {
+        issues.push('CSP has no reporting endpoint — violations not logged');
       }
     }
   } catch {
@@ -1154,6 +1256,15 @@ interface AiContext {
   jsFindings: string[];
   framework: string;
   hostname: string;
+  // NEW (2026-08-18): extended detector findings — 13 new pattern types
+  // passed to AI so it can produce MORE findings from deterministic signals.
+  extendedFindings?: Array<{
+    type: string;
+    severity: string;
+    title: string;
+    description: string;
+    location?: string;
+  }>;
 }
 
 function buildAiContext(
@@ -1162,7 +1273,8 @@ function buildAiContext(
   xssSinks: XssSink[],
   securityHeaders: SecurityHeaderAnalysis,
   cryptoPatterns: CryptoPattern[],
-  hostname: string
+  hostname: string,
+  extendedFindings: Array<{ type: string; severity: string; title: string; description: string; location?: string }> = [],
 ): AiContext {
   const pagesSummary = crawlResult.pages
     .map(p => `[${p.status}] ${p.url} — ${p.title || '(no title)'} — ${p.scripts.length} scripts, ${p.forms.length} forms, ${p.apiCalls.length} API calls`)
@@ -1184,6 +1296,7 @@ function buildAiContext(
     jsFindings,
     framework: crawlResult.framework,
     hostname,
+    extendedFindings,
   };
 }
 
@@ -1304,6 +1417,16 @@ ${context.securityIssues.join('\n') || 'None'}
 
 == CRYPTO PATTERNS ==
 ${context.cryptoPatterns.map(p => `[${p.risk}] ${p.type}: ${p.description}`).join('\n') || 'None'}
+
+${context.extendedFindings && context.extendedFindings.length > 0 ? `== DETERMINISTIC FINDINGS (from extended detectors — verify exploitability) ==
+${context.extendedFindings.map(f => `[${f.severity.toUpperCase()}] ${f.type}: ${f.title} — ${f.description}${f.location ? ` (at ${f.location})` : ''}`).join('\n')}
+
+These are OBSERVATIONS from pattern matching. Per the IRON RULE, EXPLOITABLE
+verdict requires demonstrated source→dataflow→sink chain with observable
+security impact. For each finding, classify as:
+- "EXPLOITABLE" if you can construct a working exploit
+- "OBSERVATION" if it's a config weakness / pattern match only
+- "FALSE_POSITIVE" if it's not actually exploitable in this context` : ''}
 
 Identify all real, exploitable vulnerabilities. Respond with JSON array.`,
     },

@@ -61,13 +61,13 @@ export interface ValidationResult {
 }
 
 // ─── Verdict constructors — single source of truth ─────────────────
-function exploitConfirmed(evidence: string, extra: Partial<ValidationResult> = {}): ValidationResult {
+export function exploitConfirmed(evidence: string, extra: Partial<ValidationResult> = {}): ValidationResult {
   return { verdict: 'EXPLOITABLE', confirmed: true, evidence, ...extra };
 }
-function exploitRefuted(evidence: string, extra: Partial<ValidationResult> = {}): ValidationResult {
+export function exploitRefuted(evidence: string, extra: Partial<ValidationResult> = {}): ValidationResult {
   return { verdict: 'NOT_EXPLOITABLE', confirmed: false, evidence, ...extra };
 }
-function inconclusive(evidence: string, extra: Partial<ValidationResult> = {}): ValidationResult {
+export function inconclusive(evidence: string, extra: Partial<ValidationResult> = {}): ValidationResult {
   return { verdict: 'INCONCLUSIVE', confirmed: false, evidence, ...extra };
 }
 
@@ -665,6 +665,36 @@ function extractParamFromVuln(vuln: { location: string; description: string }): 
 
 async function validateWebVulnerability(targetUrl: string, vuln: any, sourceCode: string = ''): Promise<ValidationResult> {
   const vulnType = vuln.type.toLowerCase();
+
+  // ─── ADVANCED WEB VULN VALIDATORS (dispatch to advanced-web-validators.ts) ─
+  // These vuln types have dedicated active tests in advanced-web-validators.ts.
+  // Each test sends REAL HTTP payloads and looks for OBSERVABLE SECURITY IMPACT.
+  const ADVANCED_VULN_TYPES = [
+    'xxe', 'xml_external_entity',
+    'jwt_none_alg', 'jwt_vulnerability',
+    'prototype_pollution',
+    'host_header_injection',
+    'cache_poisoning',
+    'graphql_introspection', 'graphql_injection',
+    'file_upload', 'unrestricted_file_upload',
+    'race_condition', 'toctou',
+    'deserialization', 'insecure_deserialization',
+    'rate_limit_bypass',
+    'smtp_injection', 'email_header_injection',
+    'xss_dom', 'dom_xss',
+    'postmessage_abuse',
+  ];
+  if (ADVANCED_VULN_TYPES.includes(vulnType)) {
+    try {
+      const { validateAdvancedWebVuln } = await import('./advanced-web-validators');
+      return await validateAdvancedWebVuln(vulnType, targetUrl);
+    } catch (e: any) {
+      return inconclusive(
+        `[ADVANCED-VALIDATOR-ERROR] Could not run advanced validator for ${vulnType}: ${String(e?.message || e).slice(0, 200)}`,
+        { validationScope: 'theoretical', requestUrl: targetUrl });
+    }
+  }
+
   let testSuite: WebTestPayload | null = null;
   if (vulnType === 'xss') testSuite = XSS_PAYLOADS;
   else if (vulnType === 'sql_injection') testSuite = SQLI_PAYLOADS;
@@ -1281,7 +1311,20 @@ export async function activelyValidate(
     vuln.type === 'csrf' || vuln.type === 'auth_bypass' ||
     vuln.type === 'postmessage_abuse' || vuln.type === 'clickjacking' ||
     vuln.type === 'info_exposure' || vuln.type === 'session_fixation' ||
-    vuln.type === 'idor' || vuln.type === 'mass_assignment';
+    vuln.type === 'idor' || vuln.type === 'mass_assignment' ||
+    // Advanced web vuln types (validated via advanced-web-validators.ts)
+    vuln.type === 'xxe' || vuln.type === 'xml_external_entity' ||
+    vuln.type === 'jwt_none_alg' || vuln.type === 'jwt_vulnerability' ||
+    vuln.type === 'prototype_pollution' ||
+    vuln.type === 'host_header_injection' ||
+    vuln.type === 'cache_poisoning' ||
+    vuln.type === 'graphql_introspection' || vuln.type === 'graphql_injection' ||
+    vuln.type === 'file_upload' || vuln.type === 'unrestricted_file_upload' ||
+    vuln.type === 'race_condition' || vuln.type === 'toctou' ||
+    vuln.type === 'deserialization' || vuln.type === 'insecure_deserialization' ||
+    vuln.type === 'rate_limit_bypass' ||
+    vuln.type === 'smtp_injection' || vuln.type === 'email_header_injection' ||
+    vuln.type === 'xss_dom' || vuln.type === 'dom_xss';
 
   if (isSmartContract) {
     const addressMatch = sourceCode.match(/0x[0-9a-fA-F]{40}/) ||
