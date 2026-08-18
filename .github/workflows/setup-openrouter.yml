@@ -1,0 +1,92 @@
+name: Setup OpenRouter Key
+
+on:
+  workflow_dispatch:
+
+jobs:
+  setup:
+    name: Install OpenRouter API key on VPS + verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          HOST="${{ secrets.VPS_HOST }}"
+          ssh-keyscan -p 22 -H $HOST >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Write API key to VPS env file + restart PM2 + verify
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+        run: |
+          PORT=22
+          # Use env vars (OPENROUTER_API_KEY) — passed via env: above
+          # Write the key to a local temp file first, then scp to VPS
+          echo "OPENROUTER_API_KEY=$OPENROUTER_API_KEY" > /tmp/openrouter.env
+          # SCP the env file to VPS
+          scp -P $PORT -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 /tmp/openrouter.env $VPS_USER@$VPS_HOST:/tmp/openrouter.env
+          # Now SSH and merge it into /etc/cryptosentinel.env, then restart PM2
+          ssh -p $PORT -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 $VPS_USER@$VPS_HOST bash -s <<'SETUP'
+          set -e
+
+          echo "=== 1. Current /etc/cryptosentinel.env ==="
+          if [ -f /etc/cryptosentinel.env ]; then
+            sed 's/=.*/=<set>/' /etc/cryptosentinel.env
+          else
+            echo "  (file doesn't exist, creating)"
+            touch /etc/cryptosentinel.env
+            chmod 600 /etc/cryptosentinel.env
+          fi
+
+          echo ""
+          echo "=== 2. Merge OPENROUTER_API_KEY from /tmp/openrouter.env ==="
+          # Remove old OPENROUTER_API_KEY line if exists
+          sed -i '/^OPENROUTER_API_KEY=/d' /etc/cryptosentinel.env
+          # Append new value from temp file
+          cat /tmp/openrouter.env >> /etc/cryptosentinel.env
+          rm -f /tmp/openrouter.env
+          chmod 600 /etc/cryptosentinel.env
+          echo "  Written. Verifying:"
+          grep -c "^OPENROUTER_API_KEY=sk-or" /etc/cryptosentinel.env && echo "  OK" || echo "  FAIL"
+
+          echo ""
+          echo "=== 3. Final env file (redacted) ==="
+          sed 's/=.*/=<set>/' /etc/cryptosentinel.env
+
+          echo ""
+          echo "=== 4. Restart PM2 with env sourced ==="
+          cd /opt/cryptosentinel
+          pm2 delete cryptosentinel 2>&1 | tail -2 || true
+          set -a; . /etc/cryptosentinel.env; set +a
+          pm2 start ecosystem.config.js --env production 2>&1 | tail -5
+          pm2 save 2>&1 | tail -2
+          sleep 8
+
+          echo ""
+          echo "=== 5. Verify PM2 is running ==="
+          pm2 list 2>&1 | head -10
+
+          echo ""
+          echo "=== 6. Test /api/settings (should show key is configured) ==="
+          curl -s --max-time 10 http://localhost:3000/api/settings 2>&1 | head -50
+
+          echo ""
+          echo "=== 7. Test /api/test-key (validates key against OpenRouter API) ==="
+          curl -s --max-time 30 -X POST http://localhost:3000/api/test-key \
+            -H 'Content-Type: application/json' \
+            -d '{}' 2>&1 | head -30
+
+          echo ""
+          echo "=== 8. Quick AI analysis test (small contract) ==="
+          curl -s --max-time 60 -X POST http://localhost:3000/api/analyze \
+            -H 'Content-Type: application/json' \
+            -d '{"sourceCode":"pragma solidity ^0.8.20; contract Test { mapping(address=>uint) balance; function deposit() external payable { balance[msg.sender] += msg.value; } function withdraw() external { uint b = balance[msg.sender]; (bool s, ) = msg.sender.call{value: b}(''); require(s); balance[msg.sender] = 0; } }","contractName":"Test","phase":"static"}' 2>&1 | head -100
+
+          echo ""
+          echo "=== DONE ==="
+          SETUP
