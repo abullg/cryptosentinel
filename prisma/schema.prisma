@@ -122,3 +122,22 @@ model AnalysisJob {
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 }
+
+// Audit fix HIGH-7: MemoryPattern model — referenced by /api/memory but
+// previously missing from the schema. Every call to /api/memory would throw
+// "PrismaClientValidationError: Unknown model `memoryPattern`".
+model MemoryPattern {
+  id          String   @id @default(cuid())
+  type        String                    // 'static' | 'semantic' | 'anomaly' | 'control-flow'
+  name        String
+  description String?
+  tags        String?
+  chain       String?                  // 'ethereum' | 'bsc' | 'polygon' | null = any
+  severity    String   @default("medium")
+  frequency   Int      @default(1)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([type, name])
+  @@index([frequency])
+}

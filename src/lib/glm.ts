@@ -201,7 +201,9 @@ export async function callGLM(
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${apiKey}`,
-        'HTTP-Referer': 'https://cryptosentinel.app',
+        // Audit fix HIGH-10: was hardcoded 'https://cryptosentinel.app' which
+        // disclosed the production domain. Now reads from env, defaults to localhost.
+        'HTTP-Referer': process.env.CRYPTOSENTINEL_APP_URL || 'http://localhost:3000',
         'X-Title': 'CryptoSentinel',
       },
       body: JSON.stringify(requestBody),

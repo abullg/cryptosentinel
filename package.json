@@ -1,13 +1,13 @@
 {
-  "name": "nextjs_tailwind_shadcn_ts",
-  "version": "0.2.1",
+  "name": "cryptosentinel",
+  "version": "1.0.0",
   "private": true,
   "scripts": {
     "dev": "next dev -p 3000",
     "build": "next build",
-    "start": "mkdir -p /data && npx prisma db push --accept-data-loss && PORT=${PORT:-10000} HOSTNAME=0.0.0.0 node .next/standalone/server.js",
+    "start": "mkdir -p /data && npx prisma db push && PORT=${PORT:-10000} HOSTNAME=0.0.0.0 node .next/standalone/server.js",
     "lint": "eslint .",
-    "db:push": "prisma db push --accept-data-loss",
+    "db:push": "prisma db push",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "db:reset": "prisma migrate reset",
