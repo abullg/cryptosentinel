@@ -684,6 +684,49 @@ async function validateWebVulnerability(targetUrl: string, vuln: any, sourceCode
     'xss_dom', 'dom_xss',
     'postmessage_abuse',
   ];
+
+  // ─── HACKENPROOF VALIDATORS (dispatch to hackenproof-validators.ts) ─
+  // Active tests for ALL HackenProof categories — Web & Mobile, Smart Contracts,
+  // Blockchain Protocols. Each sends REAL HTTP/RPC payloads and looks for
+  // OBSERVABLE SECURITY IMPACT.
+  const HACKENPROOF_VULN_TYPES = [
+    // Web & Mobile
+    'stored_xss', 'xss_stored',
+    'lfi', 'rfi', 'file_inclusion', 'lfi_rfi',
+    'subdomain_takeover', 'dangling_dns',
+    '2fa_bypass', 'twofa_bypass', 'two_factor_bypass',
+    'html_injection',
+    'content_spoofing',
+    'privilege_escalation', 'priv_esc',
+    'mass_assignment',
+    'blind_sqli', 'sqli_blind', 'time_based_sqli',
+    'nosql_injection', 'nosqli',
+    'ssti', 'template_injection',
+    'ldap_injection', 'ldap_inj',
+    'xpath_injection',
+    'csv_injection', 'formula_injection',
+    'http_smuggling', 'request_smuggling',
+    'jwt_weak_secret',
+    'ssrf_metadata',
+    'ssrf_port_scan',
+    'file_upload_bypass',
+    'svg_xss',
+    // Smart Contracts (on-chain — uses RPC)
+    'uninitialized_storage',
+    'block_timestamp_manipulation', 'timestamp_manipulation',
+  ];
+
+  if (HACKENPROOF_VULN_TYPES.includes(vulnType)) {
+    try {
+      const { validateHackenproofVuln } = await import('./hackenproof-validators');
+      return await validateHackenproofVuln(vulnType, targetUrl);
+    } catch (e: any) {
+      return inconclusive(
+        `[HACKENPROOF-VALIDATOR-ERROR] Could not run validator for ${vulnType}: ${String(e?.message || e).slice(0, 200)}`,
+        { validationScope: 'theoretical', requestUrl: targetUrl });
+    }
+  }
+
   if (ADVANCED_VULN_TYPES.includes(vulnType)) {
     try {
       const { validateAdvancedWebVuln } = await import('./advanced-web-validators');
@@ -1324,7 +1367,29 @@ export async function activelyValidate(
     vuln.type === 'deserialization' || vuln.type === 'insecure_deserialization' ||
     vuln.type === 'rate_limit_bypass' ||
     vuln.type === 'smtp_injection' || vuln.type === 'email_header_injection' ||
-    vuln.type === 'xss_dom' || vuln.type === 'dom_xss';
+    vuln.type === 'xss_dom' || vuln.type === 'dom_xss' ||
+    // HackenProof categories — Web & Mobile
+    vuln.type === 'stored_xss' || vuln.type === 'xss_stored' ||
+    vuln.type === 'lfi' || vuln.type === 'rfi' || vuln.type === 'file_inclusion' || vuln.type === 'lfi_rfi' ||
+    vuln.type === 'subdomain_takeover' || vuln.type === 'dangling_dns' ||
+    vuln.type === '2fa_bypass' || vuln.type === 'twofa_bypass' || vuln.type === 'two_factor_bypass' ||
+    vuln.type === 'html_injection' ||
+    vuln.type === 'content_spoofing' ||
+    vuln.type === 'privilege_escalation' || vuln.type === 'priv_esc' ||
+    vuln.type === 'blind_sqli' || vuln.type === 'sqli_blind' || vuln.type === 'time_based_sqli' ||
+    vuln.type === 'nosql_injection' || vuln.type === 'nosqli' ||
+    vuln.type === 'ssti' || vuln.type === 'template_injection' ||
+    vuln.type === 'ldap_injection' || vuln.type === 'ldap_inj' ||
+    vuln.type === 'xpath_injection' ||
+    vuln.type === 'csv_injection' || vuln.type === 'formula_injection' ||
+    vuln.type === 'http_smuggling' || vuln.type === 'request_smuggling' ||
+    vuln.type === 'jwt_weak_secret' ||
+    vuln.type === 'ssrf_metadata' || vuln.type === 'ssrf_port_scan' ||
+    vuln.type === 'file_upload_bypass' ||
+    vuln.type === 'svg_xss' ||
+    // Smart contract (on-chain)
+    vuln.type === 'uninitialized_storage' ||
+    vuln.type === 'block_timestamp_manipulation' || vuln.type === 'timestamp_manipulation';
 
   if (isSmartContract) {
     const addressMatch = sourceCode.match(/0x[0-9a-fA-F]{40}/) ||
