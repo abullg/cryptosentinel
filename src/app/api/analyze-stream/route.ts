@@ -267,6 +267,29 @@ export async function POST(req: NextRequest) {
 
         send('progress', { step: 'ai_start', message: 'Starting AI deep analysis...', percent: 30 });
 
+        // ─── GLOBAL TIMEOUT: entire analysis must complete in 10 min ───
+        // If anything hangs (AI call, crawl, DB write), this fires and
+        // completes the analysis with whatever findings we have.
+        let analysisTimedOut = false;
+        const globalTimeout = setTimeout(() => {
+          analysisTimedOut = true;
+          console.error('[analyze-stream] GLOBAL TIMEOUT (10 min) — completing with current findings');
+          send('progress', { step: 'timeout', message: 'Analysis timeout (10 min) — completing with current findings.', percent: 95 });
+          try {
+            const allCurrent = [...filteredStaticResults, ...aiResults];
+            db.audit.update({
+              where: { id: effectiveAuditId },
+              data: { status: 'completed', completedAt: new Date(), findings: allCurrent.length, confidence: 0 },
+            }).catch(() => {});
+            send('complete', {
+              findings: allCurrent,
+              message: `Analysis timeout after 10 min — ${allCurrent.length} findings saved.`,
+            });
+          } catch {}
+          try { controller.close(); } catch {}
+        }, 600_000); // 10 minutes
+
+        try {
         const isWebAnalysis = targetType === 'exchange';
         const isHackenproof = !!hackenproofContext;
 
@@ -620,11 +643,14 @@ export async function POST(req: NextRequest) {
         });
 
       } catch (e) {
-        send('error', {
-          error: String(e),
-          message: `Analysis failed: ${String(e).slice(0, 200)}`,
-        });
+        if (!analysisTimedOut) {
+          send('error', {
+            error: String(e),
+            message: `Analysis failed: ${String(e).slice(0, 200)}`,
+          });
+        }
       } finally {
+        if (globalTimeout) clearTimeout(globalTimeout);
         if (heartbeatId) clearInterval(heartbeatId);
         try { controller.close(); } catch {}
       }
