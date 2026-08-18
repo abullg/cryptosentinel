@@ -188,6 +188,11 @@ async function runAnalysisInBackground(jobId: string, config: {
     // Pass 2 — DEEP analysis
     let deepVulns: any[] = [];
     try {
+      const deepProgressInterval = setInterval(() => {
+        const elapsed = Math.round((Date.now() - globalStartTime) / 1000);
+        updateJob(50, `AI deep analysis in progress... ${elapsed}s elapsed`).catch(() => {});
+      }, 15_000);
+
       const firstPassSummary = aiVulns.map(v => ({
         title: v.title, type: v.type, severity: v.severity, description: (v.description || '').slice(0, 200),
       }));
@@ -195,11 +200,12 @@ async function runAnalysisInBackground(jobId: string, config: {
         ? analyzeWebWithGLMDeep(sourceCode.slice(0, 30000), contractName, { apiKey, model }, firstPassSummary)
         : analyzeWithGLMDeep(sourceCode, contractName, { apiKey, model }, firstPassSummary);
       const deepTimeout = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('AI pass 2 (deep) timeout after 300s')), 300_000)
+        setTimeout(() => reject(new Error('AI pass 2 (deep) timeout after 60s')), 60_000)
       );
       deepVulns = await Promise.race([deepPromise, deepTimeout]);
+      clearInterval(deepProgressInterval);
     } catch (err: any) {
-      await updateJob(60, `AI pass 2 (deep) error (continuing with pass 1 only): ${String(err).slice(0, 100)}`);
+      await updateJob(60, `AI pass 2 (deep) ${String(err).slice(0, 100)}. Continuing with pass 1 only.`);
     }
 
     if (jobTimedOut) return;
