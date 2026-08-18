@@ -126,13 +126,19 @@ jobs:
           PORT=${{ steps.ssh_port.outputs.port }}
           USER=${{ steps.ssh_port.outputs.user }}
           HOST="${{ secrets.VPS_HOST }}"
+          # Use unquoted heredoc so $REMOTE_DIR is expanded locally before
+          # being sent to the remote shell (quoted heredoc sends literal
+          # $REMOTE_DIR which is undefined on remote → 'cd $REMOTE_DIR' →
+          # falls back to /root → npm ci fails with 'package.json not found').
           REMOTE_DIR="/opt/cryptosentinel"
-          ssh -p $PORT -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 $USER@$HOST bash -s << "REMOTE_SCRIPT"
+          ssh -p $PORT -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 $USER@$HOST bash -s <<REMOTE_SCRIPT
           set -e
           cd $REMOTE_DIR
+          echo "Working dir: \$(pwd)"
 
           # Ensure persistent data dir
           mkdir -p /data /var/log/cryptosentinel
+          chmod 755 /data /var/log/cryptosentinel
 
           # Install deps (npm — bun.lock removed in audit)
           npm ci --omit=dev || npm install --omit=dev
@@ -140,7 +146,8 @@ jobs:
           # Generate Prisma client
           npx prisma generate
 
-          # Build Next.js
+          # Build Next.js (ignoreBuildErrors=true per audit fix — codebase
+          # has pre-existing TS errors in analyze-ai/route.ts union types)
           NODE_OPTIONS=--max-old-space-size=2048 npx next build
 
           # Apply DB schema (no --accept-data-loss — audit fix CRIT-7)
