@@ -140,8 +140,10 @@ jobs:
           mkdir -p /data /var/log/cryptosentinel
           chmod 755 /data /var/log/cryptosentinel
 
-          # Install deps (npm — bun.lock removed in audit)
-          npm ci --omit=dev || npm install --omit=dev
+          # Install deps (npm — bun.lock removed in audit). NO --omit=dev
+          # because the VPS needs to BUILD (next build requires devDeps
+          # like @tailwindcss/postcss, prisma, typescript, etc.)
+          npm ci || npm install
 
           # Generate Prisma client
           npx prisma generate
