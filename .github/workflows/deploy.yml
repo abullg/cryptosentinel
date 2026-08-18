@@ -57,55 +57,37 @@ jobs:
           DATABASE_URL: file:/tmp/build.db
           OPENROUTER_API_KEY: ''
 
-      - name: Install sshpass (for initial password-based auth)
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq sshpass
-          which sshpass
-
-      - name: Detect SSH port and configure access
+      - name: Setup SSH (key auth — already installed on VPS)
         id: ssh_port
         run: |
           HOST="${{ secrets.VPS_HOST }}"
           USER="${{ secrets.VPS_USER || 'root' }}"
-          PASS="${{ secrets.VPS_PASS }}"
           PORT=22
-          # Try common SSH ports
-          for p in 22 2222 65022 6022 1022 3022 5022 22222 2200 22000 65535; do
-            echo "Trying port $p with password auth..."
-            if timeout 10 sshpass -p "$PASS" ssh -p $p -o StrictHostKeyChecking=no -o ConnectTimeout=6 -o PreferredAuthentications=password -o PubkeyAuthentication=no $USER@$HOST "echo CONNECTED_$p" 2>/dev/null | grep -q "CONNECTED_$p"; then
-              PORT=$p
-              echo "Found SSH on port $p (password auth works)"
-              break
-            fi
-          done
-          echo "port=$PORT" >> "$GITHUB_OUTPUT"
-          echo "user=$USER" >> "$GITHUB_OUTPUT"
-          if [ "$PORT" = "22" ] && ! timeout 10 sshpass -p "$PASS" ssh -p 22 -o StrictHostKeyChecking=no -o ConnectTimeout=6 -o PreferredAuthentications=password -o PubkeyAuthentication=no $USER@$HOST "echo CONNECTED" 2>/dev/null | grep -q CONNECTED; then
-            echo "::error::Could not connect to VPS via password auth on any port."
-            exit 1
-          fi
-
-      - name: Install SSH public key on VPS (so subsequent SSH uses key auth)
-        run: |
-          HOST="${{ secrets.VPS_HOST }}"
-          USER="${{ steps.ssh_port.outputs.user }}"
-          PASS="${{ secrets.VPS_PASS }}"
-          PORT=${{ steps.ssh_port.outputs.port }}
-          # Write the private key to file
           mkdir -p ~/.ssh
           echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          # Get the public key from the private key
-          PUBKEY=$(ssh-keygen -y -f ~/.ssh/id_ed25519 2>/dev/null)
-          echo "Public key to install: $PUBKEY"
-          # Use sshpass to add the public key to authorized_keys on VPS
-          sshpass -p "$PASS" ssh -p $PORT -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no $USER@$HOST \
-            "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && grep -qF '$PUBKEY' ~/.ssh/authorized_keys || echo '$PUBKEY' >> ~/.ssh/authorized_keys && echo INSTALLED"
-          # Update known_hosts
           ssh-keyscan -p $PORT -H $HOST >> ~/.ssh/known_hosts 2>/dev/null || true
-          # Test that SSH key auth now works
-          ssh -p $PORT -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 $USER@$HOST "echo KEY_AUTH_WORKS"
+          # Test SSH key auth directly (key was installed in earlier deploys)
+          echo "Testing SSH key auth on port $PORT..."
+          if timeout 15 ssh -p $PORT -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i ~/.ssh/id_ed25519 $USER@$HOST "echo KEY_AUTH_OK"; then
+            echo "SSH key auth works!"
+          else
+            echo "Key auth failed, trying sshpass (password)..."
+            sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+            PASS="${{ secrets.VPS_PASS }}"
+            if timeout 15 sshpass -p "$PASS" ssh -p $PORT -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o PreferredAuthentications=password -o PubkeyAuthentication=no $USER@$HOST "echo PASS_AUTH_OK"; then
+              # Re-install public key via password auth
+              PUBKEY=$(ssh-keygen -y -f ~/.ssh/id_ed25519 2>/dev/null)
+              sshpass -p "$PASS" ssh -p $PORT -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no $USER@$HOST \
+                "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && grep -qF '$PUBKEY' ~/.ssh/authorized_keys || echo '$PUBKEY' >> ~/.ssh/authorized_keys"
+              echo "Public key re-installed via password auth"
+            else
+              echo "::error::Could not connect to VPS via key or password auth."
+              exit 1
+            fi
+          fi
+          echo "port=$PORT" >> "$GITHUB_OUTPUT"
+          echo "user=$USER" >> "$GITHUB_OUTPUT"
 
       - name: Sync repo to VPS
         run: |
