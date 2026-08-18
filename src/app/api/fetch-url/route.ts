@@ -76,16 +76,16 @@ export async function POST(req: Request) {
     // Block private IPs, loopback, link-local, metadata service, sensitive ports.
     // Note: GitHub + block explorer + hackenproof URLs are exempted from
     // PORT blocking (they're 443 anyway) but NOT from IP blocking.
-    const hostname = parsedUrl.hostname.toLowerCase();
-    const isGithub = hostname === 'github.com' || hostname === 'www.github.com'
-      || hostname === 'raw.githubusercontent.com' || hostname === 'api.github.com'
-      || hostname.endsWith('.githubusercontent.com');
-    const isHackenproof = hostname.includes('hackenproof');
-    const isBlockExplorer = /(?:etherscan|bscscan|polygonscan|arbiscan|snowtrace|ftmscan|basescan|optimistic\.etherscan|cronoscan|moonscan|avascan)\.io/.test(hostname)
-      || /(?:explorer)\.(?:near\.org|solana\.com)/.test(hostname)
-      || /(?:suiexplorer|starkscan|blockscout)/.test(hostname);
+    const ssrfHostname = parsedUrl.hostname.toLowerCase();
+    const ssrfIsGithub = ssrfHostname === 'github.com' || ssrfHostname === 'www.github.com'
+      || ssrfHostname === 'raw.githubusercontent.com' || ssrfHostname === 'api.github.com'
+      || ssrfHostname.endsWith('.githubusercontent.com');
+    const ssrfIsHackenproof = ssrfHostname.includes('hackenproof');
+    const ssrfIsBlockExplorer = /(?:etherscan|bscscan|polygonscan|arbiscan|snowtrace|ftmscan|basescan|optimistic\.etherscan|cronoscan|moonscan|avascan)\.io/.test(ssrfHostname)
+      || /(?:explorer)\.(?:near\.org|solana\.com)/.test(ssrfHostname)
+      || /(?:suiexplorer|starkscan|blockscout)/.test(ssrfHostname);
 
-    if (!isGithub && !isHackenproof && !isBlockExplorer) {
+    if (!ssrfIsGithub && !ssrfIsHackenproof && !ssrfIsBlockExplorer) {
       const ssrfCheck = isSsrfBlocked(normalized);
       if (ssrfCheck.blocked) {
         console.warn('[fetch-url] SSRF blocked:', normalized, '→', ssrfCheck.reason);
