@@ -1,0 +1,89 @@
+name: Full Rebuild
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rebuild:
+    name: Full clean rebuild
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          HOST="${{ secrets.VPS_HOST }}"
+          ssh-keyscan -p 22 -H $HOST >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Full clean + rebuild + test
+        run: |
+          HOST="${{ secrets.VPS_HOST }}"
+          USER="${{ secrets.VPS_USER || 'root' }}"
+          PORT=22
+          ssh -p $PORT -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 $USER@$HOST bash -s <<'REB'
+          set -e
+          cd /opt/cryptosentinel
+
+          echo "=== 1. Stop PM2 app ==="
+          pm2 delete cryptosentinel 2>&1 | tail -2 || true
+
+          echo ""
+          echo "=== 2. Nuclear clean: rm -rf node_modules .next ==="
+          rm -rf node_modules .next package-lock.json
+          ls -la node_modules .next 2>&1 | head -5 || echo "Both gone"
+
+          echo ""
+          echo "=== 3. Verify source files exist ==="
+          ls -la src/app/api/health/route.ts src/app/api/login/route.ts
+          ls -la src/app/api/ 2>&1 | head -20
+
+          echo ""
+          echo "=== 4. Check middleware/proxy (should be gone) ==="
+          ls -la src/middleware.ts src/proxy.ts 2>&1 || echo "No middleware/proxy files"
+
+          echo ""
+          echo "=== 5. Fresh npm install (not ci - locks were cleaned) ==="
+          npm install 2>&1 | tail -10
+
+          echo ""
+          echo "=== 6. Generate Prisma client ==="
+          npx prisma generate 2>&1 | tail -5
+
+          echo ""
+          echo "=== 7. Fresh build ==="
+          export NODE_OPTIONS=--max-old-space-size=2048
+          npx next build 2>&1 | tail -30
+
+          echo ""
+          echo "=== 8. Verify route.js in fresh build ==="
+          find .next/standalone/.next/server -name "route.js" 2>&1 | head -25
+
+          echo ""
+          echo "=== 9. Restart PM2 ==="
+          set -a; . /etc/cryptosentinel.env 2>/dev/null; set +a
+          pm2 start ecosystem.config.js --env production 2>&1 | tail -5
+          pm2 save 2>&1 | tail -2
+          sleep 10
+
+          echo ""
+          echo "=== 10. Test all endpoints ==="
+          for path in /api/health /api/login /api/test-key /api/settings /api/projects /api/vulnerabilities /; do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 http://localhost:3000$path 2>/dev/null || echo "000")
+            echo "  $path -> HTTP $CODE"
+          done
+
+          echo ""
+          echo "=== 11. Final /api/health body ==="
+          curl -s --max-time 10 http://localhost:3000/api/health 2>&1
+          echo ""
+
+          echo ""
+          echo "=== 12. PM2 logs (last 30) ==="
+          pm2 logs cryptosentinel --lines 30 --nostream --err 2>&1 | tail -40
+
+          echo ""
+          echo "=== DONE ==="
+          REB
