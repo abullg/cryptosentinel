@@ -948,7 +948,7 @@ async function validateBlockTimestamp(targetUrl: string): Promise<ValidationResu
   // This is more of a source-code analysis than active RPC test
   return inconclusive(
     `[BLOCK-TIMESTAMP] Smart contract time manipulation requires source code analysis ` +
-    `(look for `block.timestamp` in conditions, randomness, or auth). ` +
+    `(look for block.timestamp in conditions, randomness, or auth). ` +
     `Miners can manipulate block.timestamp by ~15 seconds — affects lotteries, time-locks, etc. ` +
     `Verdict: requires source review. Bounty finding: NEEDS MANUAL REVIEW.`,
     { validationScope: 'theoretical', requestUrl: targetUrl });
