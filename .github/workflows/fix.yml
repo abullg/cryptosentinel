@@ -1,0 +1,104 @@
+name: Fix VPS App
+
+# Manual trigger only - runs a deeper diagnostic on the VPS.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  fix:
+    name: Fix CryptoSentinel on VPS
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          HOST="${{ secrets.VPS_HOST }}"
+          ssh-keyscan -p 22 -H $HOST >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Deep diagnostic + install Caddy + try fix
+        run: |
+          HOST="${{ secrets.VPS_HOST }}"
+          USER="${{ secrets.VPS_USER || 'root' }}"
+          PORT=22
+          ssh -p $PORT -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 $USER@$HOST bash -s <<'DIAG_SCRIPT'
+          set +e
+          echo "=== A. Source route files (should list health, login, etc.) ==="
+          ls -la /opt/cryptosentinel/src/app/api/ 2>&1
+          echo ""
+          echo "=== B. Health route file ==="
+          ls -la /opt/cryptosentinel/src/app/api/health/ 2>&1
+          cat /opt/cryptosentinel/src/app/api/health/route.ts 2>&1 | head -20
+          echo ""
+          echo "=== C. Built standalone structure ==="
+          ls -la /opt/cryptosentinel/.next/standalone/ 2>&1
+          echo ""
+          echo "=== D. Built API routes in standalone ==="
+          find /opt/cryptosentinel/.next/standalone/.next/server -name "route.js" 2>&1 | head -20
+          echo ""
+          echo "=== E. Try various endpoints ==="
+          for path in / /api /api/health /api/settings /api/projects /login; do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 http://localhost:3000$path 2>/dev/null || echo "000")
+            echo "  $path -> HTTP $CODE"
+          done
+          echo ""
+          echo "=== F. PM2 logs (recent) ==="
+          pm2 logs cryptosentinel --lines 20 --nostream --err 2>&1 | tail -30
+          echo ""
+          echo "=== G. Install Caddy ==="
+          if ! command -v caddy >/dev/null 2>&1; then
+            echo "Installing Caddy..."
+            apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl 2>&1 | tail -3
+            curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>&1 | tail -2
+            curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.txt' | tee /etc/apt/sources.list.d/caddy-stable.list 2>&1 | tail -2
+            apt-get update -qq 2>&1 | tail -2
+            apt-get install -y caddy 2>&1 | tail -5
+          fi
+          caddy version 2>&1
+          echo ""
+          echo "=== H. Configure Caddy ==="
+          cp /opt/cryptosentinel/Caddyfile /etc/caddy/Caddyfile
+          cat /etc/caddy/Caddyfile | head -10
+          echo ""
+          echo "=== I. Start Caddy ==="
+          systemctl enable caddy 2>&1 | tail -2
+          systemctl start caddy 2>&1 | tail -3
+          sleep 3
+          systemctl status caddy --no-pager 2>&1 | head -15
+          echo ""
+          echo "=== J. Re-test endpoints after Caddy start ==="
+          for port in 81 3000 80 443; do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 http://localhost:$port/api/health 2>/dev/null || echo "000")
+            echo "  port $port -> HTTP $CODE"
+          done
+          echo ""
+          echo "=== K. PM2 app env (check OPENROUTER_API_KEY etc.) ==="
+          pm2 env cryptosentinel 2>&1 | grep -E "^(DATABASE_URL|OPENROUTER_API_KEY|CRYPTOSENTINEL_AUTH_TOKEN|NODE_ENV|PORT|HOSTNAME)" | head -10
+          echo ""
+          echo "=== L. Restart PM2 app fresh ==="
+          pm2 delete cryptosentinel 2>&1 | tail -2
+          cd /opt/cryptosentinel
+          pm2 start ecosystem.config.js --env production 2>&1 | tail -5
+          pm2 save 2>&1 | tail -2
+          sleep 5
+          pm2 list 2>&1
+          echo ""
+          echo "=== M. Final health check ==="
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 http://localhost:3000/api/health 2>/dev/null || echo "000")
+            echo "  attempt $i: HTTP $CODE"
+            if [ "$CODE" = "200" ]; then
+              curl -s http://localhost:3000/api/health
+              echo ""
+              echo "  APP IS HEALTHY!"
+              break
+            fi
+            sleep 5
+          done
+          echo ""
+          echo "=== DONE ==="
+DIAG_SCRIPT
