@@ -1,6 +1,6 @@
 name: Verify VPS App
 
-# Manual trigger only — runs a quick diagnostic on the VPS to verify
+# Manual trigger only - runs a quick diagnostic on the VPS to verify
 # the deployed app is actually running and accessible.
 
 on:
@@ -94,7 +94,7 @@ jobs:
               curl -s http://localhost:3000/api/health
               echo ""
               echo ""
-              echo "=== ✅ App is HEALTHY on VPS (localhost:3000) ==="
+              echo "=== APP IS HEALTHY ON VPS (localhost:3000) ==="
               break
             fi
             sleep 5
