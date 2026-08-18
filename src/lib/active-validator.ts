@@ -9,6 +9,28 @@
  *   INCONCLUSIVE    — could not determine (no URL to test, no test suite for vuln type,
  *                     network error, key found but no API endpoint to verify against)
  *
+ * IRON RULE (per user feedback 2026-08-18):
+ *   EXPLOITABLE cannot be assigned based solely on:
+ *     - HTTP 200 response
+ *     - missing or weak HTTP header
+ *     - found pattern (regex match in HTML/headers)
+ *     - theoretical attack scenario
+ *   EXPLOITABLE requires OBSERVABLE SECURITY IMPACT — a demonstrated
+ *   source → dataflow → sink chain where attacker-controlled input
+ *   reaches a sensitive sink and produces a measurable security outcome
+ *   (data exfiltrated, state changed, payload executed, etc.).
+ *
+ *   Configuration weaknesses (CSP with 'unsafe-inline', missing
+ *   X-Frame-Options, missing CSRF token, version disclosure in headers)
+ *   are OBSERVATIONS, NOT EXPLOITS. They are reported as INCONCLUSIVE
+ *   with validationScope='theoretical' so they are filtered out of the
+ *   bounty-eligible findings list. The system explicitly states:
+ *     "Verdict: configuration observation, NOT EXPLOITABLE.
+ *      Bounty finding: DISCARD."
+ *
+ *   This prevents the validator from confusing "I confirmed the presence
+ *   of a weakness" with "I confirmed a vulnerability".
+ *
  * THREE engines for smart contracts (in order, fail-fast):
  * 1. TARGET ON-CHAIN VALIDATION (cast) — call the deployed contract on mainnet
  * 2. LAB VALIDATION (Foundry/forge) — run the PoC against a local EVM
@@ -661,51 +683,109 @@ async function validateWebVulnerability(targetUrl: string, vuln: any, sourceCode
       resp.headers.forEach((v, k) => { headers[k] = v; });
 
       // CSP check
+      // IRON RULE (per user feedback 2026-08-18):
+      // EXPLOITABLE cannot be assigned based solely on a missing/weak HTTP
+      // header. A configuration weakness (CSP absent, CSP with 'unsafe-inline',
+      // X-Frame-Options absent, etc.) is an OBSERVATION, not an exploit.
+      // To upgrade to EXPLOITABLE, we need a demonstrated source→dataflow→sink
+      // chain with observable security impact (e.g., actual XSS payload
+      // executing, actual clickjacking click captured, actual CSRF request
+      // succeeding). Without that, the finding is INCONCLUSIVE (config weakness
+      // observed, exploit not demonstrated) and validationScope='theoretical'
+      // so it gets filtered out of the bounty-eligible findings list.
       if (vulnType === 'csp_missing') {
         const csp = headers['content-security-policy'] || '';
-        if (!csp) return exploitConfirmed(
-          `CSP header ABSENT — confirmed via real HTTP request to ${targetUrl}. Response has no Content-Security-Policy. This is a confirmed configuration weakness.`,
-          { validationScope: 'target', requestUrl: targetUrl, responseStatus: resp.status });
-        if (csp.includes("'unsafe-inline'") || csp.includes('https:')) return exploitConfirmed(
-          `CSP is WEAK — contains 'unsafe-inline' or https: wildcard: ${csp.slice(0, 200)}. Inline scripts are allowed, reducing XSS protection to zero.`,
-          { validationScope: 'target', requestUrl: targetUrl, responseStatus: resp.status });
-        // CSP present and strict — refuted
+        if (!csp) return inconclusive(
+          `[CONFIG WEAKNESS — NOT AN EXPLOIT] CSP header is absent on ${targetUrl}. ` +
+          `This is a defense-in-depth weakness (no Content-Security-Policy). ` +
+          `However, no exploit chain was demonstrated: ` +
+          `(a) no attacker-controlled input source identified, ` +
+          `(b) no XSS/CSS injection sink exercised, ` +
+          `(c) no observable security impact. ` +
+          `Verdict: configuration observation, NOT EXPLOITABLE. Bounty finding: DISCARD.`,
+          { validationScope: 'theoretical', requestUrl: targetUrl, responseStatus: resp.status });
+        if (csp.includes("'unsafe-inline'") || csp.includes('https:')) {
+          // Note: 'unsafe-inline' in style-src permits inline CSS (styles),
+          // NOT inline JavaScript. Inline JS is controlled by script-src.
+          // Calling this "XSS protection reduced to zero" was incorrect.
+          const directive = csp.match(/(style-src|script-src|default-src)[^;]*'unsafe-inline'/)?.[1] || 'a CSP directive';
+          return inconclusive(
+            `[CONFIG WEAKNESS — NOT AN EXPLOIT] CSP contains 'unsafe-inline' in ${directive}. ` +
+            `Note: 'unsafe-inline' in style-src permits inline CSS (styles), NOT inline JavaScript — ` +
+            `inline JS is controlled by script-src, and a nonce-based script-src is actually a strong control. ` +
+            `CSP observed: ${csp.slice(0, 200)}. ` +
+            `This is a defense-in-depth weakness (allows inline <style> blocks and style attributes). ` +
+            `No exploit chain was demonstrated: ` +
+            `(a) no attacker-controlled CSS input source identified, ` +
+            `(b) no CSS injection sink exercised, ` +
+            `(c) no observable security impact (no UI redressing, no data exfiltration captured). ` +
+            `Verdict: configuration observation, NOT EXPLOITABLE. Bounty finding: DISCARD.`,
+            { validationScope: 'theoretical', requestUrl: targetUrl, responseStatus: resp.status });
+        }
+        // CSP present and strict — refuted (no weakness at all)
         return exploitRefuted(`CSP is PRESENT and strict: ${csp.slice(0, 200)}. Not exploitable.`,
           { validationScope: 'target', requestUrl: targetUrl, responseStatus: resp.status });
       }
 
       // Clickjacking check
+      // IRON RULE: missing X-Frame-Options is a config weakness, not a
+      // demonstrated clickjacking exploit. Need to actually frame the page
+      // and capture a click to call it EXPLOITABLE.
       if (vulnType === 'clickjacking') {
         const xfo = headers['x-frame-options'] || '';
         const csp = headers['content-security-policy'] || '';
-        if (!xfo && !csp.includes('frame-ancestors')) return exploitConfirmed(
-          `X-Frame-Options ABSENT and CSP has no frame-ancestors — page is frameable. Clickjacking confirmed.`,
-          { validationScope: 'target', requestUrl: targetUrl, responseStatus: resp.status });
+        if (!xfo && !csp.includes('frame-ancestors')) return inconclusive(
+          `[CONFIG WEAKNESS — NOT AN EXPLOIT] X-Frame-Options is absent and CSP has no frame-ancestors directive. ` +
+          `The page COULD be framed by an attacker. However, no actual clickjacking attack was demonstrated: ` +
+          `(a) no attacker page was set up, ` +
+          `(b) no victim click was captured, ` +
+          `(c) no observable security impact (no state-changing action triggered via framed click). ` +
+          `Verdict: configuration observation, NOT EXPLOITABLE. Bounty finding: DISCARD.`,
+          { validationScope: 'theoretical', requestUrl: targetUrl, responseStatus: resp.status });
         return exploitRefuted(
           `Framing is blocked: X-Frame-Options=${xfo}, CSP frame-ancestors=${csp.includes('frame-ancestors') ? 'present' : 'absent'}.`,
           { validationScope: 'target', requestUrl: targetUrl, responseStatus: resp.status });
       }
 
       // Info exposure — check for verbose headers, version disclosure
+      // IRON RULE: technology fingerprint in headers is information disclosure,
+      // not an exploit. Need to demonstrate the leaked info enables a follow-on
+      // attack (e.g., version-specific CVE exploitation) to call it EXPLOITABLE.
       if (vulnType === 'info_exposure') {
         const exposing: string[] = [];
         if (headers['x-powered-by']) exposing.push(`X-Powered-By: ${headers['x-powered-by']}`);
         if (headers['server'] && !headers['server'].includes('cloudflare')) exposing.push(`Server: ${headers['server']}`);
         if (headers['x-aspnet-version']) exposing.push(`X-AspNet-Version: ${headers['x-aspnet-version']}`);
-        if (exposing.length > 0) return exploitConfirmed(
-          `Information disclosure confirmed: ${exposing.join(', ')}. Technology fingerprint visible in headers.`,
-          { validationScope: 'target', requestUrl: targetUrl, responseStatus: resp.status });
+        if (exposing.length > 0) return inconclusive(
+          `[CONFIG WEAKNESS — NOT AN EXPLOIT] Information disclosure in headers: ${exposing.join(', ')}. ` +
+          `Technology fingerprint visible — enables targeted vulnerability research but is not itself an exploit. ` +
+          `No exploit chain was demonstrated: ` +
+          `(a) no follow-on attack leveraging the fingerprint, ` +
+          `(b) no version-specific CVE exploitation attempted, ` +
+          `(c) no observable security impact. ` +
+          `Verdict: configuration observation, NOT EXPLOITABLE. Bounty finding: DISCARD.`,
+          { validationScope: 'theoretical', requestUrl: targetUrl, responseStatus: resp.status });
         return exploitRefuted(`No version disclosure in headers. Server header is generic or absent.`,
           { validationScope: 'target', requestUrl: targetUrl, responseStatus: resp.status });
       }
 
       // CSRF check — look for CSRF tokens in HTML form
+      // IRON RULE: absence of a CSRF token is a config weakness, not a
+      // demonstrated CSRF. Need to actually submit a forged cross-origin
+      // request and confirm a state-changing action occurred to call it
+      // EXPLOITABLE.
       if (vulnType === 'csrf') {
         const body = await resp.text();
         const hasCsrfToken = body.match(/csrf[_-]?token|_token|authenticity_token|__RequestVerificationToken/i);
-        if (!hasCsrfToken) return exploitConfirmed(
-          `No CSRF token found in page HTML. Forms are vulnerable to CSRF.`,
-          { validationScope: 'target', requestUrl: targetUrl, responseStatus: resp.status });
+        if (!hasCsrfToken) return inconclusive(
+          `[CONFIG WEAKNESS — NOT AN EXPLOIT] No CSRF token found in page HTML at ${targetUrl}. ` +
+          `Forms MAY be vulnerable to CSRF. However, no actual CSRF attack was demonstrated: ` +
+          `(a) no forged cross-origin request was submitted, ` +
+          `(b) no state-changing action was confirmed via forged request, ` +
+          `(c) no observable security impact. ` +
+          `Note: SameSite cookies, Origin/Referer checks, or custom CSRF protection may still prevent CSRF — token absence alone is not proof. ` +
+          `Verdict: configuration observation, NOT EXPLOITABLE. Bounty finding: DISCARD.`,
+          { validationScope: 'theoretical', requestUrl: targetUrl, responseStatus: resp.status });
         return exploitRefuted(`CSRF token found in HTML: ${hasCsrfToken[0]}. Forms are protected.`,
           { validationScope: 'target', requestUrl: targetUrl, responseStatus: resp.status });
       }
