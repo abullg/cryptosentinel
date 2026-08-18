@@ -17,7 +17,7 @@ module.exports = {
   apps: [{
     name: 'cryptosentinel',
     script: '.next/standalone/server.js',
-    cwd: '/app',
+    cwd: '/opt/cryptosentinel',
     interpreter: 'node',
 
     env: {
