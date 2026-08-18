@@ -27,6 +27,7 @@ jobs:
           set -e
 
           echo "=== 1. Git clone or pull latest ==="
+          git config --global --add safe.directory /opt/cryptosentinel
           if [ -d /opt/cryptosentinel/.git ]; then
             cd /opt/cryptosentinel
             git fetch origin main 2>&1 | tail -3
