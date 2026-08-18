@@ -1,0 +1,74 @@
+name: Fix Static
+
+on:
+  workflow_dispatch:
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p 22 -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Fix static assets + restart
+        run: |
+            HOST="${{ secrets.VPS_HOST }}"
+            USER="${{ secrets.VPS_USER || 'root' }}"
+            ssh -p 22 -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 $USER@$HOST bash -s <<'FIX'
+            cd /opt/cryptosentinel
+            
+            echo "=== 1. Check what exists ==="
+            echo ".next/static exists:"
+            ls .next/static/ 2>&1 | head -5
+            echo ""
+            echo ".next/standalone/.next/static exists:"
+            ls .next/standalone/.next/static/ 2>&1 | head -5
+            echo ""
+            echo ".next/standalone/.next/static/chunks exists:"
+            ls .next/standalone/.next/static/chunks/ 2>&1 | head -5
+            echo ""
+            echo ".next/static/chunks exists:"
+            ls .next/static/chunks/ 2>&1 | head -5
+            
+            echo ""
+            echo "=== 2. Force copy static assets ==="
+            mkdir -p .next/standalone/.next/static
+            cp -rf .next/static/* .next/standalone/.next/static/
+            echo "Copied static to standalone"
+            
+            echo ""
+            echo "=== 3. Copy public dir ==="
+            if [ -d public ]; then
+              cp -rf public .next/standalone/
+              echo "Copied public"
+            fi
+            
+            echo ""
+            echo "=== 4. Verify chunks exist ==="
+            ls .next/standalone/.next/static/chunks/ 2>&1 | head -10
+            
+            echo ""
+            echo "=== 5. Restart PM2 ==="
+            pm2 restart cryptosentinel 2>&1 | tail -3
+            sleep 5
+            
+            echo ""
+            echo "=== 6. Test JS file ==="
+            JS_URL=$(curl -s --max-time 5 http://localhost:3000/ 2>&1 | grep -oE 'src="[^"]*\.js"' | head -1 | sed 's/src="//;s/"//')
+            echo "JS URL: $JS_URL"
+            curl -s -o /dev/null -w "JS HTTP=%{http_code} size=%{size_download}\n" --max-time 5 "http://localhost:3000$JS_URL" 2>&1
+            
+            echo ""
+            echo "=== 7. Test CSS file ==="
+            CSS_URL=$(curl -s --max-time 5 http://localhost:3000/ 2>&1 | grep -oE 'href="[^"]*\.css"' | head -1 | sed 's/href="//;s/"//')
+            echo "CSS URL: $CSS_URL"
+            curl -s -o /dev/null -w "CSS HTTP=%{http_code} size=%{size_download}\n" --max-time 5 "http://localhost:3000$CSS_URL" 2>&1
+            
+            echo ""
+            echo "=== DONE ==="
+            FIX
