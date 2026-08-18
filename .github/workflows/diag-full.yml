@@ -1,0 +1,70 @@
+name: Full Diag
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p 22 -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Full VPS diagnostic
+        run: |
+          HOST="${{ secrets.VPS_HOST }}"
+          USER="${{ secrets.VPS_USER || 'root' }}"
+          ssh -p 22 -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 $USER@$HOST bash -s <<'DIAG'
+          echo "=== 1. PM2 ==="
+          pm2 list 2>&1
+          
+          echo ""
+          echo "=== 2. Port 3000 listening? ==="
+          ss -tlnp | grep 3000 2>&1 || echo "NOT LISTENING"
+          
+          echo ""
+          echo "=== 3. curl localhost:3000/ (HTTP code) ==="
+          curl -s -o /dev/null -w "HTTP=%{http_code} size=%{size_download} time=%{time_total}s\n" --max-time 10 http://localhost:3000/ 2>&1
+          
+          echo ""
+          echo "=== 4. curl localhost:3000/ (first 20 lines) ==="
+          curl -s --max-time 10 http://localhost:3000/ 2>&1 | head -20
+          
+          echo ""
+          echo "=== 5. server.js exists? ==="
+          ls -la /opt/cryptosentinel/.next/standalone/server.js 2>&1
+          
+          echo ""
+          echo "=== 6. Static assets? ==="
+          ls -la /opt/cryptosentinel/.next/standalone/.next/static/ 2>&1 | head -5
+          ls -la /opt/cryptosentinel/.next/standalone/public/ 2>&1 | head -5
+          
+          echo ""
+          echo "=== 7. PM2 error logs ==="
+          tail -10 /root/.pm2/logs/cryptosentinel-error.log 2>/dev/null || tail -10 /var/log/cryptosentinel/error.log 2>/dev/null || echo "No error log"
+          
+          echo ""
+          echo "=== 8. PM2 output logs ==="
+          tail -10 /root/.pm2/logs/cryptosentinel-out.log 2>/dev/null || tail -10 /var/log/cryptosentinel/out.log 2>/dev/null || echo "No output log"
+          
+          echo ""
+          echo "=== 9. ecosystem.config.js cwd ==="
+          grep cwd /opt/cryptosentinel/ecosystem.config.js 2>&1
+          
+          echo ""
+          echo "=== 10. Check /app vs /opt ==="
+          ls -la /app/.next/standalone/server.js 2>&1 || echo "/app does not exist"
+          ls -la /opt/cryptosentinel/.next/standalone/server.js 2>&1
+          
+          echo ""
+          echo "=== 11. PM2 process details ==="
+          pm2 describe cryptosentinel 2>&1 | grep -E "script path|exec cwd|status|pid|uptime" | head -10
+          
+          echo ""
+          echo "=== DONE ==="
+          DIAG
