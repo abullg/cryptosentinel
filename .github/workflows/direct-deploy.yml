@@ -25,11 +25,17 @@ jobs:
           PORT=22
           ssh -p $PORT -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 $USER@$HOST bash -s <<'DIRECT'
           set -e
-          cd /opt/cryptosentinel
 
-          echo "=== 1. Git pull latest ==="
-          git fetch origin main 2>&1 | tail -3
-          git reset --hard origin/main 2>&1 | tail -3
+          echo "=== 1. Git clone or pull latest ==="
+          if [ -d /opt/cryptosentinel/.git ]; then
+            cd /opt/cryptosentinel
+            git fetch origin main 2>&1 | tail -3
+            git reset --hard origin/main 2>&1 | tail -3
+          else
+            rm -rf /opt/cryptosentinel
+            git clone --depth 1 https://github.com/abullg/cryptosentinel.git /opt/cryptosentinel
+            cd /opt/cryptosentinel
+          fi
           git log --oneline -3
 
           echo ""
