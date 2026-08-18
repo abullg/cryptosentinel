@@ -1,0 +1,112 @@
+name: Verify VPS App
+
+# Manual trigger only — runs a quick diagnostic on the VPS to verify
+# the deployed app is actually running and accessible.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    name: Verify CryptoSentinel on VPS
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          HOST="${{ secrets.VPS_HOST }}"
+          ssh-keyscan -p 22 -H $HOST >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Run diagnostics on VPS
+        run: |
+          HOST="${{ secrets.VPS_HOST }}"
+          USER="${{ secrets.VPS_USER || 'root' }}"
+          PORT=22
+          ssh -p $PORT -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 $USER@$HOST bash -s <<EOF
+          echo "=== 1. PM2 status ==="
+          pm2 list 2>&1 || echo "PM2 not running"
+
+          echo ""
+          echo "=== 2. PM2 logs (last 30 lines) ==="
+          pm2 logs cryptosentinel --lines 30 --nostream 2>&1 | tail -40
+
+          echo ""
+          echo "=== 3. Internal health check (port 3000) ==="
+          curl -sv --connect-timeout 5 --max-time 10 http://localhost:3000/api/health 2>&1 | head -20
+
+          echo ""
+          echo "=== 4. Internal health check (port 81 via Caddy) ==="
+          curl -sv --connect-timeout 5 --max-time 10 http://localhost:81/api/health 2>&1 | head -20
+
+          echo ""
+          echo "=== 5. Caddy status ==="
+          systemctl status caddy --no-pager 2>&1 | head -15
+          caddy version 2>&1 || echo "Caddy not installed"
+
+          echo ""
+          echo "=== 6. Listening ports ==="
+          ss -tlnp 2>&1 | head -20
+
+          echo ""
+          echo "=== 7. Firewall rules (UFW) ==="
+          ufw status 2>&1 || echo "UFW not installed"
+
+          echo ""
+          echo "=== 8. iptables INPUT chain ==="
+          iptables -L INPUT -n -v 2>&1 | head -30
+
+          echo ""
+          echo "=== 9. /data dir + DB ==="
+          ls -la /data/ 2>&1
+          file /data/cryptosentinel.db 2>&1 || echo "DB file not found"
+
+          echo ""
+          echo "=== 10. Process tree ==="
+          ps aux | grep -iE 'next|node|pm2|caddy' | grep -v grep | head -10
+
+          echo ""
+          echo "=== 11. App files ==="
+          ls -la /opt/cryptosentinel/.next/standalone/ 2>&1 | head -5
+
+          echo ""
+          echo "=== 12. Last 50 lines of pm2 cryptosentinel log ==="
+          tail -50 /root/.pm2/logs/cryptosentinel-out.log 2>/dev/null || tail -50 /var/log/cryptosentinel/out.log 2>/dev/null || echo "Log file not found"
+
+          echo ""
+          echo "=== 13. Last 50 lines of pm2 cryptosentinel error log ==="
+          tail -50 /root/.pm2/logs/cryptosentinel-error.log 2>/dev/null || tail -50 /var/log/cryptosentinel/error.log 2>/dev/null || echo "No errors"
+
+          echo ""
+          echo "=== 14. Try restarting PM2 app ==="
+          pm2 restart cryptosentinel 2>&1 | tail -5
+          sleep 5
+
+          echo ""
+          echo "=== 15. Internal health check AFTER restart ==="
+          for i in 1 2 3 4 5 6; do
+            CODE=\$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 http://localhost:3000/api/health 2>/dev/null || echo "000")
+            echo "  attempt \$i: HTTP \$CODE"
+            if [ "\$CODE" = "200" ]; then
+              curl -s http://localhost:3000/api/health
+              echo ""
+              echo ""
+              echo "=== ✅ App is HEALTHY on VPS (localhost:3000) ==="
+              break
+            fi
+            sleep 5
+          done
+
+          echo ""
+          echo "=== 16. External curl test (from VPS to itself via public IP) ==="
+          for port in 81 3000 80 443; do
+            CODE=\$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 http://187.77.181.127:\$port/api/health 2>/dev/null || echo "000")
+            echo "  port \$port: HTTP \$CODE"
+          done
+
+          echo ""
+          echo "=== DONE ==="
+EOF
