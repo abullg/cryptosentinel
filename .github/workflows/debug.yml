@@ -1,0 +1,125 @@
+name: Debug Health
+
+on:
+  workflow_dispatch:
+
+jobs:
+  debug:
+    name: Debug /api/health 404
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          HOST="${{ secrets.VPS_HOST }}"
+          ssh-keyscan -p 22 -H $HOST >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Debug /api/health + fix Caddy + setup env
+        run: |
+          HOST="${{ secrets.VPS_HOST }}"
+          USER="${{ secrets.VPS_USER || 'root' }}"
+          PORT=22
+          ssh -p $PORT -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 $USER@$HOST bash -s <<'DBG'
+          set +e
+
+          echo "=== 1. Catty why failing ==="
+          journalctl -u caddy --no-pager -n 30 2>&1 | tail -30
+
+          echo ""
+          echo "=== 2. What is on port 80? ==="
+          ss -tlnp | grep ":80 " 2>&1
+          curl -sI --max-time 5 http://localhost:80/ 2>&1 | head -10
+
+          echo ""
+          echo "=== 3. /api/health verbose curl ==="
+          curl -sv --max-time 10 http://localhost:3000/api/health 2>&1 | head -30
+
+          echo ""
+          echo "=== 4. /api/login (in public_paths) ==="
+          curl -sv --max-time 10 http://localhost:3000/api/login 2>&1 | head -20
+
+          echo ""
+          echo "=== 5. /api/test-key (also public) ==="
+          curl -sv --max-time 10 http://localhost:3000/api/test-key 2>&1 | head -20
+
+          echo ""
+          echo "=== 6. Try /.next/server/app/api/health/route.js content ==="
+          head -50 /opt/cryptosentinel/.next/standalone/.next/server/app/api/health/route.js 2>&1
+
+          echo ""
+          echo "=== 7. Check if middleware is enabled ==="
+          ls -la /opt/cryptosentinel/.next/standalone/.next/server/edge-runtime* 2>&1 | head -5
+          find /opt/cryptosentinel/.next -name "middleware*" 2>&1 | head -10
+          find /opt/cryptosentinel/.next -name "proxy*" 2>&1 | head -10
+
+          echo ""
+          echo "=== 8. /opt/cryptosentinel/.next/standalone/.next/server/structure ==="
+          ls -la /opt/cryptosentinel/.next/standalone/.next/server/ 2>&1
+          ls -la /opt/cryptosentinel/.next/standalone/.next/server/app/ 2>&1 | head -20
+
+          echo ""
+          echo "=== 9. Setup env file ==="
+          if [ ! -f /etc/cryptosentinel.env ]; then
+            echo "Creating /etc/cryptosentinel.env with default values..."
+            cat > /etc/cryptosentinel.env <<ENVFILE
+DATABASE_URL=file:/data/cryptosentinel.db
+OPENROUTER_API_KEY=
+GITHUB_TOKEN=
+CRYPTOSENTINEL_AUTH_TOKEN=
+CRYPTOSENTINEL_APP_URL=http://187.77.181.127
+NODE_ENV=production
+PORT=3000
+HOSTNAME=0.0.0.0
+ENVFILE
+            chmod 600 /etc/cryptosentinel.env
+            echo "File created. NOTE: OPENROUTER_API_KEY is empty - set it manually."
+          else
+            echo "File exists:"
+            cat /etc/cryptosentinel.env | sed 's/=.*/=<redacted>/'
+          fi
+
+          echo ""
+          echo "=== 10. Restart PM2 with env sourced ==="
+          pm2 delete cryptosentinel 2>&1 | tail -2
+          cd /opt/cryptosentinel
+          set -a; . /etc/cryptosentinel.env; set +a
+          pm2 start ecosystem.config.js --env production 2>&1 | tail -10
+          pm2 save 2>&1 | tail -2
+          sleep 5
+          pm2 list 2>&1 | head -10
+
+          echo ""
+          echo "=== 11. Final health check ==="
+          for i in 1 2 3 4 5 6 7 8; do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 http://localhost:3000/api/health 2>/dev/null || echo "000")
+            echo "  attempt $i: HTTP $CODE"
+            if [ "$CODE" = "200" ]; then
+              curl -s http://localhost:3000/api/health
+              echo ""
+              echo "  APP IS HEALTHY!"
+              break
+            fi
+            sleep 5
+          done
+
+          echo ""
+          echo "=== 12. Fix Caddy - try with port 80 instead of 81 ==="
+          # The Caddyfile uses :81. But port 81 might be blocked by Hostinger
+          # or some other service. Try port 80 (HTTP) instead.
+          cat /opt/cryptosentinel/Caddyfile | head -5
+          echo "---"
+          # Check what's on port 80
+          ss -tlnp | grep ":80 "
+          echo "---"
+          # Try restarting caddy manually with our config
+          caddy start --config /opt/cryptosentinel/Caddyfile --adapter caddyfile 2>&1 | tail -10
+          sleep 3
+          curl -sI --max-time 5 http://localhost:81/api/health 2>&1 | head -5
+
+          echo ""
+          echo "=== DONE ==="
+DBG
