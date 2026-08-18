@@ -101,4 +101,4 @@ jobs:
           done
           echo ""
           echo "=== DONE ==="
-DIAG_SCRIPT
+          DIAG_SCRIPT
