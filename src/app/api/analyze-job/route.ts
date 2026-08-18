@@ -114,6 +114,7 @@ async function runAnalysisInBackground(jobId: string, config: {
   }, 600_000); // 10 minutes
 
   try {
+    const globalStartTime = Date.now();
     await updateJob(5, 'Running static analysis...');
 
     // Phase 1: Static
@@ -154,16 +155,22 @@ async function runAnalysisInBackground(jobId: string, config: {
     await updateJob(30, 'Starting AI surface analysis (pass 1/2)...');
     let aiVulns: any[] = [];
     try {
+      // Progress updates during AI call — so user knows it's not stuck
+      const progressInterval = setInterval(() => {
+        const elapsed = Math.round((Date.now() - (globalStartTime || Date.now())) / 1000);
+        updateJob(30, `AI analysis in progress... ${elapsed}s elapsed`).catch(() => {});
+      }, 15_000); // Update every 15s
+
       const aiPromise = isWeb
         ? analyzeWebWithGLM(sourceCode.slice(0, 30000), contractName, { apiKey, model })
         : analyzeWithGLM(sourceCode, contractName, { apiKey, model }, undefined);
       const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('AI pass 1 timeout after 300s')), 300_000)
+        setTimeout(() => reject(new Error('AI pass 1 timeout after 60s')), 60_000)
       );
       aiVulns = await Promise.race([aiPromise, timeoutPromise]);
+      clearInterval(progressInterval);
     } catch (err: any) {
-      await updateJob(40, `AI pass 1 error (continuing with static): ${String(err).slice(0, 100)}`);
-      // If AI failed, complete with static findings only — DON'T hang
+      await updateJob(40, `AI pass 1 ${String(err).slice(0, 100)}. Completing with static findings.`);
       if (jobTimedOut) return;
       const allResults = savedStatic.map(s => s.vuln);
       await updateJob(100, `Analysis complete (AI failed): ${allResults.length} static findings`);
