@@ -95,6 +95,24 @@ async function runAnalysisInBackground(jobId: string, config: {
     await db.analysisJob.update({ where: { id: jobId }, data: { progress, message, status: progress < 100 ? 'running' : 'completed' } }).catch(() => {});
   };
 
+  // ─── GLOBAL TIMEOUT: entire job must complete in 10 min ───
+  // If anything hangs (AI call, validation, DB write), this fires and
+  // completes the job with whatever findings we have. NEVER hang forever.
+  let jobTimedOut = false;
+  const globalTimeout = setTimeout(async () => {
+    jobTimedOut = true;
+    console.error('[analyze-job] GLOBAL TIMEOUT (10 min) — completing with current findings');
+    try {
+      await updateJob(95, 'Analysis timeout (10 min) — completing with current findings.');
+      // Get whatever findings we have
+      const existingVulns = await db.vulnerability.findMany({ where: { contractId } }).catch(() => []);
+      await db.audit.update({ where: { id: auditId },
+        data: { status: 'completed', completedAt: new Date(), findings: existingVulns.length } }).catch(() => {});
+      await db.analysisJob.update({ where: { id: jobId },
+        data: { status: 'completed', progress: 100, message: `Timeout after 10 min — ${existingVulns.length} findings saved`, resultCount: existingVulns.filter((v: any) => v.status === 'confirmed' || v.status === 'validated').length } }).catch(() => {});
+    } catch {}
+  }, 600_000); // 10 minutes
+
   try {
     await updateJob(5, 'Running static analysis...');
 
@@ -130,29 +148,36 @@ async function runAnalysisInBackground(jobId: string, config: {
 
     await updateJob(20, `Static analysis: ${savedStatic.length} findings`);
 
-    // Phase 2: MULTI-PASS AI ANALYSIS
-    //   Pass 1 (surface): find obvious vulnerabilities (XSS, SQLi, reentrancy, etc.)
-    //   Pass 2 (deep):    find non-obvious, multi-step, cross-function vulns
-    //   Merge: dedupe by hash, surface + deep findings proceed to validation
+    if (jobTimedOut) return;
+
+    // Phase 2: AI ANALYSIS (pass 1 — surface scan)
     await updateJob(30, 'Starting AI surface analysis (pass 1/2)...');
     let aiVulns: any[] = [];
     try {
-      // Pass 1 — surface scan (240s timeout per callGLM)
       const aiPromise = isWeb
         ? analyzeWebWithGLM(sourceCode.slice(0, 30000), contractName, { apiKey, model })
         : analyzeWithGLM(sourceCode, contractName, { apiKey, model }, undefined);
       const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('AI pass 1 timeout after 260s')), 260_000)
+        setTimeout(() => reject(new Error('AI pass 1 timeout after 300s')), 300_000)
       );
       aiVulns = await Promise.race([aiPromise, timeoutPromise]);
     } catch (err: any) {
-      await updateJob(40, `AI pass 1 error (continuing): ${String(err).slice(0, 100)}`);
-      // Don't throw — continue with static findings + try pass 2
+      await updateJob(40, `AI pass 1 error (continuing with static): ${String(err).slice(0, 100)}`);
+      // If AI failed, complete with static findings only — DON'T hang
+      if (jobTimedOut) return;
+      const allResults = savedStatic.map(s => s.vuln);
+      await updateJob(100, `Analysis complete (AI failed): ${allResults.length} static findings`);
+      await db.audit.update({ where: { id: auditId }, data: { status: 'completed', findings: allResults.length, completedAt: new Date() } }).catch(() => {});
+      await db.analysisJob.update({ where: { id: jobId }, data: { status: 'completed', resultCount: 0 } }).catch(() => {});
+      clearTimeout(globalTimeout);
+      return;
     }
+
+    if (jobTimedOut) return;
 
     await updateJob(50, `AI pass 1 found ${aiVulns.length} surface vulnerabilities. Starting deep analysis (pass 2/2)...`);
 
-    // Pass 2 — DEEP analysis (finds non-obvious, multi-step vulnerabilities)
+    // Pass 2 — DEEP analysis
     let deepVulns: any[] = [];
     try {
       const firstPassSummary = aiVulns.map(v => ({
@@ -162,12 +187,14 @@ async function runAnalysisInBackground(jobId: string, config: {
         ? analyzeWebWithGLMDeep(sourceCode.slice(0, 30000), contractName, { apiKey, model }, firstPassSummary)
         : analyzeWithGLMDeep(sourceCode, contractName, { apiKey, model }, firstPassSummary);
       const deepTimeout = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('AI pass 2 (deep) timeout after 260s')), 260_000)
+        setTimeout(() => reject(new Error('AI pass 2 (deep) timeout after 300s')), 300_000)
       );
       deepVulns = await Promise.race([deepPromise, deepTimeout]);
     } catch (err: any) {
       await updateJob(60, `AI pass 2 (deep) error (continuing with pass 1 only): ${String(err).slice(0, 100)}`);
     }
+
+    if (jobTimedOut) return;
 
     // Merge surface + deep findings
     aiVulns = [...aiVulns, ...deepVulns];
@@ -177,15 +204,9 @@ async function runAnalysisInBackground(jobId: string, config: {
     const savedAi: any[] = [];
     let droppedLowSeverity = 0;
     for (const v of aiVulns) {
-      // ─── SEVERITY FLOOR ──────────────────────────────────────────
-      // Discard `low` / `info` severity findings UNLESS the type is one that
-      // the obvious-vuln detector or active validator can promote to higher.
-      // This implements the user's requirement: "find at least medium/high/critical".
-      // Low-severity config noise (missing HSTS, verbose Server header, etc.) is
-      // filtered out unless the description contains a concrete exploit chain.
       const sev = (v.severity || 'medium').toLowerCase();
       const isLow = sev === 'low' || sev === 'info';
-      const allowedLowTypes = new Set(['api_leak', 'info_exposure']); // these can be promoted by obvious-check
+      const allowedLowTypes = new Set(['api_leak', 'info_exposure']);
       const hasConcreteChain = /(\bRCE\b|data exfiltrat|fund theft|wallet drain|credential leak|private key|mnemonic)/i.test(v.description || '');
       if (isLow && !allowedLowTypes.has((v.type || '').toLowerCase()) && !hasConcreteChain) {
         droppedLowSeverity++;
@@ -197,10 +218,6 @@ async function runAnalysisInBackground(jobId: string, config: {
         const existing = await db.vulnerability.findFirst({ where: { hashSignature: hashSig } });
         if (existing) continue;
 
-        // BINARY model: no confidence percentages. Status tells the truth.
-        // 'candidate' = AI found something, NOT YET TESTED
-        // Normalize all string fields — AI sometimes returns arrays for
-        // validationSteps/pocOutline/description. Prisma expects String.
         const str = (val: any): string => {
           if (val == null) return '';
           if (typeof val === 'string') return val;
@@ -230,35 +247,37 @@ async function runAnalysisInBackground(jobId: string, config: {
         });
         savedAi.push({ vuln, rawFinding: v });
       } catch (err: any) {
-        // Log the error but don't crash — continue saving other findings
         console.error(`[analyze-job] Failed to save finding "${v?.title}": ${String(err?.message || err).slice(0, 200)}`);
       }
     }
 
+    if (jobTimedOut) return;
+
     if (droppedLowSeverity > 0) {
-      await updateJob(70, `Filtered out ${droppedLowSeverity} low-severity findings without concrete exploit chain. Saving ${savedAi.length} medium+ findings...`);
+      await updateJob(70, `Filtered out ${droppedLowSeverity} low-severity findings. Saving ${savedAi.length} medium+ findings...`);
     }
 
     await updateJob(75, `Saved ${savedAi.length} AI findings. Starting validation...`);
 
-    // Phase 3: THREE-STATE VERDICT VALIDATION
-    //   EXPLOITABLE     → status='confirmed' (target) or 'validated' (lab)
-    //   NOT_EXPLOITABLE → status='refuted' (tested, exploit doesn't work)
-    //   INCONCLUSIVE    → status='candidate' (couldn't determine — no URL, no API, network error, etc.)
-    if (savedAi.length > 0) {
+    // Phase 3: ACTIVE VALIDATION (parallel, 30s per finding)
+    if (savedAi.length > 0 && !jobTimedOut) {
       const verifyPromises = savedAi.map(async ({ vuln, rawFinding: v }: any) => {
         try {
-          const verification = await activelyValidate(
-            sourceCode, contractName,
-            { title: v.title, type: v.type, severity: v.severity, description: v.description, location: v.location },
-            apiKey, model,
-            targetUrl || undefined  // Pass targetUrl DIRECTLY, not hidden in description
-          );
+          const verification = await Promise.race([
+            activelyValidate(
+              sourceCode, contractName,
+              { title: v.title, type: v.type, severity: v.severity, description: v.description, location: v.location },
+              apiKey, model,
+              targetUrl || undefined
+            ),
+            new Promise<any>((_, reject) =>
+              setTimeout(() => reject(new Error('Validation timeout (30s)')), 30_000)),
+          ]);
+
           const scope = verification.validationScope || 'theoretical';
           const verdict = verification.verdict || (verification.confirmed ? 'EXPLOITABLE' : 'INCONCLUSIVE');
 
           if (verdict === 'EXPLOITABLE') {
-            // EXPLOIT CONFIRMED — exploit works
             const newStatus = scope === 'target' ? 'confirmed' : 'validated';
             const label = scope === 'target'
               ? '[EXPLOITABLE] Exploit confirmed against production target via real HTTP request.'
@@ -268,7 +287,6 @@ async function runAnalysisInBackground(jobId: string, config: {
                 description: vuln.description + `\n\n${label}\n${verification.evidence}` } }).catch(() => {});
             vuln.confidence = 1; vuln.status = newStatus; vuln.validationScope = scope;
           } else if (verdict === 'NOT_EXPLOITABLE') {
-            // TESTED AND REFUTED — exploit does NOT work
             const label = scope === 'target'
               ? '[NOT_EXPLOITABLE] Exploit tested against production target and did NOT succeed.'
               : '[NOT_EXPLOITABLE] Exploit tested in lab and did NOT succeed.';
@@ -277,21 +295,16 @@ async function runAnalysisInBackground(jobId: string, config: {
                 description: vuln.description + `\n\n${label}\n${verification.evidence}` } }).catch(() => {});
             vuln.confidence = 0; vuln.validationScope = scope; vuln.status = 'refuted';
           } else {
-            // INCONCLUSIVE — couldn't determine, leave as candidate
-            const label = '[INCONCLUSIVE] Validation ran but could not determine exploitability. ' +
-              (scope === 'theoretical'
-                ? 'Test could not execute (no URL, network error, or no test suite for this vuln type).'
-                : 'Test executed but result was ambiguous. Manual verification needed.');
+            const label = '[INCONCLUSIVE] Validation ran but could not determine exploitability.';
             await db.vulnerability.update({ where: { id: vuln.id },
               data: { confidence: 0, status: 'candidate', validationScope: scope,
                 description: vuln.description + `\n\n${label}\n${verification.evidence}` } }).catch(() => {});
             vuln.confidence = 0; vuln.validationScope = scope; vuln.status = 'candidate';
           }
         } catch {
-          // VALIDATION ERROR — can't determine, leave as candidate
           await db.vulnerability.update({ where: { id: vuln.id },
             data: { validationScope: 'theoretical',
-              description: vuln.description + '\n\n[INCONCLUSIVE] Validation could not run — exception during test execution. Manual verification needed.' } }).catch(() => {});
+              description: vuln.description + '\n\n[INCONCLUSIVE] Validation could not run.' } }).catch(() => {});
           vuln.validationScope = 'theoretical';
           vuln.status = 'candidate';
         }
@@ -309,10 +322,11 @@ async function runAnalysisInBackground(jobId: string, config: {
     await db.analysisJob.update({ where: { id: jobId }, data: { status: 'completed', resultCount: exploitCount } }).catch(() => {});
 
   } catch (err: any) {
-    // Fix bug #1: audit lifecycle — always mark as completed or failed
     await db.audit.update({ where: { id: auditId },
       data: { status: 'failed', completedAt: new Date() } }).catch(() => {});
     await db.analysisJob.update({ where: { id: jobId },
       data: { status: 'failed', error: String(err).slice(0, 500), progress: 100, message: 'Analysis failed' } }).catch(() => {});
+  } finally {
+    clearTimeout(globalTimeout);
   }
 }
