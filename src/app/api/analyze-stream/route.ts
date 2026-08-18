@@ -487,6 +487,80 @@ export async function POST(req: NextRequest) {
           }
         }
 
+        // === AUTO-VALIDATION: actively test each finding with real payloads ===
+        // Per user request (2026-08-18): ALL findings must be actively validated
+        // via activelyValidate() — sends real HTTP payloads / Foundry tests /
+        // on-chain RPC calls to confirm with observable security impact.
+        const allFindingsToValidate = [...filteredStaticResults, ...aiResults];
+        if (allFindingsToValidate.length > 0) {
+          send('progress', { step: 'auto_validate', message: `Actively validating ${allFindingsToValidate.length} findings via HTTP/Foundry/RPC...`, percent: 95 });
+          try {
+            const { activelyValidate } = await import('@/lib/active-validator');
+            const validationPromises = allFindingsToValidate.map(async (vuln: any, idx: number) => {
+              try {
+                const result = await Promise.race([
+                  activelyValidate(
+                    sourceCode,
+                    contractName || 'Contract',
+                    { type: vuln.type, title: vuln.title, severity: vuln.severity,
+                      description: vuln.description, location: vuln.location || '' },
+                    apiKey, model,
+                    targetUrl || undefined,
+                  ),
+                  new Promise<any>((_, reject) =>
+                    setTimeout(() => reject(new Error('Validation timeout (30s)')), 30_000)),
+                ]);
+
+                const scope = result.validationScope || 'theoretical';
+                const verdict = result.verdict || 'INCONCLUSIVE';
+
+                let newStatus = vuln.status;
+                let newConfidence = vuln.confidence;
+                if (verdict === 'EXPLOITABLE') {
+                  newStatus = scope === 'target' ? 'confirmed' : 'validated';
+                  newConfidence = 1;
+                } else if (verdict === 'NOT_EXPLOITABLE') {
+                  newStatus = 'refuted';
+                  newConfidence = 0;
+                }
+
+                console.log(`[analyze-stream] Finding ${idx + 1}/${allFindingsToValidate.length} (${vuln.type}): ${verdict} (scope=${scope})`);
+
+                return {
+                  id: vuln.id,
+                  update: {
+                    confidence: newConfidence,
+                    status: newStatus,
+                    validationScope: scope,
+                    description: vuln.description + `\n\n[${verdict}] Validation scope: ${scope}\n${result.evidence?.slice(0, 500) || ''}`,
+                  },
+                };
+              } catch (e: any) {
+                console.log(`[analyze-stream] Finding ${idx + 1}/${allFindingsToValidate.length} (${vuln.type}): validation failed — ${String(e?.message || e).slice(0, 100)}`);
+                return null;
+              }
+            });
+
+            const validationResults = await Promise.all(validationPromises);
+            for (const vr of validationResults) {
+              if (!vr) continue;
+              try {
+                await db.vulnerability.update({ where: { id: vr.id }, data: vr.update });
+                // Update in both arrays
+                for (const arr of [filteredStaticResults, aiResults]) {
+                  const idx = arr.findIndex((r: any) => r.id === vr.id);
+                  if (idx >= 0) arr[idx] = { ...arr[idx], ...vr.update };
+                }
+              } catch {}
+            }
+            const confirmedCount = [...filteredStaticResults, ...aiResults].filter((r: any) => r.status === 'confirmed' || r.status === 'validated').length;
+            const refutedCount = [...filteredStaticResults, ...aiResults].filter((r: any) => r.status === 'refuted').length;
+            console.log(`[analyze-stream] Auto-validation complete. ${confirmedCount} confirmed, ${refutedCount} refuted.`);
+          } catch (e) {
+            console.error('[analyze-stream] Auto-validation error:', e);
+          }
+        }
+
         // Complete audit — apply 90% confidence threshold
         // Use filteredStaticResults (already filtered in phase 1) instead of raw staticResults
         const allResultsRaw = [...filteredStaticResults, ...aiResults];
