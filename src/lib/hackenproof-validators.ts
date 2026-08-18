@@ -512,7 +512,7 @@ async function validateSsti(targetUrl: string): Promise<ValidationResult> {
     `<%=7*7%>`,         // EJS
     `{{ '7'*7 }}`,      // Twig
     `{{config}}`,       // Jinja2 config dump
-    `${{7*7}}`,         // Velocity
+    '${{7*7}}',         // Velocity
     `#set($x=7*7)$x`,   // Velocity
     `{{7*'7'}}`,        // Jinja2 string concat
   ];
