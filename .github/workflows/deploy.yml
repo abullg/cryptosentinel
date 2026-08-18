@@ -1,0 +1,187 @@
+name: Deploy to VPS
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "deploy" to confirm'
+        required: true
+        default: 'deploy'
+  push:
+    branches: [main]
+
+concurrency:
+  group: vps-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to VPS
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Validate confirmation
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "deploy" ]; then
+            echo "::error::Confirmation mismatch. Type 'deploy' to confirm."
+            exit 1
+          fi
+
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Lint
+        run: npm run lint
+        continue-on-error: true
+
+      - name: Build
+        run: npm run build
+        env:
+          DATABASE_URL: file:/tmp/build.db
+          OPENROUTER_API_KEY: ''
+
+      - name: Install sshpass (for initial password-based auth)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+          which sshpass
+
+      - name: Detect SSH port and configure access
+        id: ssh_port
+        run: |
+          HOST="${{ secrets.VPS_HOST }}"
+          USER="${{ secrets.VPS_USER || 'root' }}"
+          PASS="${{ secrets.VPS_PASS }}"
+          PORT=22
+          # Try common SSH ports
+          for p in 22 2222 65022 6022 1022 3022 5022 22222 2200 22000 65535; do
+            echo "Trying port $p with password auth..."
+            if timeout 10 sshpass -p "$PASS" ssh -p $p -o StrictHostKeyChecking=no -o ConnectTimeout=6 -o PreferredAuthentications=password -o PubkeyAuthentication=no $USER@$HOST "echo CONNECTED_$p" 2>/dev/null | grep -q "CONNECTED_$p"; then
+              PORT=$p
+              echo "Found SSH on port $p (password auth works)"
+              break
+            fi
+          done
+          echo "port=$PORT" >> "$GITHUB_OUTPUT"
+          echo "user=$USER" >> "$GITHUB_OUTPUT"
+          if [ "$PORT" = "22" ] && ! timeout 10 sshpass -p "$PASS" ssh -p 22 -o StrictHostKeyChecking=no -o ConnectTimeout=6 -o PreferredAuthentications=password -o PubkeyAuthentication=no $USER@$HOST "echo CONNECTED" 2>/dev/null | grep -q CONNECTED; then
+            echo "::error::Could not connect to VPS via password auth on any port."
+            exit 1
+          fi
+
+      - name: Install SSH public key on VPS (so subsequent SSH uses key auth)
+        run: |
+          HOST="${{ secrets.VPS_HOST }}"
+          USER="${{ steps.ssh_port.outputs.user }}"
+          PASS="${{ secrets.VPS_PASS }}"
+          PORT=${{ steps.ssh_port.outputs.port }}
+          # Write the private key to file
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          # Get the public key from the private key
+          PUBKEY=$(ssh-keygen -y -f ~/.ssh/id_ed25519 2>/dev/null)
+          echo "Public key to install: $PUBKEY"
+          # Use sshpass to add the public key to authorized_keys on VPS
+          sshpass -p "$PASS" ssh -p $PORT -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no $USER@$HOST \
+            "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && grep -qF '$PUBKEY' ~/.ssh/authorized_keys || echo '$PUBKEY' >> ~/.ssh/authorized_keys && echo INSTALLED"
+          # Update known_hosts
+          ssh-keyscan -p $PORT -H $HOST >> ~/.ssh/known_hosts 2>/dev/null || true
+          # Test that SSH key auth now works
+          ssh -p $PORT -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 $USER@$HOST "echo KEY_AUTH_WORKS"
+
+      - name: Sync repo to VPS
+        run: |
+          PORT=${{ steps.ssh_port.outputs.port }}
+          USER=${{ steps.ssh_port.outputs.user }}
+          HOST="${{ secrets.VPS_HOST }}"
+          REMOTE_DIR="/opt/cryptosentinel"
+          ssh -p $PORT -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 $USER@$HOST "mkdir -p $REMOTE_DIR"
+          rsync -azP --delete \
+            --exclude '.git' \
+            --exclude 'node_modules' \
+            --exclude '.next' \
+            -e "ssh -p $PORT -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519" \
+            ./ $USER@$HOST:$REMOTE_DIR/
+
+      - name: Install + build + restart on VPS
+        run: |
+          PORT=${{ steps.ssh_port.outputs.port }}
+          USER=${{ steps.ssh_port.outputs.user }}
+          HOST="${{ secrets.VPS_HOST }}"
+          REMOTE_DIR="/opt/cryptosentinel"
+          ssh -p $PORT -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 $USER@$HOST bash -s << "REMOTE_SCRIPT"
+          set -e
+          cd $REMOTE_DIR
+
+          # Ensure persistent data dir
+          mkdir -p /data /var/log/cryptosentinel
+
+          # Install deps (npm — bun.lock removed in audit)
+          npm ci --omit=dev || npm install --omit=dev
+
+          # Generate Prisma client
+          npx prisma generate
+
+          # Build Next.js
+          NODE_OPTIONS=--max-old-space-size=2048 npx next build
+
+          # Apply DB schema (no --accept-data-loss — audit fix CRIT-7)
+          export DATABASE_URL=file:/data/cryptosentinel.db
+          npx prisma db push
+
+          # Restart PM2 (audit fix HIGH-1: max_restarts=10)
+          if command -v pm2 >/dev/null 2>&1; then
+            pm2 reload ecosystem.config.js --env production || pm2 start ecosystem.config.js --env production
+            pm2 save
+          else
+            npm install -g pm2
+            pm2 start ecosystem.config.js --env production
+            pm2 save
+            pm2 startup systemd -u $USER --hp /root 2>&1 | tail -3 || true
+          fi
+
+          # Reload Caddy with new config
+          if command -v caddy >/dev/null 2>&1; then
+            cp Caddyfile /etc/caddy/Caddyfile 2>/dev/null || true
+            systemctl reload caddy 2>/dev/null || caddy reload --config Caddyfile 2>/dev/null || true
+          fi
+
+          echo "=== Deploy complete ==="
+          pm2 list 2>/dev/null || true
+          REMOTE_SCRIPT
+
+      - name: Health check
+        run: |
+          for try in $(seq 1 24); do
+            for port in 81 3000 80 443; do
+              CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 \
+                http://${{ secrets.VPS_HOST }}:$port/api/health 2>/dev/null || echo "000")
+              if [ "$CODE" = "200" ]; then
+                echo "Health check passed on port $port"
+                curl -s http://${{ secrets.VPS_HOST }}:$port/api/health
+                exit 0
+              fi
+            done
+            echo "Attempt $try: not yet up, sleeping 5s..."
+            sleep 5
+          done
+          echo "::error::App did not become healthy on any expected port within 2 minutes."
+          exit 1

@@ -1,23 +1,41 @@
+# CryptoSentinel Caddy reverse proxy
+#
+# Listens on port 81 (Render's reverse proxy expects web service on $PORT).
+# For production on a VPS, change `:81` to `:443` and add your domain:
+#     cryptosentinel.example.com {
+#         reverse_proxy localhost:3000
+#     }
+# Caddy will auto-provision Let's Encrypt TLS.
+#
+# Security changes (audit fix CRIT-5):
+#   - REMOVED the `?XTransformPort=<port>` handler. It was a wide-open SSRF:
+#     any visitor could proxy to any internal port (PostgreSQL :5432, Redis
+#     :6379, Docker API :2375, metadata service 169.254.169.254, etc.).
+#     There is no legitimate use case for this in production.
+
 :81 {
-	@transform_port_query {
-		query XTransformPort=*
+	# Standard reverse proxy to the Next.js standalone server.
+	reverse_proxy localhost:3000 {
+		header_up Host {host}
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+		header_up X-Real-IP {remote_host}
 	}
 
-	handle @transform_port_query {
-		reverse_proxy localhost:{query.XTransformPort} {
-			header_up Host {host}
-			header_up X-Forwarded-For {remote_host}
-			header_up X-Forwarded-Proto {scheme}
-			header_up X-Real-IP {remote_host}
-		}
+	# Security headers (defense in depth — also set in next.config.ts)
+	header {
+		X-Frame-Options "DENY"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
 	}
 
-	handle {
-		reverse_proxy localhost:3000 {
-			header_up Host {host}
-			header_up X-Forwarded-For {remote_host}
-			header_up X-Forwarded-Proto {scheme}
-			header_up X-Real-IP {remote_host}
-		}
+	# Long timeout for AI streaming (analyze-stream uses SSE)
+	# Caddy default is 0 (no timeout) for streaming, but set explicit
+	# timeouts for normal requests to avoid hanging connections.
+	transport {
+		read_timeout 5m
+		write_timeout 5m
 	}
 }

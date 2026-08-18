@@ -16,6 +16,19 @@ function makeVulnHash(contractId: string, type: string, title: string): string {
   return createHash('sha256').update(`${contractId}:${type}:${title}`).digest('hex').slice(0, 32);
 }
 
+// ─────────────────────────────────────────────────────────────────
+// NOTE (audit comment, no functional change):
+// `VALIDATION_STEPS_MAP` and `POC_TEMPLATES` below are PLACEHOLDER strings,
+// not actual validation output. The strings claim Slither/Mythril/Echidna/
+// Certora were run, but those tools are NOT invoked anywhere in this codebase.
+// Real exploit validation is performed ONLY by `/api/validate-vuln` which
+// runs Foundry (forge) and `cast` against the target.
+//
+// To make this honest, replace the placeholder text with "Detected by <tag>
+// analysis. Run /api/validate-vuln for real exploit validation." or actually
+// integrate Slither/Mythril/Echidna/Certora into the pipeline.
+// ─────────────────────────────────────────────────────────────────
+
 const POC_TEMPLATES: Record<string, { code: string; filename: string }> = {
   reentrancy: { filename: 'ReentrancyAttack.t.sol', code: `// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\nimport "forge-std/Test.sol";\ncontract ReentrancyAttack { IVulnerable victim; function attack() external payable { victim.deposit{value: msg.value}(); victim.withdraw(); } receive() external payable { if (address(victim).balance >= 1 ether) victim.withdraw(); } }` },
   access_control: { filename: 'AccessControlAttack.t.sol', code: `// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\nimport "forge-std/Test.sol";\ncontract AccessControlAttack { function testUnauthorized() public { vm.prank(attacker); target.setOwner(attacker); } }` },

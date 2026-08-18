@@ -26,6 +26,9 @@ const CATEGORY_MAP: Record<string, string> = {
   delegatecall: 'Unsafe Delegatecall / Proxy Manipulation', storage_collision: 'Storage Collision / Proxy Slot Overlap',
 };
 
+// NOTE (audit comment, no functional change): VALIDATION_STEPS_MAP and
+// POC_TEMPLATES below are PLACEHOLDER strings — see note in analyze/route.ts.
+
 const VALIDATION_STEPS_MAP: Record<string, string> = {
   reentrancy: `Static (Slither): SWC-107 confirmed. Symbolic (Mythril): V1=0.95. Fuzzing (Echidna): V2=0.90. Formal (Certora): V3=0.95. Economic: V4=0.85. C=0.99 CONFIRMED.`,
   oracle_manipulation: `Economic Simulation: Flash loan manipulates TWAP by 35%, over-borrowing 42%. V4=0.95. C=0.95 CONFIRMED.`,
@@ -47,6 +50,7 @@ const POC_TEMPLATES: Record<string, { code: string; filename: string }> = {
   storage_collision: { filename: 'StorageCollisionAttack.t.sol', code: `// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\nimport "forge-std/Test.sol";\ncontract StorageCollisionTest { function testCollision() public { assertTrue(true); } }` },
   oracle_manipulation: { filename: 'OracleManipulationAttack.t.sol', code: `// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\nimport "forge-std/Test.sol";\ncontract OracleManipulationTest { function testManipulatedPrice() public { assertTrue(true); } }` },
 };
+
 
 
 /**

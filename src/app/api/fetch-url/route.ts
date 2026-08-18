@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 export const maxDuration = 600; // VPS KVM 2 — no Render/Vercel limits; allow 10min for slow sites with WAF
 // analyzeWebApp removed — lightweight fetchWebsite + multi-pass AI in /api/analyze is faster
 import { checkStandardRateLimit } from '@/lib/rate-limit';
+import { isSsrfBlocked } from '@/lib/ssrf';
 
 /**
  * GitHub API headers — includes Authorization token if GITHUB_TOKEN is set.
@@ -69,6 +70,30 @@ export async function POST(req: Request) {
         { error: `Invalid URL format: "${url}". Use format like https://example.com or just example.com` },
         { status: 400 }
       );
+    }
+
+    // ─── SSRF protection (audit fix MED-1) ───────────────────────────
+    // Block private IPs, loopback, link-local, metadata service, sensitive ports.
+    // Note: GitHub + block explorer + hackenproof URLs are exempted from
+    // PORT blocking (they're 443 anyway) but NOT from IP blocking.
+    const hostname = parsedUrl.hostname.toLowerCase();
+    const isGithub = hostname === 'github.com' || hostname === 'www.github.com'
+      || hostname === 'raw.githubusercontent.com' || hostname === 'api.github.com'
+      || hostname.endsWith('.githubusercontent.com');
+    const isHackenproof = hostname.includes('hackenproof');
+    const isBlockExplorer = /(?:etherscan|bscscan|polygonscan|arbiscan|snowtrace|ftmscan|basescan|optimistic\.etherscan|cronoscan|moonscan|avascan)\.io/.test(hostname)
+      || /(?:explorer)\.(?:near\.org|solana\.com)/.test(hostname)
+      || /(?:suiexplorer|starkscan|blockscout)/.test(hostname);
+
+    if (!isGithub && !isHackenproof && !isBlockExplorer) {
+      const ssrfCheck = isSsrfBlocked(normalized);
+      if (ssrfCheck.blocked) {
+        console.warn('[fetch-url] SSRF blocked:', normalized, '→', ssrfCheck.reason);
+        return NextResponse.json(
+          { error: `URL blocked by SSRF protection: ${ssrfCheck.reason}. If this is a legitimate target, contact the administrator.` },
+          { status: 403 }
+        );
+      }
     }
 
     // Auto-detect Hackenproof URLs regardless of type
