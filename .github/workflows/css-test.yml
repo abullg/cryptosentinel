@@ -1,0 +1,40 @@
+name: CSS Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check CSS/JS files
+        run: |
+            echo "=== 1. Get CSS link from HTML ==="
+            CSS_URL=$(curl -s --max-time 10 http://187.77.181.127/ 2>&1 | grep -oE 'href="[^"]*\.css"' | head -1 | sed 's/href="//;s/"//')
+            echo "CSS URL: $CSS_URL"
+            
+            echo ""
+            echo "=== 2. Fetch CSS file ==="
+            curl -s -o /dev/null -w "CSS HTTP=%{http_code} size=%{size_download}\n" --max-time 10 "http://187.77.181.127$CSS_URL" 2>&1
+            
+            echo ""
+            echo "=== 3. Get JS links from HTML ==="
+            curl -s --max-time 10 http://187.77.181.127/ 2>&1 | grep -oE 'src="[^"]*\.js"' | head -10
+            
+            echo ""
+            echo "=== 4. Fetch first JS file ==="
+            JS_URL=$(curl -s --max-time 10 http://187.77.181.127/ 2>&1 | grep -oE 'src="[^"]*\.js"' | head -1 | sed 's/src="//;s/"//')
+            echo "JS URL: $JS_URL"
+            curl -s -o /dev/null -w "JS HTTP=%{http_code} size=%{size_download}\n" --max-time 10 "http://187.77.181.127$JS_URL" 2>&1
+            
+            echo ""
+            echo "=== 5. Full HTML head section ==="
+            curl -s --max-time 10 http://187.77.181.127/ 2>&1 | head -5 | sed 's/></>\n</g' | head -20
+            
+            echo ""
+            echo "=== 6. Check _next/static dir ==="
+            curl -s -o /dev/null -w "static HTTP=%{http_code}\n" --max-time 10 "http://187.77.181.127/_next/static/" 2>&1
+            
+            echo ""
+            echo "=== DONE ==="
