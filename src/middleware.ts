@@ -21,10 +21,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { timingSafeEqual } from 'crypto';
 
-// Run middleware on Node.js runtime (not Edge) — `crypto.timingSafeEqual`
-// is a Node-only API. Edge Runtime doesn't support it. See `config` export
-// at the bottom of this file.
-
 const AUTH_COOKIE_NAME = 'cryptosentinel-token';
 const AUTH_QUERY_PARAM = 'token';
 
@@ -99,11 +95,8 @@ export function middleware(req: NextRequest) {
   return NextResponse.redirect(loginUrl);
 }
 
-// Run middleware on Node.js runtime (not Edge) — `crypto.timingSafeEqual`
-// is a Node-only API. Edge Runtime doesn't support it.
 // Run on /api/* and root page (not on /_next/* static assets)
 export const config = {
-  runtime: 'nodejs',
   matcher: [
     // Match all API routes
     '/api/:path*',
