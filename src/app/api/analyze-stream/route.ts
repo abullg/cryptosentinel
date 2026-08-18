@@ -276,11 +276,7 @@ export async function POST(req: NextRequest) {
           console.error('[analyze-stream] GLOBAL TIMEOUT (10 min) — completing with current findings');
           send('progress', { step: 'timeout', message: 'Analysis timeout (10 min) — completing with current findings.', percent: 95 });
           try {
-            const allCurrent = [...filteredStaticResults, ...aiResults];
-            db.audit.update({
-              where: { id: effectiveAuditId },
-              data: { status: 'completed', completedAt: new Date(), findings: allCurrent.length, confidence: 0 },
-            }).catch(() => {});
+            const allCurrent = [...(filteredStaticResults || []), ...(aiResults || [])];
             send('complete', {
               findings: allCurrent,
               message: `Analysis timeout after 10 min — ${allCurrent.length} findings saved.`,
@@ -289,7 +285,6 @@ export async function POST(req: NextRequest) {
           try { controller.close(); } catch {}
         }, 600_000); // 10 minutes
 
-        try {
         const isWebAnalysis = targetType === 'exchange';
         const isHackenproof = !!hackenproofContext;
 
