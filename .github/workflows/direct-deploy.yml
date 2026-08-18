@@ -54,6 +54,14 @@ jobs:
           npx next build 2>&1 | tail -20
 
           echo ""
+          echo "=== 4.5 Copy static assets to standalone ==="
+          # CRITICAL: Next.js standalone does NOT include static assets.
+          # Without this, server.js runs but UI loads blank (no CSS/JS).
+          cp -r .next/static .next/standalone/.next/ 2>/dev/null || true
+          if [ -d public ]; then cp -r public .next/standalone/; fi
+          echo "  Static assets copied"
+
+          echo ""
           echo "=== 5. Apply DB schema ==="
           export DATABASE_URL=file:/data/cryptosentinel.db
           npx prisma db push 2>&1 | tail -5
