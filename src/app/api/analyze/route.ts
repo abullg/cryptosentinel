@@ -227,10 +227,98 @@ async function runStaticPhase(
 
   const settings = await db.settings.findFirst();
   const apiKey = process.env.OPENROUTER_API_KEY || settings?.apiKey || '';
+  const model = settings?.model || DEFAULT_MODEL;
   // Strict OpenRouter key validation. Old code accepted any string > 10 chars,
   // which let users save a wrong-platform key and then hang on a 60s OpenRouter 401.
   const OPENROUTER_KEY_RE = /^sk-or-v1-[A-Za-z0-9_-]{20,}$/;
   const needsAI = !!(apiKey && OPENROUTER_KEY_RE.test(apiKey) && effectiveSourceCode.length > 20);
+
+  // ─── AUTO-VALIDATION: actively test each finding against production target ───
+  // Per user request (2026-08-18): findings should be ACTIVELY VALIDATED,
+  // not just statically detected. This runs real HTTP payloads / Foundry
+  // tests / on-chain RPC calls to confirm each finding with observable impact.
+  //
+  // All findings are validated IN PARALLEL for speed (8 findings = ~15s, not 2min).
+  // Each finding gets validationScope='target' or 'lab' if EXPLOITABLE,
+  // 'theoretical' if INCONCLUSIVE (config weakness / no exploit demonstrated).
+  if (results.length > 0) {
+    try {
+      const { activelyValidate } = await import('@/lib/active-validator');
+      const validationTargetUrl = body?.targetUrl || body?.hackenproofContext?.url || '';
+
+      console.log(`[analyze] Auto-validating ${results.length} findings in parallel...`);
+      const validationPromises = results.map(async (vuln, idx) => {
+        try {
+          const result = await Promise.race([
+            activelyValidate(
+              effectiveSourceCode,
+              effectiveContractName,
+              { type: vuln.type, title: vuln.title, severity: vuln.severity,
+                description: vuln.description, location: vuln.location || '' },
+              apiKey, model,
+              validationTargetUrl || undefined,
+            ),
+            new Promise<any>((_, reject) =>
+              setTimeout(() => reject(new Error('Validation timeout (30s)')), 30_000)),
+          ]);
+
+          const scope = result.validationScope || 'theoretical';
+          const verdict = result.verdict || 'INCONCLUSIVE';
+
+          let newStatus = 'candidate';
+          let newConfidence = 0;
+          if (verdict === 'EXPLOITABLE') {
+            newStatus = scope === 'target' ? 'confirmed' : 'validated';
+            newConfidence = 1;
+          } else if (verdict === 'NOT_EXPLOITABLE') {
+            newStatus = 'refuted';
+            newConfidence = 0;
+          } else {
+            newStatus = 'candidate';
+            newConfidence = 0;
+          }
+
+          console.log(`[analyze] Finding ${idx + 1}/${results.length} (${vuln.type}): ${verdict} (scope=${scope})`);
+
+          return {
+            id: vuln.id,
+            update: {
+              confidence: newConfidence,
+              status: newStatus,
+              validationScope: scope,
+              description: vuln.description + `\n\n[${verdict}] Validation scope: ${scope}\n${result.evidence?.slice(0, 500) || ''}`,
+            },
+          };
+        } catch (e: any) {
+          console.log(`[analyze] Finding ${idx + 1}/${results.length} (${vuln.type}): validation failed — ${String(e?.message || e).slice(0, 100)}`);
+          return null;
+        }
+      });
+
+      const validationResults = await Promise.all(validationPromises);
+      // Apply updates to DB and replace in results array
+      for (const vr of validationResults) {
+        if (!vr) continue;
+        try {
+          await db.vulnerability.update({ where: { id: vr.id }, data: vr.update });
+          // Replace in results array
+          const idx = results.findIndex(r => r.id === vr.id);
+          if (idx >= 0) {
+            results[idx] = { ...results[idx], ...vr.update };
+          }
+        } catch (e) {
+          // DB update failed — keep original finding
+        }
+      }
+      console.log(`[analyze] Auto-validation complete. Results: ${
+        results.filter(r => r.status === 'confirmed' || r.status === 'validated').length
+      } confirmed, ${results.filter(r => r.status === 'refuted').length} refuted, ${
+        results.filter(r => r.status === 'candidate').length
+      } inconclusive.`);
+    } catch (e) {
+      console.error('[analyze] Auto-validation error:', e);
+    }
+  }
 
   return NextResponse.json({
     audit, findings: results, contract,
@@ -472,6 +560,76 @@ async function executeAIPhase(
         } catch { /* keep current */ }
       });
       await Promise.allSettled(verifyPromises);
+    }
+  }
+
+  // === Step 5: AUTO-VALIDATION — actively test each finding ===
+  // Per user request (2026-08-18): ALL findings must be actively validated,
+  // not just statically detected. This sends real HTTP payloads / Foundry
+  // tests / on-chain RPC calls to confirm each finding with observable impact.
+  if (results.length > 0) {
+    try {
+      const { activelyValidate } = await import('@/lib/active-validator');
+      console.log(`[analyze-ai] Auto-validating ${results.length} AI findings in parallel...`);
+
+      const validationPromises = results.map(async (vuln, idx) => {
+        try {
+          const result = await Promise.race([
+            activelyValidate(
+              sourceCode,
+              contractName || 'Contract',
+              { type: vuln.type, title: vuln.title, severity: vuln.severity,
+                description: vuln.description, location: vuln.location || '' },
+              apiKey, model,
+              targetUrl || undefined,
+            ),
+            new Promise<any>((_, reject) =>
+              setTimeout(() => reject(new Error('Validation timeout (30s)')), 30_000)),
+          ]);
+
+          const scope = result.validationScope || 'theoretical';
+          const verdict = result.verdict || 'INCONCLUSIVE';
+
+          let newStatus = vuln.status;
+          let newConfidence = vuln.confidence;
+          if (verdict === 'EXPLOITABLE') {
+            newStatus = scope === 'target' ? 'confirmed' : 'validated';
+            newConfidence = 1;
+          } else if (verdict === 'NOT_EXPLOITABLE') {
+            newStatus = 'refuted';
+            newConfidence = 0;
+          }
+          // INCONCLUSIVE — keep current status/confidence (already set by AI)
+
+          console.log(`[analyze-ai] Finding ${idx + 1}/${results.length} (${vuln.type}): ${verdict} (scope=${scope})`);
+
+          return {
+            id: vuln.id,
+            update: {
+              confidence: newConfidence,
+              status: newStatus,
+              validationScope: scope,
+              description: vuln.description + `\n\n[${verdict}] Validation scope: ${scope}\n${result.evidence?.slice(0, 500) || ''}`,
+            },
+          };
+        } catch (e: any) {
+          console.log(`[analyze-ai] Finding ${idx + 1}/${results.length} (${vuln.type}): validation failed — ${String(e?.message || e).slice(0, 100)}`);
+          return null;
+        }
+      });
+
+      const validationResults = await Promise.all(validationPromises);
+      for (const vr of validationResults) {
+        if (!vr) continue;
+        try {
+          await db.vulnerability.update({ where: { id: vr.id }, data: vr.update });
+          const idx = results.findIndex(r => r.id === vr.id);
+          if (idx >= 0) results[idx] = { ...results[idx], ...vr.update };
+        } catch {}
+      }
+      console.log(`[analyze-ai] Auto-validation complete. ${results.filter(r => r.status === 'confirmed' || r.status === 'validated').length} confirmed, ${results.filter(r => r.status === 'refuted').length} refuted, ${results.filter(r => r.status === 'candidate').length} inconclusive.`);
+    } catch (e) {
+      console.error('[analyze-ai] Auto-validation error:', e);
     }
   }
 
