@@ -318,9 +318,38 @@ export async function POST(req: NextRequest) {
         // Step 1: Main AI analysis
         send('progress', { step: 'ai_analysis', message: 'Running GLM 5.2 deep analysis (this may take 30-60s)...', percent: 50 });
         const analysisSourceWithWeb = analysisSource + webSearchContext;
-        const aiVulns = isWebAnalysis
-          ? await analyzeWebWithGLM(analysisSourceWithWeb, contractName || 'Contract', { apiKey, model })
-          : await analyzeWithGLM(analysisSourceWithWeb, contractName || 'Contract', { apiKey, model }, blockchainData || undefined);
+
+        // CRITICAL FIX: wrap AI call in try/catch with timeout to prevent
+        // "TypeError: Failed to fetch" hang at 30%. If OpenRouter is
+        // unreachable or takes too long, send error event and complete
+        // with static findings only.
+        let aiVulns: any[] = [];
+        try {
+          const aiResult = await Promise.race([
+            isWebAnalysis
+              ? analyzeWebWithGLM(analysisSourceWithWeb, contractName || 'Contract', { apiKey, model })
+              : analyzeWithGLM(analysisSourceWithWeb, contractName || 'Contract', { apiKey, model }, blockchainData || undefined),
+            new Promise<never>((_, reject) =>
+              setTimeout(() => reject(new Error('AI analysis timeout (120s) — OpenRouter may be overloaded')), 120_000)),
+          ]);
+          aiVulns = aiResult;
+        } catch (aiError: any) {
+          console.error('[analyze-stream] AI analysis failed:', aiError);
+          const errMsg = String(aiError?.message || aiError).slice(0, 300);
+          send('progress', { step: 'ai_failed', message: `AI analysis failed: ${errMsg}. Completing with static findings only.`, percent: 75 });
+          // Complete with static findings only — DON'T hang at 30%
+          try {
+            await db.audit.update({
+              where: { id: effectiveAuditId },
+              data: { status: 'completed', completedAt: new Date(), findings: staticResults.length, confidence: 0 },
+            });
+          } catch {}
+          send('complete', {
+            findings: [...filteredStaticResults],
+            message: `Analysis complete: ${staticResults.length} static findings (AI analysis failed: ${errMsg})`,
+          });
+          return;
+        }
 
         send('progress', { step: 'ai_done', message: `AI found ${aiVulns.length} potential vulnerabilities`, percent: 75 });
 

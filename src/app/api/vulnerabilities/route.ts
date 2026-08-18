@@ -22,16 +22,26 @@ export async function POST(req: Request) {
   try {
     const body = await req.json();
 
-    // === ACTION: clear-all — delete all vulnerabilities, contracts, audits ===
+    // === ACTION: clear-all — delete ALL data (vulns, contracts, audits, projects, jobs, memory) ===
     if (body.action === 'clear-all') {
       const deletedVulns = await db.vulnerability.deleteMany({});
       const deletedContracts = await db.contract.deleteMany({});
       const deletedAudits = await db.audit.deleteMany({});
+      const deletedJobs = await db.analysisJob.deleteMany({});
+      const deletedMemory = await db.memoryPattern.deleteMany({});
+      const deletedProjects = await db.project.deleteMany({});
+      const deletedSettings = await db.settings.deleteMany({});
+      // Recreate default settings
+      await db.settings.create({ data: { model: 'z-ai/glm-5.2' } }).catch(() => {});
       return NextResponse.json({
         cleared: true,
         vulnerabilities: deletedVulns.count,
         contracts: deletedContracts.count,
         audits: deletedAudits.count,
+        jobs: deletedJobs.count,
+        memoryPatterns: deletedMemory.count,
+        projects: deletedProjects.count,
+        settings: deletedSettings.count,
       });
     }
 
