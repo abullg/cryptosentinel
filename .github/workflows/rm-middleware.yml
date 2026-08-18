@@ -1,0 +1,74 @@
+name: Remove Middleware
+
+on:
+  workflow_dispatch:
+
+jobs:
+  fix:
+    name: Remove middleware.ts and rebuild
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          HOST="${{ secrets.VPS_HOST }}"
+          ssh-keyscan -p 22 -H $HOST >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Remove middleware + clean rebuild + test
+        run: |
+          HOST="${{ secrets.VPS_HOST }}"
+          USER="${{ secrets.VPS_USER || 'root' }}"
+          PORT=22
+          ssh -p $PORT -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 $USER@$HOST bash -s <<'RMV'
+          set -e
+          cd /opt/cryptosentinel
+
+          echo "=== 1. Remove middleware.ts and proxy.ts (if any) ==="
+          rm -f src/middleware.ts src/proxy.ts
+          ls -la src/middleware.ts src/proxy.ts 2>&1 || echo "Both removed"
+          echo ""
+
+          echo "=== 2. Verify health + login routes exist in source ==="
+          ls -la src/app/api/health/route.ts src/app/api/login/route.ts 2>&1
+
+          echo ""
+          echo "=== 3. Clean everything and rebuild from scratch ==="
+          rm -rf .next node_modules/.cache
+          npm ci 2>&1 | tail -3
+          export NODE_OPTIONS=--max-old-space-size=2048
+          npx next build 2>&1 | tail -25
+
+          echo ""
+          echo "=== 4. Verify route.js exists in fresh build ==="
+          find .next/standalone/.next/server -name "route.js" 2>&1 | head -25
+
+          echo ""
+          echo "=== 5. Restart PM2 ==="
+          pm2 delete cryptosentinel 2>&1 | tail -2
+          set -a; . /etc/cryptosentinel.env 2>/dev/null; set +a
+          pm2 start ecosystem.config.js --env production 2>&1 | tail -5
+          pm2 save 2>&1 | tail -2
+          sleep 8
+
+          echo ""
+          echo "=== 6. Test endpoints (no middleware) ==="
+          for path in /api/health /api/login /api/test-key /api/settings /api/projects /; do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 http://localhost:3000$path 2>/dev/null || echo "000")
+            echo "  $path -> HTTP $CODE"
+          done
+
+          echo ""
+          echo "=== 7. Detailed /api/health ==="
+          curl -sv --max-time 10 http://localhost:3000/api/health 2>&1 | tail -25
+
+          echo ""
+          echo "=== 8. Detailed /api/login ==="
+          curl -sv --max-time 10 http://localhost:3000/api/login 2>&1 | tail -20
+
+          echo ""
+          echo "=== DONE ==="
+          RMV
