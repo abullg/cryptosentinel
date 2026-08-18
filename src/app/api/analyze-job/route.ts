@@ -170,6 +170,7 @@ async function runAnalysisInBackground(jobId: string, config: {
       aiVulns = await Promise.race([aiPromise, timeoutPromise]);
       clearInterval(progressInterval);
     } catch (err: any) {
+      clearInterval(progressInterval);
       await updateJob(40, `AI pass 1 ${String(err).slice(0, 100)}. Completing with static findings.`);
       if (jobTimedOut) return;
       const allResults = savedStatic.map(s => s.vuln);

@@ -52,10 +52,10 @@ jobs:
           if [ -n "$JOB_ID" ]; then
             echo ""
             echo "=== 7. Poll job status (30s) ==="
-            for i in 1 2 3 4 5 6; do
+            for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
               STATUS=$(curl -s --max-time 5 "http://localhost:3000/api/job-status/$JOB_ID" 2>&1)
               echo "  Poll $i: $STATUS" | head -3
-              sleep 5
+              sleep 10
             done
           fi
 
