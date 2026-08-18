@@ -24,24 +24,39 @@ jobs:
           USER="${{ secrets.VPS_USER || 'root' }}"
           PORT=22
           ssh -p $PORT -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 $USER@$HOST bash -s <<'FORCE'
-          echo "=== Delete DB file (nuclear option) ==="
-          # Delete the SQLite database file entirely — PM2 will recreate it on restart
+          echo "=== 1. Stop PM2 ==="
+          pm2 delete cryptosentinel 2>&1 | tail -2 || true
+
+          echo ""
+          echo "=== 2. Delete DB file ==="
           rm -f /data/cryptosentinel.db /data/cryptosentinel.db-journal /data/cryptosentinel.db-shm /data/cryptosentinel.db-wal
           echo "  DB file deleted"
 
           echo ""
-          echo "=== Restart PM2 (will recreate empty DB) ==="
+          echo "=== 3. Recreate DB with schema (prisma db push) ==="
           cd /opt/cryptosentinel
-          pm2 delete cryptosentinel 2>&1 | tail -2
+          export DATABASE_URL=file:/data/cryptosentinel.db
+          npx prisma db push 2>&1 | tail -5
+          echo "  Schema applied"
+
+          echo ""
+          echo "=== 4. Start PM2 (clean DB) ==="
           set -a; . /etc/cryptosentinel.env 2>/dev/null; set +a
           pm2 start ecosystem.config.js --env production 2>&1 | tail -5
           pm2 save 2>&1 | tail -2
           sleep 8
 
           echo ""
-          echo "=== Verify cleared ==="
-          PROJECTS=$(curl -s --max-time 10 http://localhost:3000/api/projects 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d))" 2>/dev/null || echo "?")
-          VULNS=$(curl -s --max-time 10 http://localhost:3000/api/vulnerabilities 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d))" 2>/dev/null || echo "?")
+          echo "=== 5. Call clear-all API (deletes any auto-created data) ==="
+          curl -s --max-time 15 -X POST http://localhost:3000/api/vulnerabilities \
+            -H 'Content-Type: application/json' \
+            -d '{"action":"clear-all"}' 2>&1
+
+          echo ""
+          echo ""
+          echo "=== 6. Verify cleared ==="
+          PROJECTS=$(curl -s --max-time 10 http://localhost:3000/api/projects 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d) if isinstance(d,list) else 'error')" 2>/dev/null || echo "error")
+          VULNS=$(curl -s --max-time 10 http://localhost:3000/api/vulnerabilities 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d) if isinstance(d,list) else 'error')" 2>/dev/null || echo "error")
           echo "Projects remaining: $PROJECTS"
           echo "Vulnerabilities remaining: $VULNS"
 
