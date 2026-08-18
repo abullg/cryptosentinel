@@ -1,0 +1,41 @@
+name: External Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Test VPS from outside
+        run: |
+          echo "=== 1. HTTP GET port 80 ==="
+          curl -sv --max-time 15 http://187.77.181.127/ 2>&1 | head -30
+          
+          echo ""
+          echo "=== 2. HTTP code ==="
+          curl -s -o /dev/null -w "HTTP=%{http_code} size=%{size_download} time=%{time_total}s\n" --max-time 15 http://187.77.181.127/ 2>&1
+          
+          echo ""
+          echo "=== 3. Check CSS/JS links in HTML ==="
+          curl -s --max-time 10 http://187.77.181.127/ 2>&1 | grep -oE '(href|src)="[^"]*"' | head -10
+          
+          echo ""
+          echo "=== 4. Test API ==="
+          curl -s --max-time 10 http://187.77.181.127/api/settings 2>&1 | head -5
+          
+          echo ""
+          echo "=== 5. Test port 3000 from outside ==="
+          curl -s -o /dev/null -w "HTTP=%{http_code} time=%{time_total}s\n" --max-time 10 http://187.77.181.127:3000/ 2>&1 || echo "Port 3000 unreachable"
+          
+          echo ""
+          echo "=== 6. Test port 443 ==="
+          curl -s -o /dev/null -w "HTTP=%{http_code} time=%{time_total}s\n" --max-time 10 https://187.77.181.127/ 2>&1 || echo "Port 443 unreachable"
+          
+          echo ""
+          echo "=== 7. HTML title ==="
+          curl -s --max-time 10 http://187.77.181.127/ 2>&1 | grep -oE '<title>[^<]*</title>' | head -3
+          
+          echo ""
+          echo "=== DONE ==="
