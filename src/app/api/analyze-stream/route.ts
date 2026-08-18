@@ -330,7 +330,7 @@ export async function POST(req: NextRequest) {
               ? analyzeWebWithGLM(analysisSourceWithWeb, contractName || 'Contract', { apiKey, model })
               : analyzeWithGLM(analysisSourceWithWeb, contractName || 'Contract', { apiKey, model }, blockchainData || undefined),
             new Promise<never>((_, reject) =>
-              setTimeout(() => reject(new Error('AI analysis timeout (120s) — OpenRouter may be overloaded')), 120_000)),
+              setTimeout(() => reject(new Error('AI analysis timeout (300s) — OpenRouter may be overloaded')), 300_000)),
           ]);
           aiVulns = aiResult;
         } catch (aiError: any) {
