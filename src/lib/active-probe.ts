@@ -54,8 +54,8 @@ const BROWSER_HEADERS: Record<string, string> = {
 };
 
 const PER_REQUEST_TIMEOUT = 6_000;
-const MAX_PROBES = 60;             // hard cap on total probes
-const MAX_CONFIRMED = 25;          // hard cap on confirmed findings to save
+const MAX_PROBES = 100;             // hard cap on total probes (was 60, doubled)
+const MAX_CONFIRMED = 30;           // hard cap on confirmed findings to save
 
 // ─── Payload libraries ────────────────────────────────────────────────
 
@@ -498,8 +498,9 @@ export async function runActiveProbes(inputs: ProbeInput[]): Promise<PreConfirme
   // Shuffle + cap so we test broadly even on huge inputs
   const shuffled = queue.sort(() => Math.random() - 0.5).slice(0, MAX_PROBES);
 
-  // Run probes with limited concurrency (8 at a time) — never DoS target
-  const CONCURRENCY = 8;
+  // Run probes with limited concurrency (16 at a time — was 8) — never DoS target
+  // but allow faster throughput so 100 probes finish in ~40s vs 90s
+  const CONCURRENCY = 16;
   let cursor = 0;
 
   async function worker() {

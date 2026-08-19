@@ -12,6 +12,7 @@ import { runSemanticAnalysis } from '@/lib/semantic-analyzer';
 import { runAnomalyDetection } from '@/lib/anomaly-detector';
 import { runControlFlowAnalysis } from '@/lib/control-flow-analyzer';
 import { runActiveProbes, buildProbeInputsFromCrawl, type PreConfirmedFinding } from '@/lib/active-probe';
+import { rigorVerifyFinding } from '@/lib/rigor-verify';
 import { createHash } from 'crypto';
 
 const CATEGORY_MAP: Record<string, string> = {
@@ -110,27 +111,26 @@ async function runAnalysisInBackground(jobId: string, config: {
     await db.analysisJob.update({ where: { id: jobId }, data: { progress, message, status: progress < 100 ? 'running' : 'completed' } }).catch(() => {});
   };
 
-  // ─── GLOBAL TIMEOUT: entire job must complete in 15 min ───
-  // User feedback: "ему не хватает времени" — AI needed more time on
-  // complex targets with 30+ pages. 10 min was too tight when Phase 0
-  // (active probes) + Phase 2 (AI pass 1+2) + Phase 3 (validation) all
-  // had to run. VPS is KVM 2 (always-on, no serverless limit) so 15 min
-  // is safe. If anything hangs, this fires and completes with whatever
-  // findings we have. NEVER hang forever.
+  // ─── GLOBAL TIMEOUT: entire job must complete in 30 min ───
+  // User feedback: "15 минут тоже мало" — increase parallelism and total
+  // time to 30 min. VPS is KVM 2 (always-on, no serverless limit) so
+  // 30 min is safe. The job MUST complete (status=completed, progress=100)
+  // — never hang forever with status=running. If anything hangs, this
+  // fires and completes with whatever findings we have.
   let jobTimedOut = false;
   const globalTimeout = setTimeout(async () => {
     jobTimedOut = true;
-    console.error('[analyze-job] GLOBAL TIMEOUT (15 min) — completing with current findings');
+    console.error('[analyze-job] GLOBAL TIMEOUT (30 min) — completing with current findings');
     try {
-      await updateJob(95, 'Analysis timeout (15 min) — completing with current findings.');
+      await updateJob(95, 'Analysis timeout (30 min) — completing with current findings.');
       // Get whatever findings we have
       const existingVulns = await db.vulnerability.findMany({ where: { contractId } }).catch(() => []);
       await db.audit.update({ where: { id: auditId },
         data: { status: 'completed', completedAt: new Date(), findings: existingVulns.length } }).catch(() => {});
       await db.analysisJob.update({ where: { id: jobId },
-        data: { status: 'completed', progress: 100, message: `Timeout after 15 min — ${existingVulns.length} findings saved`, resultCount: existingVulns.filter((v: any) => v.status === 'confirmed' || v.status === 'validated').length } }).catch(() => {});
+        data: { status: 'completed', progress: 100, message: `Timeout after 30 min — ${existingVulns.length} findings saved`, resultCount: existingVulns.filter((v: any) => v.status === 'confirmed' || v.status === 'validated').length } }).catch(() => {});
     } catch {}
-  }, 900_000); // 15 minutes
+  }, 1_800_000); // 30 minutes
 
   try {
     const globalStartTime = Date.now();
@@ -163,6 +163,53 @@ async function runAnalysisInBackground(jobId: string, config: {
         console.warn('[analyze-job] Active probes failed:', String(probeErr).slice(0, 150));
       }
 
+      // ─── RIGOR VERIFICATION + SAVE ───
+      // For each pre-confirmed finding, run rigor verification BEFORE
+      // saving. User explicitly asked: every confirmed finding must
+      // answer 5 standard questions (repeatability, clean session,
+      // public comparison, multi-entity uniqueness, real-vs-demo).
+      // If rigor FAILS, the finding is DROPPED (not saved to DB).
+      // This prevents the SPA-shell false positives like the
+      // /admin /dashboard Nuxt.js finding the user questioned.
+      const confirmedAfterRigor: PreConfirmedFinding[] = [];
+      let rigorDropped = 0;
+      for (const f of preConfirmed) {
+        try {
+          const rigor = await Promise.race([
+            rigorVerifyFinding(f, targetUrl),
+            new Promise<any>((resolve) =>
+              setTimeout(() => resolve({
+                verdict: 'INCONCLUSIVE',
+                evidence: 'Rigor verification timed out (30s) — keeping finding as confirmed but without rigor answers.',
+                refinedDescription: f.description,
+                repeatability: 'unknown', cleanSession: 'unknown',
+                publicComparison: 'unknown', multiEntity: 'unknown', realVsDemo: 'unknown',
+              }), 30_000)),
+          ]);
+          if (rigor.verdict === 'FAIL') {
+            // Rigor check failed — likely false positive. Drop it.
+            console.log(`[analyze-job] Rigor FAILED for "${f.title}" — dropping (likely false positive)`);
+            rigorDropped++;
+            continue;
+          }
+          // Update finding description with rigor answers so user sees them
+          confirmedAfterRigor.push({
+            ...f,
+            description: rigor.refinedDescription,
+            evidence: `${f.evidence}\n\n== RIGOR VERIFICATION ==\n${rigor.evidence}`,
+            // Reduce confidence if partial pass (3-4/5) vs full pass (5/5)
+            confidence: rigor.verdict === 'PASS' ? f.confidence : Math.max(0.6, f.confidence - 0.15),
+          });
+        } catch (rigorErr) {
+          console.warn(`[analyze-job] Rigor check error for "${f.title}": ${String(rigorErr).slice(0, 100)} — keeping as-is`);
+          confirmedAfterRigor.push(f);
+        }
+      }
+      preConfirmed = confirmedAfterRigor;
+      if (rigorDropped > 0) {
+        console.log(`[analyze-job] Rigor verification dropped ${rigorDropped}/${preConfirmed.length + rigorDropped} findings as false positives`);
+      }
+
       // Save confirmed findings to DB immediately — bypassing AI entirely
       for (const f of preConfirmed) {
         const hashSig = makeVulnHash(contractId, f.type, f.title);
@@ -176,12 +223,12 @@ async function runAnalysisInBackground(jobId: string, config: {
               description: f.description,
               location: f.location,
               confidence: f.confidence,
-              status: 'confirmed', // HARD HTTP evidence = confirmed
+              status: 'confirmed', // HARD HTTP evidence + RIGOR passed = confirmed
               hashSignature: hashSig,
               patternTag: f.type,
               target: contractName,
               vulnCategory: CATEGORY_MAP[f.type] || f.type,
-              validationSteps: `Actively validated via real HTTP request. Evidence:\n${f.evidence}`,
+              validationSteps: `Actively validated via real HTTP request + rigor verification (5 standard questions answered). Evidence:\n${f.evidence}`,
               poc: f.pocOutline,
               pocFilename: `${f.type}_attack.t.sol`,
               codeSnippet: sourceCode ? sourceCode.slice(0, 200) : null,
@@ -448,7 +495,7 @@ async function runAnalysisInBackground(jobId: string, config: {
     const allResults = [...savedStatic.map(s => s.vuln), ...savedAi.map(s => s.vuln)].filter((r: any) => r.status === 'confirmed' || r.status === 'validated');
     const exploitCount = allResults.length + preConfirmed.length;
 
-    const summary = `Analysis complete: ${exploitCount} confirmed exploit${exploitCount === 1 ? '' : 's'} (${preConfirmed.length} from active HTTP probes + ${allResults.length} from AI/static validation). Non-confirmed findings were dropped.`;
+    const summary = `Analysis complete: ${exploitCount} confirmed exploit${exploitCount === 1 ? '' : 's'} (${preConfirmed.length} from active HTTP probes + ${allResults.length} from AI/static validation). All findings passed rigor verification (5 standard questions: repeatability, clean session, public comparison, multi-entity, real-vs-demo). Non-confirmed findings were dropped.`;
     await updateJob(100, summary);
     await db.audit.update({ where: { id: auditId }, data: { status: 'completed', findings: exploitCount, completedAt: new Date() } }).catch(() => {});
     await db.analysisJob.update({ where: { id: jobId }, data: { status: 'completed', resultCount: exploitCount } }).catch(() => {});

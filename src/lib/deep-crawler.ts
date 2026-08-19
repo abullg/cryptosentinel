@@ -86,10 +86,13 @@ const BROWSER_HEADERS: Record<string, string> = {
   'Upgrade-Insecure-Requests': '1',
 };
 
-const MAX_PAGES = 30;
-const MAX_JS_BUNDLES = 12;
+const MAX_PAGES = 50;
+const MAX_JS_BUNDLES = 15;
 const PER_PAGE_TIMEOUT = 8_000;
-const TOTAL_BUDGET_MS = 90_000; // hard cap so we never hang the pipeline
+const TOTAL_BUDGET_MS = 240_000; // 4 min hard cap — was 90s, too tight
+// with proxy fallback (each page can take 8s). 50 pages × 8s sequential
+// = 6+ min, but parallel batches of 10 cut this to ~80s. 4 min leaves
+// headroom for slow responses.
 const COMMON_SEED_PATHS = [
   '/', '/login', '/signin', '/register', '/signup', '/auth',
   '/admin', '/dashboard', '/account', '/settings', '/profile',
@@ -601,13 +604,13 @@ export async function deepCrawl(targetUrl: string): Promise<CrawlResult> {
   let securityHeaders: Record<string, string> = {};
   let wafDetected = false;
 
-  // PARALLEL BFS LOOP — fetch pages in batches of 5 at a time.
+  // PARALLEL BFS LOOP — fetch pages in batches of 10 at a time.
   // Previous version was SEQUENTIAL: 30 pages × ~8s each = 4 minutes
   // just for crawling. With WAF proxy fallback, each page could take
   // up to 18s (6s direct + 6s allorigins + 6s codetabs) → 9 minutes
   // for Phase 0 alone. This caused the user's "stuck at 5 min" freeze.
-  // Parallel batches reduce 30 pages × 8s to ~6 batches × 8s = 48s.
-  const PARALLEL_BATCH = 5;
+  // Parallel batches of 10 cut 50 pages × 8s to ~5 batches × 8s = 40s.
+  const PARALLEL_BATCH = 10;
 
   while (queue.length > 0 && pages.length < MAX_PAGES) {
     // Time budget check
