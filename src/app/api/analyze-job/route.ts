@@ -16,6 +16,7 @@ import { rigorVerifyFinding } from '@/lib/rigor-verify';
 import { writeProgressFile } from '@/lib/progress-file';
 import { withTimeout, fireAndForget } from '@/lib/with-timeout';
 import { checkPassiveEvidence } from '@/lib/passive-evidence';
+import { runProvenanceChain } from '@/lib/provenance-chain';
 import { createHash } from 'crypto';
 
 const CATEGORY_MAP: Record<string, string> = {
@@ -813,36 +814,39 @@ async function runValidationOnFindings(
         }
       }
 
-      // ─── ACTIVE VALIDATION (or passive evidence was insufficient) ───
-      const verification = await Promise.race([
-        activelyValidate(
-          sourceCode, contractName,
+      // ─── PROVENANCE CHAIN (replaces superficial activelyValidate) ───
+      // User: 'candidate → request ID → raw request → raw response →
+      // evidence extractor → security-property check → CONFIRMED / DROP'
+      // 'AI может иметь confidence 0.99, но это ещё не proof.
+      //  100% = deterministic validator доказал security property.'
+      const provenance = await Promise.race([
+        runProvenanceChain(
           { title: v.title, type: v.type, severity: v.severity, description: v.description, location: v.location },
-          apiKey, model,
-          targetUrl || undefined
+          targetUrl || '',
         ),
-        new Promise<any>((_, reject) =>
-          setTimeout(() => reject(new Error('Validation timeout (25s)')), 25_000)),
+        new Promise<any>((resolve) =>
+          setTimeout(() => resolve({
+            verdict: 'DROP',
+            confidence: 0,
+            evidenceChain: 'Provenance chain timed out (30s) — could not verify security property.',
+            securityChecks: [{ propertyName: 'timeout', passed: false, reasoning: 'Timed out', evidence: '' }],
+          }), 30_000)),
       ]);
 
-      const scope = verification.validationScope || 'theoretical';
-      const verdict = verification.verdict || (verification.confirmed ? 'EXPLOITABLE' : 'INCONCLUSIVE');
-      console.log(`[analyze-job]   Active validation: verdict=${verdict} scope=${scope}`);
+      console.log(`[analyze-job]   Provenance chain: verdict=${provenance.verdict} confidence=${provenance.confidence}`);
+      console.log(`[analyze-job]   Security checks: ${provenance.securityChecks.map((c: any) => `${c.propertyName}=${c.passed ? 'PASS' : 'FAIL'}`).join(', ')}`);
 
-      if (verdict === 'EXPLOITABLE') {
-        const newStatus = scope === 'target' ? 'confirmed' : 'validated';
-        const label = scope === 'target'
-          ? '[CONFIRMED] Exploit confirmed against production target via real HTTP request.'
-          : '[CONFIRMED] Exploit confirmed in lab (Foundry test passed).';
+      if (provenance.verdict === 'CONFIRMED') {
         await withTimeout(db.vulnerability.update({ where: { id: vuln.id },
-          data: { confidence: 1, status: newStatus, validationScope: scope,
-            description: vuln.description + `\n\n${label}\n${verification.evidence}` } }), 10_000, null, 'validation vuln.update confirmed');
-        vuln.confidence = 1; vuln.status = newStatus; vuln.validationScope = scope;
+          data: { confidence: 1, status: 'confirmed', validationScope: 'provenance',
+            description: vuln.description + `\n\n== PROVENANCE CHAIN (deterministic proof) ==\n${provenance.evidenceChain}` } }), 10_000, null, 'provenance vuln.update');
+        vuln.confidence = 1;
+        vuln.status = 'confirmed';
+        vuln.validationScope = 'provenance';
         confirmed++;
+        activeValidated++;
       } else {
-        // NOT_EXPLOITABLE or INCONCLUSIVE — mark as candidate so the caller
-        // can DELETE it. User explicitly asked: don't show inconclusive or
-        // not-exploitable in the UI — only confirmed exploits matter.
+        console.log(`[analyze-job]   Provenance DROPPED — security property not proven`);
         vuln.status = 'candidate';
         vuln.confidence = 0;
       }
