@@ -239,6 +239,17 @@ async function runAnalysisInBackground(jobId: string, config: {
     } catch {}
   }, 1_800_000); // 30 minutes
 
+  // ─── PANIC TIMER — if global timeout fails to fire, force-exit process ───
+  // PM2 will restart the process, clearing any in-memory state and SQLite
+  // locks. The user can retry. This is the LAST RESORT — should never fire
+  // under normal operation, but guarantees the job NEVER hangs forever.
+  const panicTimer = setTimeout(() => {
+    console.error('[analyze-job] PANIC TIMER (35 min) — forcing process exit');
+    writeProgressFile(jobId, { progress: 100, message: 'Forced exit (35 min panic timer) — please retry', status: 'failed' });
+    // Give file write 1s to flush, then exit
+    setTimeout(() => process.exit(1), 1_000);
+  }, 2_100_000); // 35 minutes (5 min after global timeout)
+
   try {
     const globalStartTime = Date.now();
     await updateJob(5, 'Running static analysis...');
