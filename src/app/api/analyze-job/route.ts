@@ -15,6 +15,7 @@ import { runActiveProbes, buildProbeInputsFromCrawl, type PreConfirmedFinding } 
 import { rigorVerifyFinding } from '@/lib/rigor-verify';
 import { writeProgressFile } from '@/lib/progress-file';
 import { withTimeout, fireAndForget } from '@/lib/with-timeout';
+import { checkPassiveEvidence } from '@/lib/passive-evidence';
 import { createHash } from 'crypto';
 
 const CATEGORY_MAP: Record<string, string> = {
@@ -733,25 +734,29 @@ async function runAnalysisInBackground(jobId: string, config: {
  * @param updateJob - progress reporter
  * @param startProgress - progress value to start ticking from
  */
-// ─── PASSIVE FINDING TYPES ───────────────────────────────────────────
-// These findings are CONFIRMED by the recon data we ALREADY have
-// (security headers, HTML content, JS bundle analysis). They do NOT
-// need additional HTTP requests to validate.
+// ─── PASSIVE EVIDENCE TYPES ──────────────────────────────────────────
+// These types CAN be auto-confirmed from recon data — but ONLY if
+// SUFFICIENT evidence is found. User explicit feedback:
+//   'Passive type ≠ automatically valid.
+//    Passive type + sufficient passive evidence → auto-confirm.'
 //
-// For bitunix.com the AI found:
-//   - csp_missing (we have security headers showing CSP is missing)
-//   - info_exposure window.__net_track__ (we have the HTML with this)
-//   - cors_misconfig (we have CORS headers)
-//   - api_leak (we have JS bundle scan results)
-// These were being DROPPED by CONFIRM-OR-DROP because active validation
-// couldn't reach the target (bitunix returns 404 for /admin etc.).
-// Now they're auto-confirmed from the recon data we already collected.
-const PASSIVE_TYPES = new Set([
+// Examples where presence ≠ exploitable:
+//   - CORS Allow-Origin: * alone is FINE for public APIs. Exploitable
+//     only if combined with Allow-Credentials: true.
+//   - /api/openapi.json existing ≠ API leak. Need to verify it exposes
+//     internal endpoints or sensitive schemas.
+//   - 'POSSIBLE hardcoded secret' in recon ≠ API leak. Need REAL secret
+//     pattern (sk-/eyJ/AKIA/ghp_), not placeholder.
+//
+// For each passive type, src/lib/passive-evidence.ts defines a STRICT
+// evidence checker. If sufficient → auto-confirm. If not → fall back
+// to active HTTP validation.
+const PASSIVE_EVIDENCE_TYPES = new Set([
   'csp_missing',
-  'info_exposure',         // when AI identifies info exposure from HTML/headers we have
-  'api_leak',              // when AI identifies hardcoded secret in JS we already scanned
-  'cors_misconfig',        // we have CORS headers
-  'clickjacking',          // we have X-Frame-Options header
+  'info_exposure',
+  'api_leak',
+  'cors_misconfig',
+  'clickjacking',
   'hsts_missing',
   'cookie_security',
   'header_misconfig',
@@ -770,43 +775,43 @@ async function runValidationOnFindings(
   if (savedFindings.length === 0) return;
   let completed = 0;
   let confirmed = 0;
+  let passiveConfirmed = 0;
+  let activeValidated = 0;
   const total = savedFindings.length;
 
   const verifyPromises = savedFindings.map(async ({ vuln, rawFinding: v }: any) => {
     try {
-      // ─── PASSIVE TYPES: auto-confirm from recon data ───
-      // These findings don't need active HTTP validation — they're
-      // already proven by the security headers / HTML content / JS
-      // bundle scan we already collected. Auto-confirm them.
       const findingType = (v.type || '').toLowerCase();
-      if (PASSIVE_TYPES.has(findingType)) {
-        // Verify the finding is actually mentioned in our recon data
-        // (sourceCode contains the security headers + HTML content)
-        const findingKeyword = findingType === 'csp_missing' ? 'CSP: MISSING' :
-          findingType === 'info_exposure' ? '__net_track__' :
-          findingType === 'api_leak' ? 'POSSIBLE' :
-          findingType === 'cors_misconfig' ? 'CORS:' :
-          findingType === 'clickjacking' ? 'X-Frame-Options: MISSING' :
-          findingType === 'hsts_missing' ? 'HSTS: MISSING' :
-          findingType === 'cookie_security' ? 'Cookie issues:' :
-          findingType;
 
-        const reconHasEvidence = sourceCode.toLowerCase().includes(findingKeyword.toLowerCase()) ||
-                                sourceCode.toLowerCase().includes(findingType.replace('_', ' '));
-
-        if (reconHasEvidence) {
-          // Auto-confirm — passive finding verified by recon data
-          const label = `[CONFIRMED] Passive finding — verified by recon data already collected (no active HTTP validation needed).`;
+      // ─── PASSIVE EVIDENCE CHECK ───
+      // For passive types, check if recon data has SUFFICIENT evidence
+      // to auto-confirm. If yes → skip active validation (saves HTTP
+      // requests, faster pipeline, more concurrency for active findings).
+      // If no → fall back to active HTTP validation.
+      if (PASSIVE_EVIDENCE_TYPES.has(findingType)) {
+        const evidenceResult = checkPassiveEvidence(findingType, sourceCode, v);
+        if (evidenceResult.sufficient) {
+          // Auto-confirm — sufficient passive evidence found
+          const label = `[CONFIRMED via passive evidence] ${evidenceResult.evidence}`;
+          const newSeverity = evidenceResult.severity || v.severity || 'medium';
           await withTimeout(db.vulnerability.update({ where: { id: vuln.id },
-            data: { confidence: 0.9, status: 'validated', validationScope: 'passive',
-              description: vuln.description + `\n\n${label}\nEvidence found in recon data: "${findingKeyword}".\n\nNote: this finding was auto-confirmed because it can be verified from the security headers / HTML content we already collected. No additional HTTP requests were needed.` } }), 10_000, null, 'passive vuln.update');
-          vuln.confidence = 0.9; vuln.status = 'validated'; vuln.validationScope = 'passive';
+            data: { confidence: evidenceResult.confidence, status: 'validated',
+              validationScope: 'passive', severity: newSeverity,
+              description: vuln.description + `\n\n${label}\n\n== RIGOR VERIFICATION (passive) ==\nThis finding was auto-confirmed because the recon data we already collected (security headers, HTML content, JS bundle scan) contains SUFFICIENT evidence. No additional HTTP requests were needed — saves time and concurrency for findings that genuinely require runtime proof.\n\nEvidence: ${evidenceResult.evidence}\nConfidence: ${evidenceResult.confidence}` } }), 10_000, null, 'passive vuln.update');
+          vuln.confidence = evidenceResult.confidence;
+          vuln.status = 'validated';
+          vuln.validationScope = 'passive';
+          vuln.severity = newSeverity;
           confirmed++;
+          passiveConfirmed++;
           return;
+        } else {
+          // Insufficient passive evidence — fall through to active validation
+          console.log(`[analyze-job] Passive evidence INSUFFICIENT for "${v.title}" — falling back to active validation: ${evidenceResult.evidence.slice(0, 80)}`);
         }
       }
 
-      // ─── ACTIVE TYPES: run real HTTP validation ───
+      // ─── ACTIVE VALIDATION (or passive evidence was insufficient) ───
       const verification = await Promise.race([
         activelyValidate(
           sourceCode, contractName,
