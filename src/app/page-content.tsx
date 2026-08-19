@@ -1090,16 +1090,22 @@ export default function CryptoSentinelDashboard() {
       let pollErrors = 0;
       const poll = async () => {
         try {
-          // Cache-bust with timestamp — browser may serve stale response
-          // otherwise, especially on slow networks
+          // FETCH WITH TIMEOUT — if /api/job-status doesn't respond in 10s,
+          // abort and retry. Without this, a single hung fetch blocks ALL
+          // subsequent polls (await never resolves → setTimeout never fires).
+          const pollController = new AbortController();
+          const pollTimeout = setTimeout(() => pollController.abort(), 10_000);
           const statusRes = await fetch(`/api/job-status/${jobId}?t=${Date.now()}`, {
             cache: 'no-store',
             headers: { 'Cache-Control': 'no-cache' },
-          });
-          if (!statusRes.ok) {
+            signal: pollController.signal,
+          }).catch(() => null);
+          clearTimeout(pollTimeout);
+
+          if (!statusRes || !statusRes.ok) {
             pollErrors++;
-            if (pollErrors > 5) { reject(new Error(`Status check failed ${pollErrors} times`)); return; }
-            setTimeout(poll, 5_000); // retry
+            if (pollErrors > 10) { reject(new Error(`Status check failed ${pollErrors} times`)); return; }
+            setTimeout(poll, 3_000); // retry faster (was 5s)
             return;
           }
           pollErrors = 0; // reset on success
