@@ -14,6 +14,43 @@ import { runControlFlowAnalysis } from '@/lib/control-flow-analyzer';
 import { runActiveProbes, buildProbeInputsFromCrawl, type PreConfirmedFinding } from '@/lib/active-probe';
 import { rigorVerifyFinding } from '@/lib/rigor-verify';
 import { createHash } from 'crypto';
+import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'fs';
+
+// ─── PROGRESS FILE STORAGE ───
+// SQLite Prisma has a single-writer connection by default. When many
+// concurrent operations try to write (50 parallel HTTP workers saving
+// findings + 15 parallel rigor verifications updating findings +
+// flushTimer writing progress), they queue up at the single connection.
+// If one write hangs (disk I/O, transaction deadlock), ALL writes are
+// blocked — user sees frozen progress forever.
+//
+// FIX: progress updates go to a JSON FILE instead of SQLite. File I/O
+// is non-blocking (uses kernel async I/O, not a serialized connection
+// pool). /tmp/cs-progress/ directory is fast (often tmpfs). The
+// /api/job-status endpoint reads this file FIRST (instant) and falls
+// back to SQLite only if the file is missing.
+const PROGRESS_DIR = '/tmp/cs-progress';
+try { if (!existsSync(PROGRESS_DIR)) mkdirSync(PROGRESS_DIR, { recursive: true }); } catch {}
+
+function progressFilePath(jobId: string): string {
+  return `${PROGRESS_DIR}/${jobId}.json`;
+}
+
+function writeProgressFile(jobId: string, state: { progress: number; message: string; status: string }) {
+  try {
+    writeFileSync(progressFilePath(jobId), JSON.stringify({ ...state, updatedAt: Date.now() }));
+  } catch (e) {
+    console.error('[analyze-job] writeProgressFile failed:', String(e).slice(0, 100));
+  }
+}
+
+export function readProgressFile(jobId: string): { progress: number; message: string; status: string; updatedAt: number } | null {
+  try {
+    if (!existsSync(progressFilePath(jobId))) return null;
+    const data = readFileSync(progressFilePath(jobId), 'utf8');
+    return JSON.parse(data);
+  } catch { return null; }
+}
 
 const CATEGORY_MAP: Record<string, string> = {
   reentrancy: 'Reentrancy', oracle_manipulation: 'Oracle Manipulation',
@@ -107,7 +144,7 @@ async function runAnalysisInBackground(jobId: string, config: {
           discoveredEndpoints, discoveredForms, discoveredParams } = config;
   const isWeb = targetType === 'exchange' || contractName.endsWith('.html');
 
-  // ─── IN-MEMORY PROGRESS STATE + PERIODIC FLUSH ───
+  // ─── IN-MEMORY PROGRESS STATE + FILE-BASED FLUSH ───
   // Previous version did `await db.analysisJob.update(...)` on every
   // progress change. With 50 parallel HTTP workers + 15 parallel rigor
   // verifications, each calling updateJob, the SQLite write lock got
@@ -115,47 +152,38 @@ async function runAnalysisInBackground(jobId: string, config: {
   // setInterval ticks during AI pass 1 would fire but DB writes would
   // be stuck, so the user saw frozen progress ("stuck at 30s for 4 min").
   //
-  // FIX: keep progress in memory (instant, no I/O). A SINGLE flush timer
-  // writes to DB every 3s, but SKIPS if a previous flush is still
-  // pending — so we never queue up multiple writes. This eliminates
-  // SQLite write lock contention entirely.
+  // FIX (v2 — after user reported 'stuck at 60s for 3 min' even with
+  // in-memory state): the SQLite Prisma connection itself is a single
+  // bottleneck. If ANY write hangs (transaction deadlock, slow disk),
+  // flushPending stays true forever and no more updates happen.
+  //
+  // NEW APPROACH: progress goes to a JSON FILE (writeFileSync, no Prisma).
+  // File I/O is non-blocking and never serializes through a connection
+  // pool. Job-status endpoint reads the file first, falls back to DB.
   let progressState = { progress: 0, message: 'Job created', status: 'pending' as string };
-  let flushPending = false;
-  const flushTimer = setInterval(async () => {
-    if (flushPending) return; // skip if previous flush is still running
-    flushPending = true;
-    try {
-      await db.analysisJob.update({
-        where: { id: jobId },
-        data: { ...progressState, status: progressState.progress < 100 ? 'running' : 'completed' },
-      });
-    } catch (e) {
-      console.error('[analyze-job] Progress flush failed:', String(e).slice(0, 100));
-    } finally {
-      flushPending = false;
-    }
-  }, 3_000);
 
-  // Instant, non-blocking progress update — just sets the in-memory state
+  // File flush timer — every 1s, write current state to JSON file
+  const flushTimer = setInterval(() => {
+    writeProgressFile(jobId, progressState);
+  }, 1_000);
+
+  // Instant, non-blocking progress update — sets in-memory state +
+  // immediately writes to file (so user sees update within 1s)
   const updateJob = async (progress: number, message: string) => {
     progressState = { progress, message, status: 'running' };
-    // Don't await — flush timer will pick it up
+    writeProgressFile(jobId, progressState);  // immediate file write
   };
 
   // Force-flush now (used at completion so user sees final state immediately)
   const flushJobNow = async () => {
-    if (flushPending) return;
-    flushPending = true;
+    writeProgressFile(jobId, progressState);
+    // Also try DB write — best-effort, don't block
     try {
       await db.analysisJob.update({
         where: { id: jobId },
         data: { ...progressState, status: progressState.progress < 100 ? 'running' : 'completed' },
-      });
-    } catch (e) {
-      console.error('[analyze-job] Force flush failed:', String(e).slice(0, 100));
-    } finally {
-      flushPending = false;
-    }
+      }).catch(() => {});
+    } catch {}
   };
 
   // ─── GLOBAL TIMEOUT: entire job must complete in 30 min ───

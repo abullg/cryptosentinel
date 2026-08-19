@@ -1090,7 +1090,12 @@ export default function CryptoSentinelDashboard() {
       let pollErrors = 0;
       const poll = async () => {
         try {
-          const statusRes = await fetch(`/api/job-status/${jobId}`);
+          // Cache-bust with timestamp — browser may serve stale response
+          // otherwise, especially on slow networks
+          const statusRes = await fetch(`/api/job-status/${jobId}?t=${Date.now()}`, {
+            cache: 'no-store',
+            headers: { 'Cache-Control': 'no-cache' },
+          });
           if (!statusRes.ok) {
             pollErrors++;
             if (pollErrors > 5) { reject(new Error(`Status check failed ${pollErrors} times`)); return; }
