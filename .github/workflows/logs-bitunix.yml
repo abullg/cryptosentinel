@@ -4,14 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       job_id:
-        description: 'Job ID from analyze-job (optional — if empty, just dump last 200 lines of PM2 logs)'
+        description: 'Job ID (optional — if empty, just dump recent PM2 logs)'
         required: false
         default: ''
 
 jobs:
   logs:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     steps:
       - name: Setup SSH
         run: |
@@ -20,63 +20,9 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -p 22 -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
 
-      - name: Fetch PM2 logs (last 200 lines)
+      - name: Fetch PM2 logs
         run: |
           HOST="${{ secrets.VPS_HOST }}"
           USER="${{ secrets.VPS_USER || 'root' }}"
           JOB_ID="${{ github.event.inputs.job_id }}"
-          ssh -p 22 -o StrictHostKeyChecking=no -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 $USER@$HOST bash -s <<LOGS
-          echo "=== 1. PM2 status ==="
-          pm2 list 2>&1 | head -10
-
-          echo ""
-          echo "=== 2. PM2 OUT log (last 100 lines) ==="
-          tail -100 /var/log/cryptosentinel/out.log 2>/dev/null || pm2 logs cryptosentinel --lines 50 --nostream --out 2>&1 | tail -100
-
-          echo ""
-          echo "=== 3. PM2 ERROR log (last 100 lines) ==="
-          tail -100 /var/log/cryptosentinel/error.log 2>/dev/null || pm2 logs cryptosentinel --lines 50 --nostream --err 2>&1 | tail -100
-
-          echo ""
-          echo "=== 4. Progress files in /tmp/cs-progress ==="
-          ls -la /tmp/cs-progress/ 2>/dev/null | head -20
-
-          echo ""
-          echo "=== 5. Recent job progress files (most recent 5) ==="
-          for f in \$(ls -t /tmp/cs-progress/*.json 2>/dev/null | head -5); do
-            echo "--- \$f ---"
-            cat \$f 2>/dev/null
-            echo ""
-          done
-
-          if [ -n "\$JOB_ID" ]; then
-            echo ""
-            echo "=== 6. Specific job \$JOB_ID progress file ==="
-            cat /tmp/cs-progress/\$JOB_ID.json 2>/dev/null || echo "File not found"
-
-            echo ""
-            echo "=== 7. Specific job DB status ==="
-            cd /opt/cryptosentinel && node -e "
-              const { PrismaClient } = require('@prisma/client');
-              const db = new PrismaClient();
-              db.analysisJob.findUnique({ where: { id: '\$JOB_ID' } }).then(j => {
-                console.log(JSON.stringify(j, null, 2));
-                return db.vulnerability.findMany({ where: { contractId: j?.contractId || 'none' } });
-              }).then(v => {
-                console.log('FINDINGS:', v.length);
-                v.forEach(f => console.log('  -', f.type, '|', f.status, '|', f.title?.slice(0,80)));
-              }).catch(e => console.error(e)).finally(() => process.exit(0));
-            " 2>&1
-          fi
-
-          echo ""
-          echo "=== 8. DB job count ==="
-          cd /opt/cryptosentinel && node -e "
-            const { PrismaClient } = require('@prisma/client');
-            const db = new PrismaClient();
-            db.analysisJob.count().then(c => console.log('Total jobs:', c)).catch(e => console.error(e)).finally(() => process.exit(0));
-          " 2>&1
-
-          echo ""
-          echo "=== DONE ==="
-LOGS
+          ssh -p 22 -o StrictHostKeyChecking=no -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 $USER@$HOST "echo '=== PM2 STATUS ==='; pm2 list 2>&1 | head -10; echo; echo '=== PM2 OUT (last 80) ==='; tail -80 /var/log/cryptosentinel/out.log 2>/dev/null; echo; echo '=== PM2 ERR (last 80) ==='; tail -80 /var/log/cryptosentinel/error.log 2>/dev/null; echo; echo '=== Progress files ==='; ls -la /tmp/cs-progress/ 2>/dev/null | head -20; echo; echo '=== Recent progress file contents ==='; for f in \$(ls -t /tmp/cs-progress/*.json 2>/dev/null | head -3); do echo \"--- \$f ---\"; cat \$f 2>/dev/null; echo; done; if [ -n \"$JOB_ID\" ]; then echo \"=== Job $JOB_ID file ===\"; cat /tmp/cs-progress/$JOB_ID.json 2>/dev/null; fi"
