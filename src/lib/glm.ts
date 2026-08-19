@@ -176,7 +176,7 @@ export async function callGLM(
   //   - Run a SECOND deep-analysis pass for non-obvious vulnerabilities
   //   - Cross-reference with known exploits (DAO, bZx, etc.)
   // If still running at 4 min, model is stuck — abort and use partial.
-  const callTimeout = config.timeoutMs || 240_000; // 4 min — deep multi-pass analysis
+  const callTimeout = config.timeoutMs || 120_000; // 2 min max per AI call
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), callTimeout);
   let response: Response;
