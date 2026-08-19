@@ -552,16 +552,36 @@ async function runAnalysisInBackground(jobId: string, config: {
       if (jobTimedOut) return;
       const allResults = savedStatic.map(s => s.vuln);
       await new Promise(r => setTimeout(r, 300));
-      await updateJob(75, `Saving ${allResults.length} static findings...`);
-      await new Promise(r => setTimeout(r, 300));
-      await updateJob(100, `Analysis complete (AI failed): ${allResults.length} static findings`);
-      fireAndForget(db.audit.update({ where: { id: auditId }, data: { status: 'completed', findings: allResults.length, completedAt: new Date() } }), 'catch audit.update');
-      fireAndForget(db.analysisJob.update({ where: { id: jobId }, data: { status: 'completed', resultCount: 0 } }), 'catch analysisJob.update');
-      writeProgressFile(jobId, { progress: 100, message: `Analysis complete (AI failed): ${allResults.length} static findings`, status: 'completed' });
+      // STILL RUN VALIDATION on static findings even when AI failed!
+      // Previous version returned early WITHOUT Phase 3 validation —
+      // static findings stayed as 'candidate' → dropped → 0 in UI.
+      // Now: run provenance chain + passive evidence on static findings,
+      // then complete with whatever is confirmed.
+      if (savedStatic.length > 0 && !jobTimedOut) {
+        await updateJob(75, `AI failed but ${savedStatic.length} static findings to validate...`);
+        await runValidationOnFindings(savedStatic, sourceCode, contractName, apiKey, model, targetUrl, updateJob, 80);
+        // Drop non-confirmed
+        const dropStaticIds: string[] = [];
+        for (const s of savedStatic) {
+          if (s.vuln.status !== 'confirmed' && s.vuln.status !== 'validated') {
+            dropStaticIds.push(s.vuln.id);
+            s.vuln.status = 'dropped';
+          }
+        }
+        if (dropStaticIds.length > 0) {
+          try { await withTimeout(db.vulnerability.deleteMany({ where: { id: { in: dropStaticIds } } }), 10_000, null, 'catch dropStatic deleteMany'); } catch {}
+        }
+      }
+      const confirmedCount = savedStatic.filter((s: any) => s.vuln.status === 'confirmed' || s.vuln.status === 'validated').length;
+      await updateJob(100, `Analysis complete (AI failed): ${confirmedCount} confirmed from static findings`);
+      fireAndForget(db.audit.update({ where: { id: auditId }, data: { status: 'completed', findings: confirmedCount, completedAt: new Date() } }), 'catch audit.update');
+      fireAndForget(db.analysisJob.update({ where: { id: jobId }, data: { status: 'completed', resultCount: confirmedCount } }), 'catch analysisJob.update');
+      writeProgressFile(jobId, { progress: 100, message: `Analysis complete (AI failed): ${confirmedCount} confirmed from static findings`, status: 'completed' });
       clearInterval(flushTimer); clearInterval(heartbeatTimer);
       clearTimeout(phase2Watchdog);
       clearTimeout(globalTimeout);
       clearTimeout(panicTimer);
+      await flushJobNow();
       return;
     }
     clearTimeout(phase2Watchdog);
