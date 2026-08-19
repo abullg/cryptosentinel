@@ -43,11 +43,11 @@ jobs:
 
             echo ""
             echo "=== 3. Build ==="
-            rm -rf .next
-            npm install 2>&1 | tail -3
+            rm -rf .next node_modules
+            npm install 2>&1 | tail -5
             npx prisma generate 2>&1 | tail -2
             export NODE_OPTIONS=--max-old-space-size=2048
-            npx next build 2>&1 | tail -10
+            npx next build 2>&1 | tail -15
 
             echo ""
             echo "=== 4. Copy static ==="
