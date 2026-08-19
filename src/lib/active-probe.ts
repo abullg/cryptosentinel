@@ -181,19 +181,18 @@ async function sendProbe(url: string, init: RequestInit): Promise<{ status: numb
     console.log(`[active-probe] Direct status=${res.status} for ${url.slice(0, 80)}, trying proxies...`);
   } catch {}
 
-  // ─── PROXY FALLBACK — for WAF/geo-blocked targets like bitunix.com ───
+  // ─── PROXY FALLBACK (PARALLEL) — for WAF/geo-blocked targets ───
   // Many crypto exchanges return 469 "Restricted Access" or 403 Cloudflare
-  // challenge when probed directly from VPS/sandbox IPs. Route the probe
-  // through a CORS proxy to bypass geo-block + WAF.
-  //
-  // Note: POST works via allorigins.win/raw — it forwards the body. For GET
-  // with query params, encode URL with the payload already in it.
+  // challenge when probed directly. Fire all proxies at once and use the
+  // first good response. Previous version was sequential: 2 proxies × 6s
+  // each = 12s per probe. With 60 probes that added 12 minutes! Parallel
+  // cuts it to 6s max per probe.
   const PROXIES = [
     `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
     `https://api.codetabs.com/v1/proxy/?url=${encodeURIComponent(url)}`,
   ];
-  for (const proxyUrl of PROXIES) {
-    try {
+  const proxyResults = await Promise.allSettled(
+    PROXIES.map(async (proxyUrl) => {
       const proxyInit: RequestInit = {
         ...init,
         // Use GET for all proxy requests — most proxies don't forward POST
@@ -205,15 +204,18 @@ async function sendProbe(url: string, init: RequestInit): Promise<{ status: numb
         redirect: 'follow' as RequestRedirect,
       };
       const res = await fetch(proxyUrl, proxyInit);
-      if (!res.ok) continue;
+      if (!res.ok) return null;
       const body = await res.text();
-      if (body.length < 100) continue;
-      if (/cf-challenge|cloudflare|access restricted/i.test(body)) continue;
+      if (body.length < 100) return null;
+      if (/cf-challenge|cloudflare|access restricted/i.test(body)) return null;
       const headers: Record<string, string> = {};
       res.headers.forEach((v, k) => { headers[k.toLowerCase()] = v; });
       headers['x-via-proxy'] = '1';
       return { status: res.status, body, headers, elapsed: Date.now() - start };
-    } catch {}
+    })
+  );
+  for (const r of proxyResults) {
+    if (r.status === 'fulfilled' && r.value) return r.value;
   }
 
   return null;

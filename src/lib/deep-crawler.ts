@@ -229,33 +229,35 @@ async function fetchPage(url: string): Promise<{ status: number; html: string; h
     console.log(`[deep-crawler] Direct fetch status=${res.status} for ${url}, trying proxies...`);
   } catch {}
 
-  // MULTI-PROXY FALLBACK — when target is WAF/geo-blocked, route the
-  // request through CORS proxies that exit from different countries.
-  // Bitunix (and many crypto exchanges) geo-block VPS/sandbox IPs but
-  // allow requests from public proxy servers in allowed regions.
+  // MULTI-PROXY FALLBACK (PARALLEL) — when target is WAF/geo-blocked,
+  // fire all proxies at once and use the first good response. Previous
+  // version was sequential: 3 proxies × 8s each = 24s worst case per
+  // page. Parallel: ~8s max (the slowest proxy wins, but we use the
+  // first good response). Critical for sites with 30 pages — saves
+  // up to 8 minutes of crawl time.
   const PROXIES = [
     `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
     `https://api.codetabs.com/v1/proxy/?url=${encodeURIComponent(url)}`,
     `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
   ];
 
-  for (const proxyUrl of PROXIES) {
-    try {
+  const proxyResults = await Promise.allSettled(
+    PROXIES.map(async (proxyUrl) => {
       const res = await fetch(proxyUrl, {
         headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
         signal: AbortSignal.timeout(PER_PAGE_TIMEOUT),
         redirect: 'follow',
       });
-      if (!res.ok) continue;
+      if (!res.ok) return null;
       const html = await res.text();
-      // Proxies return WAF challenge pages too — skip those
-      if (html.length < 200 || isWAFChallenge(html)) continue;
-      // Got real content via proxy
+      if (html.length < 200 || isWAFChallenge(html)) return null;
       const headers: Record<string, string> = {};
       res.headers.forEach((v, k) => { headers[k.toLowerCase()] = v; });
-      // Mark as 200 from proxy
       return { status: 200, html, headers: { ...headers, 'x-fetched-via-proxy': '1' } };
-    } catch {}
+    })
+  );
+  for (const r of proxyResults) {
+    if (r.status === 'fulfilled' && r.value) return r.value;
   }
 
   // WAYBACK MACHINE FALLBACK — use archived snapshot from web.archive.org
@@ -599,7 +601,14 @@ export async function deepCrawl(targetUrl: string): Promise<CrawlResult> {
   let securityHeaders: Record<string, string> = {};
   let wafDetected = false;
 
-  // BFS loop
+  // PARALLEL BFS LOOP — fetch pages in batches of 5 at a time.
+  // Previous version was SEQUENTIAL: 30 pages × ~8s each = 4 minutes
+  // just for crawling. With WAF proxy fallback, each page could take
+  // up to 18s (6s direct + 6s allorigins + 6s codetabs) → 9 minutes
+  // for Phase 0 alone. This caused the user's "stuck at 5 min" freeze.
+  // Parallel batches reduce 30 pages × 8s to ~6 batches × 8s = 48s.
+  const PARALLEL_BATCH = 5;
+
   while (queue.length > 0 && pages.length < MAX_PAGES) {
     // Time budget check
     if (Date.now() - startTime > budgetMs) {
@@ -607,80 +616,94 @@ export async function deepCrawl(targetUrl: string): Promise<CrawlResult> {
       break;
     }
 
-    const url = queue.shift()!;
-    if (visited.has(url)) continue;
-    visited.add(url);
-
-    const page = await fetchPage(url);
-    if (!page) continue;
-
-    // First successful page → record security headers
-    if (pages.length === 0 && Object.keys(securityHeaders).length === 0) {
-      securityHeaders = page.headers;
+    // Take next batch of URLs from the queue
+    const batch: string[] = [];
+    while (batch.length < PARALLEL_BATCH && queue.length > 0 && pages.length + batch.length < MAX_PAGES) {
+      const url = queue.shift()!;
+      if (visited.has(url)) continue;
+      visited.add(url);
+      batch.push(url);
     }
+    if (batch.length === 0) break;
 
-    if (page.status >= 400 && page.status !== 401 && page.status !== 403) continue;
+    // Fetch all pages in this batch IN PARALLEL
+    const batchResults = await Promise.allSettled(
+      batch.map(async (url) => ({ url, page: await fetchPage(url) }))
+    );
 
-    // Skip empty / WAF challenge pages
-    if (page.html.length < 100) continue;
-    if (isWAFChallenge(page.html)) {
-      wafDetected = true;
+    for (const result of batchResults) {
+      if (result.status !== 'fulfilled') continue;
+      const { url, page } = result.value;
+      if (!page) continue;
+
+      // First successful page → record security headers
+      if (pages.length === 0 && Object.keys(securityHeaders).length === 0) {
+        securityHeaders = page.headers;
+      }
+
+      if (page.status >= 400 && page.status !== 401 && page.status !== 403) continue;
+
+      // Skip empty / WAF challenge pages
+      if (page.html.length < 100) continue;
+      if (isWAFChallenge(page.html)) {
+        wafDetected = true;
+        pages.push({
+          url, path: new URL(url).pathname, status: page.status,
+          title: '[WAF challenge page]', html: '',
+          forms: [], params: [], endpoints: [], scripts: [], metaTags: [],
+          wafBlocked: true,
+        });
+        continue;
+      }
+
+      const parsedPage = parsePage(page.html, url);
+      const pagePath = new URL(url).pathname + new URL(url).search;
+
+      // Collect URL params
+      const pageParams: string[] = [];
+      try {
+        new URL(url).searchParams.forEach((_, key) => {
+          pageParams.push(key);
+          allParams.add(key);
+        });
+      } catch {}
+
+      // Collect endpoints
+      for (const ep of parsedPage.endpoints) {
+        const full = ep.startsWith('http') ? ep : `${origin}${ep}`;
+        allEndpoints.add(full);
+      }
+      for (const f of parsedPage.forms) {
+        allForms.push({ ...f, action: f.action.startsWith('http') ? f.action : `${origin}${f.action.startsWith('/') ? f.action : '/' + f.action}` });
+      }
+      for (const s of parsedPage.scripts) {
+        if (s.startsWith('http')) scriptUrls.add(s);
+        else if (s.startsWith('/')) scriptUrls.add(`${origin}${s}`);
+      }
+
       pages.push({
-        url, path: new URL(url).pathname, status: page.status,
-        title: '[WAF challenge page]', html: '',
-        forms: [], params: [], endpoints: [], scripts: [], metaTags: [],
-        wafBlocked: true,
+        url, path: pagePath, status: page.status,
+        title: parsedPage.title,
+        html: page.html.slice(0, 5000),
+        forms: parsedPage.forms,
+        params: pageParams,
+        endpoints: parsedPage.endpoints,
+        scripts: parsedPage.scripts,
+        metaTags: parsedPage.metaTags,
+        wafBlocked: false,
       });
-      continue;
-    }
 
-    const parsedPage = parsePage(page.html, url);
-    const pagePath = new URL(url).pathname + new URL(url).search;
-
-    // Collect URL params
-    const pageParams: string[] = [];
-    try {
-      new URL(url).searchParams.forEach((_, key) => {
-        pageParams.push(key);
-        allParams.add(key);
-      });
-    } catch {}
-
-    // Collect endpoints
-    for (const ep of parsedPage.endpoints) {
-      const full = ep.startsWith('http') ? ep : `${origin}${ep}`;
-      allEndpoints.add(full);
-    }
-    for (const f of parsedPage.forms) {
-      allForms.push({ ...f, action: f.action.startsWith('http') ? f.action : `${origin}${f.action.startsWith('/') ? f.action : '/' + f.action}` });
-    }
-    for (const s of parsedPage.scripts) {
-      if (s.startsWith('http')) scriptUrls.add(s);
-      else if (s.startsWith('/')) scriptUrls.add(`${origin}${s}`);
-    }
-
-    pages.push({
-      url, path: pagePath, status: page.status,
-      title: parsedPage.title,
-      html: page.html.slice(0, 5000),
-      forms: parsedPage.forms,
-      params: pageParams,
-      endpoints: parsedPage.endpoints,
-      scripts: parsedPage.scripts,
-      metaTags: parsedPage.metaTags,
-      wafBlocked: false,
-    });
-
-    // Enqueue internal links discovered in this page
-    for (const link of parsedPage.links) {
-      const normalized = normalizeUrl(link, url);
-      if (!normalized) continue;
-      if (!isSameOrigin(normalized, origin)) continue;
-      // Skip non-HTML resources
-      const path = new URL(normalized).pathname.toLowerCase();
-      if (/\.(jpg|jpeg|png|gif|svg|ico|webp|mp4|mp3|pdf|zip|css|woff|woff2|ttf|eot)(\?|$)/.test(path)) continue;
-      if (visited.has(normalized)) continue;
-      if (queue.length < 200) queue.push(normalized); // cap queue
+      // Enqueue internal links discovered in this page
+      for (const link of parsedPage.links) {
+        const normalized = normalizeUrl(link, url);
+        if (!normalized) continue;
+        if (!isSameOrigin(normalized, origin)) continue;
+        // Skip non-HTML resources
+        const path = new URL(normalized).pathname.toLowerCase();
+        if (/\.(jpg|jpeg|png|gif|svg|ico|webp|mp4|mp3|pdf|zip|css|woff|woff2|ttf|eot)(\?|$)/.test(path)) continue;
+        if (visited.has(normalized)) continue;
+        if (queue.length < 200) queue.push(normalized); // cap queue
+      }
     }
   }
 

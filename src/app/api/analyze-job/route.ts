@@ -110,23 +110,27 @@ async function runAnalysisInBackground(jobId: string, config: {
     await db.analysisJob.update({ where: { id: jobId }, data: { progress, message, status: progress < 100 ? 'running' : 'completed' } }).catch(() => {});
   };
 
-  // ─── GLOBAL TIMEOUT: entire job must complete in 10 min ───
-  // If anything hangs (AI call, validation, DB write), this fires and
-  // completes the job with whatever findings we have. NEVER hang forever.
+  // ─── GLOBAL TIMEOUT: entire job must complete in 15 min ───
+  // User feedback: "ему не хватает времени" — AI needed more time on
+  // complex targets with 30+ pages. 10 min was too tight when Phase 0
+  // (active probes) + Phase 2 (AI pass 1+2) + Phase 3 (validation) all
+  // had to run. VPS is KVM 2 (always-on, no serverless limit) so 15 min
+  // is safe. If anything hangs, this fires and completes with whatever
+  // findings we have. NEVER hang forever.
   let jobTimedOut = false;
   const globalTimeout = setTimeout(async () => {
     jobTimedOut = true;
-    console.error('[analyze-job] GLOBAL TIMEOUT (10 min) — completing with current findings');
+    console.error('[analyze-job] GLOBAL TIMEOUT (15 min) — completing with current findings');
     try {
-      await updateJob(95, 'Analysis timeout (10 min) — completing with current findings.');
+      await updateJob(95, 'Analysis timeout (15 min) — completing with current findings.');
       // Get whatever findings we have
       const existingVulns = await db.vulnerability.findMany({ where: { contractId } }).catch(() => []);
       await db.audit.update({ where: { id: auditId },
         data: { status: 'completed', completedAt: new Date(), findings: existingVulns.length } }).catch(() => {});
       await db.analysisJob.update({ where: { id: jobId },
-        data: { status: 'completed', progress: 100, message: `Timeout after 10 min — ${existingVulns.length} findings saved`, resultCount: existingVulns.filter((v: any) => v.status === 'confirmed' || v.status === 'validated').length } }).catch(() => {});
+        data: { status: 'completed', progress: 100, message: `Timeout after 15 min — ${existingVulns.length} findings saved`, resultCount: existingVulns.filter((v: any) => v.status === 'confirmed' || v.status === 'validated').length } }).catch(() => {});
     } catch {}
-  }, 600_000); // 10 minutes
+  }, 900_000); // 15 minutes
 
   try {
     const globalStartTime = Date.now();
@@ -269,27 +273,30 @@ async function runAnalysisInBackground(jobId: string, config: {
     // IMPORTANT: progress must INCREMENT gradually during AI pass — never
     // stay at the same % for 60s. The old code stayed at 30% for the entire
     // AI pass 1 (60s) which made the UI look frozen ("stuck at 30%").
-    // Now: 30% → 40% → 45% during pass 1, then 50% → 60% → 65% during
-    // pass 2, so the user always sees forward motion.
+    // Now: 30% → 48% during pass 1 (120s), then 50% → 65% during pass 2
+    // (120s), so the user always sees forward motion across the full
+    // 240s of AI time.
     await updateJob(30, 'Starting AI surface analysis (pass 1/2)...');
     let aiVulns: any[] = [];
     // Declare OUTSIDE try so catch block can access it
     let progressInterval: ReturnType<typeof setInterval> | null = null;
     let aiPass1Progress = 30;
     try {
-      // Tick progress forward every 10s — 30 → 32 → 34 → ... → 45 max
-      // This eliminates the "frozen at 30%" cosmetic bug.
+      // Tick progress forward every 10s — 30 → 32 → 34 → ... → 48 max
+      // With 120s timeout: 30→32→34→36→38→40→42→44→46→48 (over 90s), then
+      // stays at 48 for the last 30s (acceptable — small pause before
+      // pass 2 starts).
       progressInterval = setInterval(() => {
-        aiPass1Progress = Math.min(45, aiPass1Progress + 2);
+        aiPass1Progress = Math.min(48, aiPass1Progress + 2);
         const elapsed = Math.round((Date.now() - (globalStartTime || Date.now())) / 1000);
         updateJob(aiPass1Progress, `AI pass 1 surface analysis... ${elapsed}s elapsed`).catch(() => {});
       }, 10_000);
 
       const aiPromise = isWeb
-        ? analyzeWebWithGLM(sourceCode.slice(0, 30000), contractName, { apiKey, model, timeoutMs: 60_000 })
-        : analyzeWithGLM(sourceCode, contractName, { apiKey, model, timeoutMs: 60_000 }, undefined);
+        ? analyzeWebWithGLM(sourceCode.slice(0, 30000), contractName, { apiKey, model, timeoutMs: 120_000 })
+        : analyzeWithGLM(sourceCode, contractName, { apiKey, model, timeoutMs: 120_000 }, undefined);
       const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('AI pass 1 timeout after 60s')), 60_000)
+        setTimeout(() => reject(new Error('AI pass 1 timeout after 120s')), 120_000)
       );
       aiVulns = await Promise.race([aiPromise, timeoutPromise]);
       if (progressInterval) clearInterval(progressInterval);
@@ -321,7 +328,7 @@ async function runAnalysisInBackground(jobId: string, config: {
     let aiPass2Progress = 50;
     try {
       deepProgressInterval = setInterval(() => {
-        aiPass2Progress = Math.min(62, aiPass2Progress + 2);
+        aiPass2Progress = Math.min(68, aiPass2Progress + 2);
         const elapsed = Math.round((Date.now() - globalStartTime) / 1000);
         updateJob(aiPass2Progress, `AI pass 2 deep analysis... ${elapsed}s elapsed`).catch(() => {});
       }, 10_000);
@@ -330,10 +337,10 @@ async function runAnalysisInBackground(jobId: string, config: {
         title: v.title, type: v.type, severity: v.severity, description: (v.description || '').slice(0, 200),
       }));
       const deepPromise = isWeb
-        ? analyzeWebWithGLMDeep(sourceCode.slice(0, 30000), contractName, { apiKey, model, timeoutMs: 60_000 }, firstPassSummary)
-        : analyzeWithGLMDeep(sourceCode, contractName, { apiKey, model, timeoutMs: 60_000 }, firstPassSummary);
+        ? analyzeWebWithGLMDeep(sourceCode.slice(0, 30000), contractName, { apiKey, model, timeoutMs: 120_000 }, firstPassSummary)
+        : analyzeWithGLMDeep(sourceCode, contractName, { apiKey, model, timeoutMs: 120_000 }, firstPassSummary);
       const deepTimeout = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('AI pass 2 (deep) timeout after 60s')), 60_000)
+        setTimeout(() => reject(new Error('AI pass 2 (deep) timeout after 120s')), 120_000)
       );
       deepVulns = await Promise.race([deepPromise, deepTimeout]);
       if (deepProgressInterval) clearInterval(deepProgressInterval);
