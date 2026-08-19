@@ -207,6 +207,17 @@ function parsePage(html: string, url: string): {
   return { title, forms, endpoints, scripts, metaTags, links: [...links] };
 }
 
+// OUTER HARD TIMEOUT on fetchPage — even if internal AbortSignal.timeout
+// fails to abort the fetch (Node.js bug, slow stream, hung connection),
+// this Promise.race ensures fetchPage returns within 30s. Without this,
+// Promise.allSettled in the BFS loop waits forever for one hung fetch.
+async function fetchPageWithOuterTimeout(url: string): Promise<{ status: number; html: string; headers: Record<string, string> } | null> {
+  return Promise.race([
+    fetchPage(url),
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), 30_000)),
+  ]);
+}
+
 async function fetchPage(url: string): Promise<{ status: number; html: string; headers: Record<string, string> } | null> {
   // Direct fetch first
   try {
@@ -633,8 +644,11 @@ export async function deepCrawl(targetUrl: string): Promise<CrawlResult> {
     if (batch.length === 0) break;
 
     // Fetch all pages in this batch IN PARALLEL
+    // Use fetchPageWithOuterTimeout — outer 30s hard timeout that doesn't
+    // depend on AbortSignal (which can fail to abort in some Node.js
+    // edge cases, leaving Promise.allSettled hanging forever).
     const batchResults = await Promise.allSettled(
-      batch.map(async (url) => ({ url, page: await fetchPage(url) }))
+      batch.map(async (url) => ({ url, page: await fetchPageWithOuterTimeout(url) }))
     );
 
     for (const result of batchResults) {
