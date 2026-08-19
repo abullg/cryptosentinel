@@ -188,11 +188,12 @@ export async function callGLM(
       model: model || DEFAULT_MODEL,
       messages,
       temperature,
-      // Explicitly set max_tokens — without it, OpenRouter's default may
-      // truncate the response mid-JSON, causing 'Failed to parse response
-      // as JSON' errors. 16384 tokens = ~12K words = enough for 30+
-      // findings with full PoC outlines.
-      max_tokens: 16384,
+      // Explicitly set max_tokens — GLM 5.2 has deep reasoning capability.
+      // User: 'если дать ему больше токенов то потенциальных уязвимостей
+      // и их глубина будет достаточно по умолчанию большая'
+      // 32768 tokens = ~24K words — enough for 50+ findings with full
+      // PoC outlines and deep multi-step reasoning chains.
+      max_tokens: 32768,
     };
 
     response = await fetch(OPENROUTER_API_URL, {

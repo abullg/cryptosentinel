@@ -235,11 +235,11 @@ async function runAnalysisInBackground(jobId: string, config: {
       fireAndForget(db.audit.update({ where: { id: auditId },
         data: { status: 'completed', completedAt: new Date(), findings: existingVulns.length } }), 'globalTimeout audit.update');
       fireAndForget(db.analysisJob.update({ where: { id: jobId },
-        data: { status: 'completed', progress: 100, message: `Timeout after 30 min — ${existingVulns.length} findings saved`, resultCount: existingVulns.filter((v: any) => v.status === 'confirmed' || v.status === 'validated').length } }), 'globalTimeout analysisJob.update');
+        data: { status: 'completed', progress: 100, message: `Timeout after 45 min — ${existingVulns.length} findings saved`, resultCount: existingVulns.filter((v: any) => v.status === 'confirmed' || v.status === 'validated').length } }), 'globalTimeout analysisJob.update');
       // Always write progress file too — non-blocking, user sees immediately
-      writeProgressFile(jobId, { progress: 100, message: `Timeout after 30 min — ${existingVulns.length} findings saved`, status: 'completed' });
+      writeProgressFile(jobId, { progress: 100, message: `Timeout after 45 min — ${existingVulns.length} findings saved`, status: 'completed' });
     } catch {}
-  }, 1_800_000); // 30 minutes
+  }, 2_700_000); // 45 minutes — was 30, increased for deeper AI reasoning
 
   // ─── PANIC TIMER — if global timeout fails to fire, force-exit process ───
   // PM2 will restart the process, clearing any in-memory state and SQLite
@@ -250,7 +250,7 @@ async function runAnalysisInBackground(jobId: string, config: {
     writeProgressFile(jobId, { progress: 100, message: 'Forced exit (35 min panic timer) — please retry', status: 'failed' });
     // Give file write 1s to flush, then exit
     setTimeout(() => process.exit(1), 1_000);
-  }, 2_100_000); // 35 minutes (5 min after global timeout)
+  }, 3_000_000); // 50 minutes (5 min after global timeout) (5 min after global timeout)
 
   try {
     const globalStartTime = Date.now();
@@ -507,7 +507,7 @@ async function runAnalysisInBackground(jobId: string, config: {
     // this 4-min hard cap fires and forces the catch handler. User
     // reported "stuck at 30s for 4 min" — this is the GUARANTEE that
     // even in the worst case, Phase 2 cannot exceed 4 min.
-    const PHASE2_HARD_TIMEOUT = 240_000; // 4 min hard cap for AI pass 1+2
+    const PHASE2_HARD_TIMEOUT = 540_000; // 9 min hard cap — was 4 min, too tight for deep GLM-5.2 reasoning
     const phase2Start = Date.now();
     let phase2TimedOut = false;
     const phase2Watchdog = setTimeout(() => {
@@ -532,10 +532,10 @@ async function runAnalysisInBackground(jobId: string, config: {
       }, 10_000);
 
       const aiPromise = isWeb
-        ? analyzeWebWithGLM(sourceCode.slice(0, 30000), contractName, { apiKey, model, timeoutMs: 120_000 })
-        : analyzeWithGLM(sourceCode, contractName, { apiKey, model, timeoutMs: 120_000 }, undefined);
+        ? analyzeWebWithGLM(sourceCode.slice(0, 30000), contractName, { apiKey, model, timeoutMs: 180_000 })
+        : analyzeWithGLM(sourceCode, contractName, { apiKey, model, timeoutMs: 180_000 }, undefined);
       const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('AI pass 1 timeout after 120s')), 120_000)
+        setTimeout(() => reject(new Error('AI pass 1 timeout after 180s')), 180_000)
       );
       // Phase 2 hard timeout also rejects — last-resort safety net
       const hardTimeoutPromise = new Promise<never>((_, reject) =>
@@ -585,10 +585,10 @@ async function runAnalysisInBackground(jobId: string, config: {
         title: v.title, type: v.type, severity: v.severity, description: (v.description || '').slice(0, 200),
       }));
       const deepPromise = isWeb
-        ? analyzeWebWithGLMDeep(sourceCode.slice(0, 30000), contractName, { apiKey, model, timeoutMs: 120_000 }, firstPassSummary)
-        : analyzeWithGLMDeep(sourceCode, contractName, { apiKey, model, timeoutMs: 120_000 }, firstPassSummary);
+        ? analyzeWebWithGLMDeep(sourceCode.slice(0, 30000), contractName, { apiKey, model, timeoutMs: 180_000 }, firstPassSummary)
+        : analyzeWithGLMDeep(sourceCode, contractName, { apiKey, model, timeoutMs: 180_000 }, firstPassSummary);
       const deepTimeout = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('AI pass 2 (deep) timeout after 120s')), 120_000)
+        setTimeout(() => reject(new Error('AI pass 2 (deep) timeout after 180s')), 180_000)
       );
       deepVulns = await Promise.race([deepPromise, deepTimeout]);
       if (deepProgressInterval) clearInterval(deepProgressInterval);
