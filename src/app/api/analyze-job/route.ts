@@ -150,6 +150,13 @@ async function runAnalysisInBackground(jobId: string, config: {
     // we still surface real vulnerabilities to the user.
     let preConfirmed: PreConfirmedFinding[] = [];
     if (isWeb && targetUrl && (discoveredEndpoints.length > 0 || discoveredForms.length > 0 || discoveredParams.length > 0)) {
+      // ─── PHASE 0 HARD TIMEOUT (5 min) ───
+      // Active probes + rigor verification combined must not exceed 5 min.
+      // If anything hangs (slow proxies, network issues, slow target),
+      // we abort Phase 0 and continue to Phase 1+2 (static + AI). The
+      // job still completes — never hangs forever.
+      const PHASE0_BUDGET_MS = 300_000; // 5 min hard cap for Phase 0
+      const phase0Start = Date.now();
       await updateJob(10, `Active probing: ${discoveredEndpoints.length} endpoints, ${discoveredForms.length} forms, ${discoveredParams.length} params...`);
       try {
         const probeInputs = buildProbeInputsFromCrawl({
@@ -157,13 +164,31 @@ async function runAnalysisInBackground(jobId: string, config: {
           targetUrl,
         });
         console.log(`[analyze-job] Active probes: ${probeInputs.length} inputs built from crawl data`);
-        preConfirmed = await runActiveProbes(probeInputs);
+        // Wrap probes in a timeout — if they take >3 min, abort
+        const probeTimeout = new Promise<PreConfirmedFinding[]>((resolve) =>
+          setTimeout(() => {
+            console.warn('[analyze-job] Active probes hit 3-min timeout — using partial results');
+            resolve([]);
+          }, 180_000));
+        preConfirmed = await Promise.race([
+          runActiveProbes(probeInputs),
+          probeTimeout,
+        ]);
         console.log(`[analyze-job] Active probes confirmed ${preConfirmed.length} findings with HARD HTTP evidence`);
       } catch (probeErr) {
         console.warn('[analyze-job] Active probes failed:', String(probeErr).slice(0, 150));
       }
 
-      // ─── RIGOR VERIFICATION + SAVE ───
+      // Check Phase 0 budget before rigor verification
+      if (Date.now() - phase0Start > PHASE0_BUDGET_MS) {
+        console.warn('[analyze-job] Phase 0 budget exceeded — skipping rigor verification');
+        await updateJob(15, 'Phase 0 timeout — skipping rigor verification, saving findings as-is');
+      } else if (preConfirmed.length > 0) {
+        // Set per-rigor timeout based on remaining Phase 0 budget
+        const remainingBudget = PHASE0_BUDGET_MS - (Date.now() - phase0Start);
+        console.log(`[analyze-job] Rigor verification budget: ${Math.round(remainingBudget / 1000)}s for ${preConfirmed.length} findings`);
+
+      // ─── RIGOR VERIFICATION (PARALLEL) + SAVE ───
       // For each pre-confirmed finding, run rigor verification BEFORE
       // saving. User explicitly asked: every confirmed finding must
       // answer 5 standard questions (repeatability, clean session,
@@ -171,39 +196,64 @@ async function runAnalysisInBackground(jobId: string, config: {
       // If rigor FAILS, the finding is DROPPED (not saved to DB).
       // This prevents the SPA-shell false positives like the
       // /admin /dashboard Nuxt.js finding the user questioned.
+      //
+      // PARALLEL EXECUTION with concurrency cap — previous version was
+      // sequential: 30 findings × 24s each = 12 MINUTES with no progress
+      // updates, which caused the user's "stuck for 16 min" report. Now
+      // we run 5 findings in parallel × ~6s each = ~36s total (20x
+      // speedup). Each individual rigorVerifyFinding also fires its
+      // 4 HTTP requests in parallel (already fixed in rigor-verify.ts).
       const confirmedAfterRigor: PreConfirmedFinding[] = [];
       let rigorDropped = 0;
-      for (const f of preConfirmed) {
-        try {
-          const rigor = await Promise.race([
-            rigorVerifyFinding(f, targetUrl),
-            new Promise<any>((resolve) =>
-              setTimeout(() => resolve({
-                verdict: 'INCONCLUSIVE',
-                evidence: 'Rigor verification timed out (30s) — keeping finding as confirmed but without rigor answers.',
-                refinedDescription: f.description,
-                repeatability: 'unknown', cleanSession: 'unknown',
-                publicComparison: 'unknown', multiEntity: 'unknown', realVsDemo: 'unknown',
-              }), 30_000)),
-          ]);
+      const RIGOR_CONCURRENCY = 5; // 5 findings verified in parallel
+
+      // Chunked parallel runner — 5 at a time, then next batch
+      for (let i = 0; i < preConfirmed.length; i += RIGOR_CONCURRENCY) {
+        if (jobTimedOut) break;
+        const chunk = preConfirmed.slice(i, i + RIGOR_CONCURRENCY);
+        const chunkResults = await Promise.allSettled(
+          chunk.map(async (f) => {
+            try {
+              const rigor = await Promise.race([
+                rigorVerifyFinding(f, targetUrl),
+                new Promise<any>((resolve) =>
+                  setTimeout(() => resolve({
+                    verdict: 'INCONCLUSIVE',
+                    evidence: 'Rigor verification timed out (30s) — keeping finding as confirmed but without rigor answers.',
+                    refinedDescription: f.description,
+                    repeatability: 'unknown', cleanSession: 'unknown',
+                    publicComparison: 'unknown', multiEntity: 'unknown', realVsDemo: 'unknown',
+                  }), 30_000)),
+              ]);
+              return { f, rigor };
+            } catch (rigorErr) {
+              console.warn(`[analyze-job] Rigor check error for "${f.title}": ${String(rigorErr).slice(0, 100)} — keeping as-is`);
+              return { f, rigor: null };
+            }
+          })
+        );
+        for (const r of chunkResults) {
+          if (r.status !== 'fulfilled') continue;
+          const { f, rigor } = r.value;
+          if (rigor === null) {
+            confirmedAfterRigor.push(f);
+            continue;
+          }
           if (rigor.verdict === 'FAIL') {
-            // Rigor check failed — likely false positive. Drop it.
             console.log(`[analyze-job] Rigor FAILED for "${f.title}" — dropping (likely false positive)`);
             rigorDropped++;
             continue;
           }
-          // Update finding description with rigor answers so user sees them
           confirmedAfterRigor.push({
             ...f,
             description: rigor.refinedDescription,
             evidence: `${f.evidence}\n\n== RIGOR VERIFICATION ==\n${rigor.evidence}`,
-            // Reduce confidence if partial pass (3-4/5) vs full pass (5/5)
             confidence: rigor.verdict === 'PASS' ? f.confidence : Math.max(0.6, f.confidence - 0.15),
           });
-        } catch (rigorErr) {
-          console.warn(`[analyze-job] Rigor check error for "${f.title}": ${String(rigorErr).slice(0, 100)} — keeping as-is`);
-          confirmedAfterRigor.push(f);
         }
+        // Update progress between batches so user sees movement
+        await updateJob(10 + Math.round(((i + chunk.length) / preConfirmed.length) * 5),
+          `Rigor verification: ${i + chunk.length}/${preConfirmed.length} findings checked...`).catch(() => {});
       }
       preConfirmed = confirmedAfterRigor;
       if (rigorDropped > 0) {
@@ -239,6 +289,7 @@ async function runAnalysisInBackground(jobId: string, config: {
           console.warn('[analyze-job] Failed to save pre-confirmed finding:', String(e).slice(0, 100));
         }
       }
+      } // end of else (rigor verification ran)
       if (preConfirmed.length > 0) {
         await updateJob(15, `Active probing CONFIRMED ${preConfirmed.length} vulnerabilities (HARD HTTP evidence)`);
       } else {

@@ -110,90 +110,73 @@ export async function rigorVerifyFinding(
     return result;
   }
 
-  // ─── CHECK 1: REPEATABILITY — send 2 more requests, verify response ───
-  let repeat1Body = '';
-  let repeat2Body = '';
-  let repeatStatus = 0;
-  try {
-    const res1 = await fetch(findingUrl, {
-      headers: BROWSER_HEADERS,
-      signal: AbortSignal.timeout(6_000),
-      redirect: 'follow',
-    });
-    repeat1Body = await res1.text();
-    repeatStatus = res1.status;
-    const res2 = await fetch(findingUrl, {
-      headers: BROWSER_HEADERS,
-      signal: AbortSignal.timeout(6_000),
-      redirect: 'follow',
-    });
-    repeat2Body = await res2.text();
-  } catch {}
+  // ─── PARALLEL CHECKS — fire all 4 HTTP requests at once ───
+  // Previous version did these SEQUENTIALLY: 4 × 6s = 24s per finding.
+  // With 30 findings × 24s = 12 MINUTES in Phase 0 (no progress updates).
+  // This caused the user's "stuck for 16 min" report. Parallel cuts
+  // per-finding time to ~6s (the slowest of 4 requests), so 30 findings
+  // × 6s / 5 parallel = 36s total — 20x speedup.
+  const pubUrl = new URL(findingUrl);
+  pubUrl.pathname = '/';
+  pubUrl.search = '';
+  const pubUrlStr = pubUrl.toString();
 
+  const [repeat1Res, repeat2Res, cleanRes, publicRes] = await Promise.allSettled([
+    fetch(findingUrl, {
+      headers: BROWSER_HEADERS,
+      signal: AbortSignal.timeout(6_000),
+      redirect: 'follow',
+    }).then(r => r.text()),
+    fetch(findingUrl, {
+      headers: BROWSER_HEADERS,
+      signal: AbortSignal.timeout(6_000),
+      redirect: 'follow',
+    }).then(r => r.text()),
+    fetch(findingUrl, {
+      headers: CLEAN_SESSION_HEADERS,
+      signal: AbortSignal.timeout(6_000),
+      redirect: 'manual', // don't follow — check for auth redirect
+    }).then(async r => ({ status: r.status, body: await r.text(), location: r.headers.get('location') || '' })),
+    fetch(pubUrlStr, {
+      headers: BROWSER_HEADERS,
+      signal: AbortSignal.timeout(6_000),
+      redirect: 'follow',
+    }).then(r => r.text()),
+  ]);
+
+  // ─── CHECK 1: REPEATABILITY ───
+  const repeat1Body = repeat1Res.status === 'fulfilled' ? repeat1Res.value : '';
+  const repeat2Body = repeat2Res.status === 'fulfilled' ? repeat2Res.value : '';
   if (repeat1Body && repeat2Body) {
-    // For "static" findings (XSS reflected, info exposure), the response
-    // should be identical (or near-identical modulo dynamic tokens). For
-    // "dynamic" findings (auth bypass returning user data), the response
-    // may vary but should contain the same KIND of sensitive data.
     const sameLength = Math.abs(repeat1Body.length - repeat2Body.length) < 200;
     const sameContent = repeat1Body === repeat2Body;
     if (sameContent) {
       result.repeatability = 'consistent';
     } else if (sameLength) {
-      result.repeatability = 'consistent'; // similar length = dynamic but consistent
+      result.repeatability = 'consistent';
     } else {
       result.repeatability = 'varies';
     }
   }
 
-  // ─── CHECK 2: CLEAN SESSION — request without cookies/auth ───
-  let cleanBody = '';
-  try {
-    const res = await fetch(findingUrl, {
-      headers: CLEAN_SESSION_HEADERS,
-      signal: AbortSignal.timeout(6_000),
-      redirect: 'manual', // don't follow redirects — check for auth redirect
-    });
-    cleanBody = await res.text();
-    // If status is 3xx (redirect to login), it's NOT a bypass — server
-    // is enforcing auth via redirect.
-    if (res.status >= 300 && res.status < 400) {
-      const location = res.headers.get('location') || '';
+  // ─── CHECK 2: CLEAN SESSION ───
+  if (cleanRes.status === 'fulfilled' && cleanRes.value) {
+    const { status, body: cleanBody, location } = cleanRes.value;
+    if (status >= 300 && status < 400) {
       result.cleanSession = 'requires-auth';
       result.evidence += `Clean session redirected to ${location} — server ENFORCES auth via redirect. NOT a real bypass.\n`;
-    } else if (res.status === 401 || res.status === 403) {
+    } else if (status === 401 || status === 403) {
       result.cleanSession = 'requires-auth';
-      result.evidence += `Clean session got ${res.status} — server ENFORCES auth. NOT a real bypass.\n`;
-    } else if (res.status === 200 && cleanBody.length > 200) {
+      result.evidence += `Clean session got ${status} — server ENFORCES auth. NOT a real bypass.\n`;
+    } else if (status === 200 && cleanBody.length > 200) {
       result.cleanSession = 'works-without-auth';
-      result.evidence += `Clean session (no cookies, mobile UA) returned ${res.status} with ${cleanBody.length} bytes — endpoint works WITHOUT any auth.\n`;
+      result.evidence += `Clean session (no cookies, mobile UA) returned ${status} with ${cleanBody.length} bytes — endpoint works WITHOUT any auth.\n`;
     }
-  } catch {}
+  }
 
-  // ─── CHECK 3: PUBLIC COMPARISON — get homepage / parent path ───
-  // For SPA-shell false positives, /admin returns the SAME HTML as /
-  // because the SPA serves the same index.html for all routes. Real
-  // admin endpoints return different (admin-specific) content.
-  let publicBody = '';
-  try {
-    // Determine the public comparison URL:
-    // - For /admin → compare to /
-    // - For /api/admin/users → compare to /api/ (or /)
-    // - For https://target.com/admin → compare to https://target.com/
-    const pubUrl = new URL(findingUrl);
-    pubUrl.pathname = '/';
-    pubUrl.search = '';
-    const res = await fetch(pubUrl.toString(), {
-      headers: BROWSER_HEADERS,
-      signal: AbortSignal.timeout(6_000),
-      redirect: 'follow',
-    });
-    publicBody = await res.text();
-  } catch {}
-
+  // ─── CHECK 3: PUBLIC COMPARISON ───
+  const publicBody = publicRes.status === 'fulfilled' ? publicRes.value : '';
   if (publicBody && repeat1Body) {
-    // If /admin response is >95% similar to / response, it's just the
-    // SPA shell. Real admin content differs significantly.
     const similarity = computeSimilarity(publicBody, repeat1Body);
     if (similarity > 0.95) {
       result.publicComparison = 'same-as-public';
