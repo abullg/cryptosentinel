@@ -86,12 +86,12 @@ const BROWSER_HEADERS: Record<string, string> = {
   'Upgrade-Insecure-Requests': '1',
 };
 
-const MAX_PAGES = 100;
-const MAX_JS_BUNDLES = 25;
+const MAX_PAGES = 30;            // was 100 — too many caused rate-limiting
+const MAX_JS_BUNDLES = 10;       // was 25 — same reason
 const PER_PAGE_TIMEOUT = 8_000;
-const TOTAL_BUDGET_MS = 300_000; // 5 min hard cap for crawl (was 4 min)
-// With 50 parallel fetches × 8s, 100 pages = 2 batches × 8s = 16s.
-// 5 min leaves headroom for slow responses + proxy fallback.
+const TOTAL_BUDGET_MS = 90_000;  // 90s hard cap (was 5 min — too long)
+// With 10 parallel × 8s, 30 pages = 3 batches × 8s = 24s.
+// 90s leaves headroom for slow proxies + Wayback fallback.
 const COMMON_SEED_PATHS = [
   '/', '/login', '/signin', '/register', '/signup', '/auth',
   '/admin', '/dashboard', '/account', '/settings', '/profile',
@@ -609,12 +609,11 @@ export async function deepCrawl(targetUrl: string): Promise<CrawlResult> {
   let securityHeaders: Record<string, string> = {};
   let wafDetected = false;
 
-  // PARALLEL BFS LOOP — fetch pages in batches of 50 at a time.
-  // VPS has 8GB RAM + 100GB SSD so we can afford high concurrency.
-  // 50 parallel fetches × 8s = 1 batch for 50 pages = ~8s total crawl.
-  // Previous versions were: sequential (9 min) → 10 parallel (40s).
-  // User explicit request: 'increase parallel requests to 50'
-  const PARALLEL_BATCH = 50;
+  // PARALLEL BFS LOOP — fetch pages in batches of 10 at a time.
+  // Was 50 — too many caused allorigins proxy to rate-limit us,
+  // resulting in 4-min crawl times. 10 parallel is balanced: fast
+  // (3 batches × 8s = 24s for 30 pages) without triggering rate limits.
+  const PARALLEL_BATCH = 10;
 
   while (queue.length > 0 && pages.length < MAX_PAGES) {
     // Time budget check

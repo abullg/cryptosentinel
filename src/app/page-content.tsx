@@ -1220,12 +1220,13 @@ export default function CryptoSentinelDashboard() {
     addActivity('scan', 'Fetching URL and starting analysis...', 'running', targetUrl, 5);
 
     try {
-      // Fetch URL content first — 120s timeout (was 60s, too short for slow sites with WAF)
-      addActivity('scan', 'Crawling target site (robots.txt, sitemap, SSL, paths)...', 'running', 'This can take 10-30s', 10);
+      // Fetch URL content first — 180s timeout (was 120s — too short for
+      // complex targets with WAF/proxy fallback like bitunix.com)
+      addActivity('scan', 'Crawling target site (robots.txt, sitemap, SSL, paths, JS bundles)...', 'running', 'Can take 30-90s on WAF-protected sites', 10);
       const fetchRes = await fetchWithTimeout('/api/fetch-url', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: targetUrl, type: targetType === 'hackenproof' ? 'contract' : targetType }),
-      }, 120_000); // 2 min — /api/fetch-url crawls sitemap + SSL + path discovery
+      }, 180_000); // 3 min — deep crawl + multi-proxy fallback can be slow
 
       if (!fetchRes.ok) {
         const errData = await fetchRes.json().catch(() => ({}));
