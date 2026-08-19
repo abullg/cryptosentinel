@@ -3,6 +3,7 @@ export const maxDuration = 600; // VPS KVM 2 — no Render/Vercel limits; allow 
 // analyzeWebApp removed — lightweight fetchWebsite + multi-pass AI in /api/analyze is faster
 import { checkStandardRateLimit } from '@/lib/rate-limit';
 import { isSsrfBlocked } from '@/lib/ssrf';
+import { deepCrawl } from '@/lib/deep-crawler';
 
 /**
  * GitHub API headers — includes Authorization token if GITHUB_TOKEN is set.
@@ -629,12 +630,82 @@ async function fetchWebAppWithAI(parsedUrl: URL, isContractFallback = false) {
   const urlStr = parsedUrl.toString();
 
   try {
-    // FAST PATH: Lightweight crawl (4-5 requests, ~5-10s) returns rich data for AI.
-    // AI analysis runs separately in /api/analyze via multi-pass GLM agents.
-    // This avoids the old 40-min bottleneck from sequential HTTP + AI in analyzeWebApp.
-    console.log(`[fetchWebAppWithAI] Fast crawl for ${urlStr} (AI in /api/analyze)`);
+    // DEEP CRAWL PATH — BFS through ALL internal pages on the target site
+    // (replaces the old shallow "3 sitemap pages" crawl). Discovers login,
+    // admin, /api/*, forms with input fields, and per-page URL parameters
+    // — the security-relevant surfaces that shallow crawling missed.
+    console.log(`[fetchWebAppWithAI] Deep BFS crawl for ${urlStr}`);
+    let crawl;
+    try {
+      crawl = await deepCrawl(urlStr);
+    } catch (crawlErr) {
+      // Fallback to legacy shallow crawl if BFS fails (e.g. SSRF block, total timeout)
+      console.warn('[fetchWebAppWithAI] Deep crawl failed, falling back to shallow:', String(crawlErr).slice(0, 150));
+      return await fetchWebsite(parsedUrl, isContractFallback);
+    }
 
-    return await fetchWebsite(parsedUrl, isContractFallback);
+    // If the deep crawl got 0 successful pages (full WAF block) fall back
+    // to the legacy passive-recon path which has the CORS-proxy fallback.
+    if (crawl.pages.length === 0 || crawl.pages.every(p => p.wafBlocked)) {
+      console.warn('[fetchWebAppWithAI] Deep crawl got 0 readable pages (WAF?). Falling back to legacy.');
+      return await fetchWebsite(parsedUrl, isContractFallback);
+    }
+
+    // Build AI-ready analysis source: deep crawl recon text + endpoint map
+    const aiSource = `// Target: ${urlStr}
+// Type: Exchange / Web Application
+// Recon method: Deep BFS crawl (30+ pages, parallel)
+// Pages crawled: ${crawl.pages.length}
+// JS bundles analyzed: ${crawl.jsBundles.length}
+// Discovered endpoints: ${crawl.discoveredEndpoints.length}
+// Discovered forms: ${crawl.discoveredForms.length}
+// Discovered unique URL params: ${crawl.discoveredParams.length}
+// WAF detected: ${crawl.wafDetected}
+// Crawled at: ${new Date().toISOString()}
+
+${crawl.reconText}
+
+== HACKENPROOF SEVERITY PRIORITIES (Web & Mobile) ==
+CRITICAL: Payment manipulation, SQL Injection, RCE, Business logic with fund loss, Command Injection
+HIGH: Wallet subdomain takeover, Stored XSS, SSRF, Sensitive data exposure >15%, Auth Bypass, IDOR, Privilege Escalation
+MEDIUM: Reflected XSS, Non-wallet subdomain takeover, 2FA bypass, CSRF
+LOW: HTML Injection, Rate limiting missing on non-critical endpoints
+
+== ACTIVE VALIDATION ENABLED ==
+The system will send REAL HTTP requests with payloads to ALL discovered endpoints
+and parameters below to confirm exploitability. Report findings you are confident
+the active validators can confirm with a real HTTP probe.
+
+DISCOVERED ENDPOINTS (test each for: SQLi, XSS, IDOR, auth bypass, SSRF, open redirect, info exposure):
+${crawl.discoveredEndpoints.slice(0, 80).map((e, i) => `  ${i+1}. ${e}`).join('\n')}
+
+DISCOVERED FORMS (test each input for: SQLi, XSS, CSRF, auth bypass, mass assignment):
+${crawl.discoveredForms.slice(0, 30).map((f, i) => `  ${i+1}. ${f.method.toUpperCase()} ${f.action} — fields: ${f.fields.join(', ') || '(none)'}`).join('\n')}
+
+DISCOVERED URL PARAMETERS (test each for: SQLi, XSS, SSRF, open redirect, LFI, IDOR):
+${crawl.discoveredParams.slice(0, 30).map((p, i) => `  ${i+1}. ${p}`).join('\n')}
+`;
+
+    return NextResponse.json({
+      sourceCode: aiSource,
+      contractName: parsedUrl.hostname.replace(/\./g, '_'),
+      language: 'web',
+      filesCount: 1,
+      totalSize: aiSource.length,
+      url: urlStr,
+      title: crawl.pages[0]?.title || parsedUrl.hostname,
+      scriptsFound: crawl.jsBundles.length,
+      apiEndpointsFound: crawl.discoveredEndpoints.length,
+      formsFound: crawl.discoveredForms.length,
+      wafDetected: crawl.wafDetected,
+      reconType: crawl.wafDetected ? 'Deep crawl (WAF partial block)' : 'Deep BFS crawl + passive recon',
+      // New fields for downstream active validation
+      discoveredEndpoints: crawl.discoveredEndpoints,
+      discoveredForms: crawl.discoveredForms,
+      discoveredParams: crawl.discoveredParams,
+      crawledPages: crawl.pages.length,
+      jsBundlesAnalyzed: crawl.jsBundles.length,
+    });
 
   } catch (e) {
     const msg = String(e);

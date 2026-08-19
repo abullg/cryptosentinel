@@ -1032,14 +1032,27 @@ export default function CryptoSentinelDashboard() {
    *  2. Poll GET /api/job-status/{jobId} every 5s
    *  3. When status=completed → fetch results from /api/vulnerabilities
    *  4. When status=failed → show error */
-  const startBackgroundAnalysis = async (sourceCode: string, contractName: string, targetType: string, targetUrl?: string) => {
+  const startBackgroundAnalysis = async (
+    sourceCode: string,
+    contractName: string,
+    targetType: string,
+    targetUrl?: string,
+    crawlData?: { discoveredEndpoints?: string[]; discoveredForms?: any[]; discoveredParams?: string[] },
+  ) => {
     addActivity('scan', 'Starting background analysis...', 'running', targetUrl || contractName, 5);
 
-    // Step 1: Start the job
+    // Step 1: Start the job — pass crawl data so analyze-job can run
+    // per-endpoint active probes BEFORE AI even starts. This is what
+    // "literally search everywhere on the site" means.
     const res = await fetch('/api/analyze-job', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sourceCode, contractName, targetType, targetUrl }),
+      body: JSON.stringify({
+        sourceCode, contractName, targetType, targetUrl,
+        discoveredEndpoints: crawlData?.discoveredEndpoints || [],
+        discoveredForms: crawlData?.discoveredForms || [],
+        discoveredParams: crawlData?.discoveredParams || [],
+      }),
     });
 
     if (!res.ok) {
@@ -1068,15 +1081,29 @@ export default function CryptoSentinelDashboard() {
           const status = await statusRes.json();
 
           if (status.progress !== undefined && status.progress < 100) {
-            // Only add NEW activity entries — dedupe by message
-            // (prevents duplicate 30% entries when job stays at same progress)
+            // Incremental progress update — UPDATE the last entry in place
+            // if the new progress is within ±5% of it, instead of adding a
+            // new entry. This eliminates the "many 30% rows" cosmetic bug
+            // when AI pass ticks every 10s while still in the same phase.
             const msg = status.message || `Progress: ${status.progress}%`;
             setActivities(prev => {
               const lastEntry = prev[0];
-              // Skip if same message as last entry (dedupe)
-              if (lastEntry && lastEntry.message === msg) return prev;
-              // Skip if same progress as last entry (dedupe)
-              if (lastEntry && lastEntry.detail === `${status.progress}%`) return prev;
+              // If last entry exists AND is in the same phase band (within ±5%),
+              // UPDATE its message+timestamp in place rather than pushing a new row.
+              if (lastEntry && lastEntry.type === 'scan' && lastEntry.status === 'running') {
+                const lastProgress = typeof lastEntry.progress === 'number' ? lastEntry.progress : 0;
+                if (Math.abs(lastProgress - status.progress) <= 5) {
+                  const updated = {
+                    ...lastEntry,
+                    message: msg,
+                    detail: `${status.progress}%`,
+                    progress: status.progress,
+                    timestamp: Date.now(),
+                  };
+                  return [updated, ...prev.slice(1)];
+                }
+              }
+              // Different phase band → push new entry (this is a real transition)
               const entry = {
                 type: 'scan',
                 message: msg,
@@ -1184,15 +1211,25 @@ export default function CryptoSentinelDashboard() {
       if (data.error) throw new Error(data.error);
       if (!data.sourceCode) throw new Error('No content found at the URL');
 
-      addActivity('system', `URL content fetched: ${data.sourceCode.length} chars`, 'success', '', 20);
+      // Surface crawl stats to the user so they can SEE the deep crawl worked
+      if (data.crawledPages || data.apiEndpointsFound || data.formsFound) {
+        addActivity('system', `Deep crawl: ${data.crawledPages || 0} pages, ${data.apiEndpointsFound || 0} endpoints, ${data.formsFound || 0} forms, ${data.discoveredParams?.length || 0} unique params`, 'success', '', 20);
+      } else {
+        addActivity('system', `URL content fetched: ${data.sourceCode.length} chars`, 'success', '', 20);
+      }
 
-      // Start background analysis with fetched code
+      // Start background analysis with fetched code + crawl data
       const apiType = targetType === 'hackenproof' ? 'contract' : targetType;
       await startBackgroundAnalysis(
         data.sourceCode,
         data.contractName || 'FetchedContract',
         apiType,
-        targetUrl
+        targetUrl,
+        {
+          discoveredEndpoints: data.discoveredEndpoints,
+          discoveredForms: data.discoveredForms,
+          discoveredParams: data.discoveredParams,
+        },
       );
       addActivity('scan', 'URL analysis complete', 'success', 'Done', 100);
       setSourceCode(''); setTargetUrl(''); setHackenproofContext(null);
