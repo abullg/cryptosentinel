@@ -146,26 +146,42 @@ async function runAnalysisInBackground(jobId: string, config: {
   // bottleneck. If ANY write hangs (transaction deadlock, slow disk),
   // flushPending stays true forever and no more updates happen.
   //
-  // NEW APPROACH: progress goes to a JSON FILE (writeFileSync, no Prisma).
-  // File I/O is non-blocking and never serializes through a connection
-  // pool. Job-status endpoint reads the file first, falls back to DB.
+  // FIX (v3 — after user reported 'stuck at 10s for 10 min'): flushTimer
+  // was writing stale progressState to file every 1s — file's updatedAt
+  // was fresh but content was stuck at 32%. Watchdog checked file age
+  // (always fresh due to flushTimer) so never fired. NEW: flushTimer
+  // only writes when state JSON CHANGES. If state is stuck for >2min,
+  // file age grows, watchdog fires correctly.
   let progressState = { progress: 0, message: 'Job created', status: 'pending' as string };
+  let lastWrittenStateJson = '';
 
-  // File flush timer — every 1s, write current state to JSON file
+  // File flush timer — every 1s, write current state to JSON file.
+  // CRITICAL FIX: only write if state JSON has CHANGED. This way, if
+  // setInterval stops firing (event loop blocked or AI hung), the file
+  // stops being updated. The job-status watchdog sees stale file age
+  // (>2 min) and marks job as failed — user sees error instead of
+  // spinning forever on stale progress.
   const flushTimer = setInterval(() => {
+    const stateJson = JSON.stringify(progressState);
+    if (stateJson === lastWrittenStateJson) {
+      return; // state unchanged — don't write, let file age grow so watchdog can fire
+    }
+    lastWrittenStateJson = stateJson;
     writeProgressFile(jobId, progressState);
   }, 1_000);
 
   // Instant, non-blocking progress update — sets in-memory state +
   // immediately writes to file (so user sees update within 1s)
   const updateJob = async (progress: number, message: string) => {
-    progressState = { progress, message, status: 'running' };
+    progressState = { progress, message, status: progress >= 100 ? 'completed' : 'running' };
     writeProgressFile(jobId, progressState);  // immediate file write
+    lastWrittenStateJson = JSON.stringify(progressState);  // sync cache
   };
 
   // Force-flush now (used at completion so user sees final state immediately)
   const flushJobNow = async () => {
     writeProgressFile(jobId, progressState);
+    lastWrittenStateJson = JSON.stringify(progressState);
     // Also try DB write — best-effort, don't block (5s timeout — fire-and-forget)
     fireAndForget(
       withTimeout(db.analysisJob.update({
@@ -175,6 +191,30 @@ async function runAnalysisInBackground(jobId: string, config: {
       'flushJobNow'
     );
   };
+
+  // ─── HEARTBEAT TIMER — touches progress file every 30s ───
+  // Belt-and-suspenders: even if setInterval/flushTimer logic fails, this
+  // timer writes a heartbeat to the file every 30s. If it ALSO stops
+  // firing (event loop blocked), the watchdog in job-status will fire
+  // at 2 min and mark the job as failed.
+  // The heartbeat updates the message with elapsed time so user sees
+  // SOMETHING moving even if the main pipeline is hung.
+  const heartbeatJobStart = Date.now();
+  const heartbeatTimer = setInterval(() => {
+    const elapsed = Math.round((Date.now() - heartbeatJobStart) / 1000);
+    // Only update if progressState is still 'running' — don't overwrite 'completed'/'failed'
+    if (progressState.status === 'running') {
+      // Add heartbeat marker so we know this is a heartbeat update
+      const heartbeatState = {
+        progress: progressState.progress,
+        message: `${progressState.message.split(' [heartbeat')[0]} [heartbeat ${elapsed}s]`,
+        status: 'running' as string,
+      };
+      writeProgressFile(jobId, heartbeatState);
+      // Don't update lastWrittenStateJson — let the next real flushTimer tick
+      // OR updateJob call work normally
+    }
+  }, 30_000);
 
   // ─── GLOBAL TIMEOUT: entire job must complete in 30 min ───
   // User feedback: "15 минут тоже мало" — increase parallelism and total
@@ -433,7 +473,7 @@ async function runAnalysisInBackground(jobId: string, config: {
       fireAndForget(db.audit.update({ where: { id: auditId }, data: { status: 'completed', findings: exploitCount, completedAt: new Date() } }), 'fast-path audit.update');
       fireAndForget(db.analysisJob.update({ where: { id: jobId }, data: { status: 'completed', resultCount: exploitCount } }), 'fast-path analysisJob.update');
       writeProgressFile(jobId, { progress: 100, message: `Done: ${exploitCount} confirmed exploits (active probes: ${preConfirmed.length}, validated: ${finalResults.length}). AI skipped — already had enough hard evidence.`, status: 'completed' });
-      clearInterval(flushTimer);
+      clearInterval(flushTimer); clearInterval(heartbeatTimer);
       clearTimeout(globalTimeout);
       clearTimeout(panicTimer);
       return;
@@ -505,7 +545,7 @@ async function runAnalysisInBackground(jobId: string, config: {
       fireAndForget(db.audit.update({ where: { id: auditId }, data: { status: 'completed', findings: allResults.length, completedAt: new Date() } }), 'catch audit.update');
       fireAndForget(db.analysisJob.update({ where: { id: jobId }, data: { status: 'completed', resultCount: 0 } }), 'catch analysisJob.update');
       writeProgressFile(jobId, { progress: 100, message: `Analysis complete (AI failed): ${allResults.length} static findings`, status: 'completed' });
-      clearInterval(flushTimer);
+      clearInterval(flushTimer); clearInterval(heartbeatTimer);
       clearTimeout(phase2Watchdog);
       clearTimeout(globalTimeout);
       clearTimeout(panicTimer);
@@ -658,7 +698,7 @@ async function runAnalysisInBackground(jobId: string, config: {
   } finally {
     clearTimeout(globalTimeout);
     clearTimeout(panicTimer);
-    clearInterval(flushTimer);
+    clearInterval(flushTimer); clearInterval(heartbeatTimer);
     // Final force-flush so user sees the latest state immediately
     try {
       await flushJobNow();
