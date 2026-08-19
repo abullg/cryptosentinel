@@ -349,28 +349,55 @@ async function validateWithFoundry(sourceCode: string, contractName: string, vul
   const actualName = contractName || nameMatch?.[1] || 'Target';
   const tmpDir = `/tmp/foundry-${Date.now()}`;
   try {
+    // Check if forge is installed
+    try {
+      execSync('which forge', { timeout: 3_000, encoding: 'utf-8', stdio: 'pipe' });
+    } catch {
+      return inconclusive(
+        `Foundry (forge) is not installed on the VPS. Cannot run lab validation. Install with: curl -L https://foundry.paradigm.xyz | bash && foundryup`,
+        { validationScope: 'theoretical' });
+    }
+
     mkdirSync(join(tmpDir, 'src'), { recursive: true });
     mkdirSync(join(tmpDir, 'test'), { recursive: true });
     writeFileSync(join(tmpDir, 'src', `${actualName}.sol`), sourceCode);
-    writeFileSync(join(tmpDir, 'test', 'PoC.t.sol'), generatePoCTest(sourceCode, actualName, vuln));
+    const pocTest = generatePoCTest(sourceCode, actualName, vuln);
+    writeFileSync(join(tmpDir, 'test', 'PoC.t.sol'), pocTest);
     writeFileSync(join(tmpDir, 'foundry.toml'), `[profile.default]\nsrc="src"\nout="out"\nlibs=["lib"]\nsolc_version="0.8.20"\noptimizer=true\n`);
+
+    // Setup forge-std — try cached, then install
     const FORGE_STD_CACHE = '/opt/forge-lib/forge-std';
     const forgeStdLink = join(tmpDir, 'lib', 'forge-std');
+    mkdirSync(join(tmpDir, 'lib'), { recursive: true });
+    if (existsSync(FORGE_STD_CACHE)) {
+      try { symlinkSync(FORGE_STD_CACHE, forgeStdLink, 'dir'); } catch {}
+    } else {
+      try {
+        execSync('git init && git add -A && git commit -m init', { cwd: tmpDir, timeout: 5_000, stdio: 'pipe' });
+        execSync('forge install foundry-rs/forge-std --no-commit --no-git', { cwd: tmpDir, timeout: 30_000, stdio: 'pipe' });
+        mkdirSync('/opt/forge-lib', { recursive: true });
+        execSync(`cp -r ${forgeStdLink} ${FORGE_STD_CACHE}`, { timeout: 10_000, stdio: 'pipe' });
+      } catch {}
+    }
+
+    // Run forge test — capture stdout AND stderr
+    let result = '';
     try {
-      mkdirSync(join(tmpDir, 'lib'), { recursive: true });
-      if (existsSync(FORGE_STD_CACHE)) { try { symlinkSync(FORGE_STD_CACHE, forgeStdLink, 'dir'); } catch {} }
-      else { try { execSync('git init && git add -A && git commit -m init', { cwd: tmpDir, timeout: 5_000, stdio: 'pipe' }); } catch {}
-        try { execSync('forge install foundry-rs/forge-std --no-commit --no-git', { cwd: tmpDir, timeout: 30_000, stdio: 'pipe' });
-          try { mkdirSync('/opt/forge-lib', { recursive: true }); execSync(`cp -r ${forgeStdLink} ${FORGE_STD_CACHE}`, { timeout: 10_000, stdio: 'pipe' }); } catch {} } catch {} }
-    } catch {}
-    const result = execSync('forge test -vvv 2>&1', { cwd: tmpDir, timeout: 30_000, encoding: 'utf-8', stdio: 'pipe' });
-    const passed = result.includes('[PASS]') || result.includes('SUCCESS');
+      result = execSync('forge test -vvv 2>&1', { cwd: tmpDir, timeout: 30_000, encoding: 'utf-8', stdio: 'pipe' });
+    } catch (e: any) {
+      // execSync throws on non-zero exit code — but forge returns non-zero on test failure
+      // The output is in e.stdout (pipe) or e.stderr
+      result = (e.stdout || '').toString() + (e.stderr || '').toString();
+      if (!result) result = String(e.message || e);
+    }
+
+    const passed = result.includes('[PASS]') || result.includes('SUCCESS') || result.includes('Suite result: OK');
     const gasMatch = result.match(/(\d+)\s+gas/);
     if (passed) return exploitConfirmed(
       `Foundry PoC PASSED. Gas: ${gasMatch?.[1] || 'n/a'}. This confirms the exploit works in a local EVM, NOT that the deployed contract is exploitable.`,
       { validationScope: 'lab', testOutput: result.slice(0, 2000), gasUsed: gasMatch ? parseInt(gasMatch[1]) : undefined });
     // Foundry ran but PoC failed — exploit REFUTED under lab conditions
-    return exploitRefuted(`Foundry PoC FAILED — exploit did not succeed under lab conditions.`,
+    return exploitRefuted(`Foundry PoC FAILED — exploit did not succeed under lab conditions. Output: ${result.slice(0, 500)}`,
       { validationScope: 'lab', testOutput: result.slice(0, 2000) });
   } catch (e: any) {
     // Foundry crashed (compile error, missing deps, timeout) — INCONCLUSIVE, not "refuted"
