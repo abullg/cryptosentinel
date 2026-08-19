@@ -1,0 +1,22 @@
+name: Test Proxies
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p 22 -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Test all fetch strategies from VPS
+        run: |
+          HOST="${{ secrets.VPS_HOST }}"
+          USER="${{ secrets.VPS_USER || 'root' }}"
+          ssh -p 22 -o StrictHostKeyChecking=no -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 $USER@$HOST "echo '=== Testing bitunix.com via each proxy ==='; for url in 'https://www.bitunix.com/' 'https://chrome.coin98.com/'; do echo ''; echo \"--- TARGET: \$url ---\"; echo '1. Direct fetch (Chrome UA):'; timeout 10 curl -s -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131' -o /tmp/d1.html -w 'HTTP %{http_code}, size %{size_download} bytes, time %{time_total}s\n' \"\$url\" 2>&1 | tail -1; head -c 200 /tmp/d1.html 2>/dev/null; echo ''; echo '2. Direct fetch (Googlebot UA):'; timeout 10 curl -s -A 'Googlebot/2.1' -o /tmp/d2.html -w 'HTTP %{http_code}, size %{size_download} bytes, time %{time_total}s\n' \"\$url\" 2>&1 | tail -1; head -c 200 /tmp/d2.html 2>/dev/null; echo ''; echo '3. allorigins RAW:'; timeout 10 curl -sL --max-time 8 \"https://api.allorigins.win/raw?url=\$(printf '%s' \"\$url\" | jq -sRr @uri)\" -o /tmp/d3.html -w 'HTTP %{http_code}, size %{size_download} bytes, time %{time_total}s\n' 2>&1 | tail -1; head -c 200 /tmp/d3.html 2>/dev/null; echo ''; echo '4. allorigins GET (JSON):'; timeout 10 curl -sL --max-time 8 \"https://api.allorigins.win/get?url=\$(printf '%s' \"\$url\" | jq -sRr @uri)\" -o /tmp/d4.json -w 'HTTP %{http_code}, size %{size_download} bytes, time %{time_total}s\n' 2>&1 | tail -1; cat /tmp/d4.json 2>/dev/null | head -c 300; echo ''; echo '5. r.jina.ai reader:'; timeout 10 curl -sL --max-time 8 \"https://r.jina.ai/\$url\" -o /tmp/d5.html -w 'HTTP %{http_code}, size %{size_download} bytes, time %{time_total}s\n' 2>&1 | tail -1; head -c 300 /tmp/d5.html 2>/dev/null; echo ''; echo '6. Wayback Machine:'; timeout 12 curl -sIL --max-time 10 \"https://web.archive.org/web/2025/\$url\" 2>&1 | head -5; echo ''; echo '7. codetabs:'; timeout 10 curl -sL --max-time 8 \"https://api.codetabs.com/v1/proxy/?url=\$url\" -o /tmp/d7.html -w 'HTTP %{http_code}, size %{size_download} bytes, time %{time_total}s\n' 2>&1 | tail -1; head -c 200 /tmp/d7.html 2>/dev/null; echo ''; done; echo ''; echo '=== DONE ==='"
