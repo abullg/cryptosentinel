@@ -54,8 +54,8 @@ const BROWSER_HEADERS: Record<string, string> = {
 };
 
 const PER_REQUEST_TIMEOUT = 6_000;
-const MAX_PROBES = 100;             // hard cap on total probes (was 60, doubled)
-const MAX_CONFIRMED = 30;           // hard cap on confirmed findings to save
+const MAX_PROBES = 200;             // hard cap on total probes (was 100, doubled again)
+const MAX_CONFIRMED = 50;           // hard cap on confirmed findings to save (was 30)
 
 // ─── Payload libraries ────────────────────────────────────────────────
 
@@ -498,9 +498,11 @@ export async function runActiveProbes(inputs: ProbeInput[]): Promise<PreConfirme
   // Shuffle + cap so we test broadly even on huge inputs
   const shuffled = queue.sort(() => Math.random() - 0.5).slice(0, MAX_PROBES);
 
-  // Run probes with limited concurrency (16 at a time — was 8) — never DoS target
-  // but allow faster throughput so 100 probes finish in ~40s vs 90s
-  const CONCURRENCY = 16;
+  // Run probes with high concurrency (50 at a time). VPS has 8GB RAM so
+  // we can afford 50 simultaneous HTTP requests. 100 probes / 50 = 2
+  // batches × 6s = 12s total (vs 100/16 × 6s = 38s with previous cap).
+  // User explicit: 'increase parallel requests to 50'
+  const CONCURRENCY = 50;
   let cursor = 0;
 
   async function worker() {

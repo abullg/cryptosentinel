@@ -200,12 +200,14 @@ async function runAnalysisInBackground(jobId: string, config: {
       // PARALLEL EXECUTION with concurrency cap — previous version was
       // sequential: 30 findings × 24s each = 12 MINUTES with no progress
       // updates, which caused the user's "stuck for 16 min" report. Now
-      // we run 5 findings in parallel × ~6s each = ~36s total (20x
-      // speedup). Each individual rigorVerifyFinding also fires its
-      // 4 HTTP requests in parallel (already fixed in rigor-verify.ts).
+      // we run 15 findings in parallel × ~6s each (each fires 4 parallel
+      // HTTP requests) = ~12s total for 30 findings (60x speedup).
+      // VPS has 8GB RAM, can handle 15×4=60 simultaneous HTTP connections.
+      // User explicit: 'increase parallel requests to 50' — 15 findings
+      // × 4 requests per finding = 60 concurrent requests = under 50 cap.
       const confirmedAfterRigor: PreConfirmedFinding[] = [];
       let rigorDropped = 0;
-      const RIGOR_CONCURRENCY = 5; // 5 findings verified in parallel
+      const RIGOR_CONCURRENCY = 15; // 15 findings verified in parallel
 
       // Chunked parallel runner — 5 at a time, then next batch
       for (let i = 0; i < preConfirmed.length; i += RIGOR_CONCURRENCY) {

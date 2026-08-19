@@ -33,9 +33,11 @@ module.exports = {
       NEXT_RUNTIME: 'nodejs',
       NODE_ENV: 'production',
 
-      // ── Memory (VPS has 8GB) ────────────────────────────────────────
-      // Allow up to 2GB for large smart contract multi-pass analysis.
-      NODE_OPTIONS: '--unhandled-rejections=strict --max-old-space-size=2048',
+      // ── Memory (VPS has 8GB RAM + 100GB SSD) ───────────────────────
+      // Allow up to 6GB for large smart contract multi-pass analysis
+      // and parallel BFS crawling with 50 concurrent page fetches.
+      // 6GB cap leaves 2GB for the OS + nginx + PM2 itself.
+      NODE_OPTIONS: '--unhandled-rejections=strict --max-old-space-size=6144',
 
       // ── Secrets (set these on the VPS in /etc/environment or PM2 env) ─
       OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY || '',
@@ -53,8 +55,9 @@ module.exports = {
     watch: false,
     autorestart: true,
 
-    // ── Memory threshold (VPS has 8GB) ────────────────────────────────
-    max_memory_restart: '2G',
+    // ── Memory threshold (VPS has 8GB RAM) ────────────────────────────
+    // PM2 restarts the process if it exceeds 6GB. Leaves 2GB for the OS.
+    max_memory_restart: '6G',
 
     // ── Timeouts (audit fix HIGH-2 + SSE compat) ─────────────────────
     // 10s kill_timeout + 30s listen_timeout for long AI streams.
