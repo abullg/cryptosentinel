@@ -676,13 +676,18 @@ async function runAnalysisInBackground(jobId: string, config: {
     // eliminates 'inconclusive', 'candidate', and 'refuted' statuses entirely.
     // The DB only ever contains confirmed/validated findings.
     const dropIds: string[] = [];
+    const keptIds: string[] = [];
     for (const s of [...savedStatic, ...savedAi]) {
       const st = s.vuln.status;
+      console.log(`[analyze-job] Drop check: type="${(s.rawFinding?.type || s.vuln?.type || 'unknown')}" status="${st}" title="${(s.vuln?.title || '').slice(0, 60)}" → ${st === 'confirmed' || st === 'validated' ? 'KEEP' : 'DROP'}`);
       if (st !== 'confirmed' && st !== 'validated') {
         dropIds.push(s.vuln.id);
         s.vuln.status = 'dropped'; // mark for tally
+      } else {
+        keptIds.push(s.vuln.id);
       }
     }
+    console.log(`[analyze-job] Drop summary: ${keptIds.length} kept (confirmed/validated), ${dropIds.length} to drop`);
     if (dropIds.length > 0) {
       try {
         await withTimeout(db.vulnerability.deleteMany({ where: { id: { in: dropIds } } }), 10_000, null, 'dropIds deleteMany');
@@ -782,22 +787,20 @@ async function runValidationOnFindings(
   const verifyPromises = savedFindings.map(async ({ vuln, rawFinding: v }: any) => {
     try {
       const findingType = (v.type || '').toLowerCase();
+      console.log(`[analyze-job] Validating finding: type="${findingType}" title="${(v.title || '').slice(0, 60)}" — isPassiveType=${PASSIVE_EVIDENCE_TYPES.has(findingType)}`);
 
       // ─── PASSIVE EVIDENCE CHECK ───
-      // For passive types, check if recon data has SUFFICIENT evidence
-      // to auto-confirm. If yes → skip active validation (saves HTTP
-      // requests, faster pipeline, more concurrency for active findings).
-      // If no → fall back to active HTTP validation.
       if (PASSIVE_EVIDENCE_TYPES.has(findingType)) {
         const evidenceResult = checkPassiveEvidence(findingType, sourceCode, v);
+        console.log(`[analyze-job]   Passive evidence: sufficient=${evidenceResult.sufficient} confidence=${evidenceResult.confidence} evidence="${evidenceResult.evidence.slice(0, 80)}"`);
         if (evidenceResult.sufficient) {
-          // Auto-confirm — sufficient passive evidence found
           const label = `[CONFIRMED via passive evidence] ${evidenceResult.evidence}`;
           const newSeverity = evidenceResult.severity || v.severity || 'medium';
-          await withTimeout(db.vulnerability.update({ where: { id: vuln.id },
+          const updateResult = await withTimeout(db.vulnerability.update({ where: { id: vuln.id },
             data: { confidence: evidenceResult.confidence, status: 'validated',
               validationScope: 'passive', severity: newSeverity,
-              description: vuln.description + `\n\n${label}\n\n== RIGOR VERIFICATION (passive) ==\nThis finding was auto-confirmed because the recon data we already collected (security headers, HTML content, JS bundle scan) contains SUFFICIENT evidence. No additional HTTP requests were needed — saves time and concurrency for findings that genuinely require runtime proof.\n\nEvidence: ${evidenceResult.evidence}\nConfidence: ${evidenceResult.confidence}` } }), 10_000, null, 'passive vuln.update');
+              description: vuln.description + `\n\n${label}\n\n== RIGOR VERIFICATION (passive) ==\nEvidence: ${evidenceResult.evidence}\nConfidence: ${evidenceResult.confidence}` } }), 10_000, null, 'passive vuln.update');
+          console.log(`[analyze-job]   DB update result: ${updateResult ? 'SUCCESS' : 'FAILED (null)'} — setting in-memory status='validated'`);
           vuln.confidence = evidenceResult.confidence;
           vuln.status = 'validated';
           vuln.validationScope = 'passive';
@@ -806,8 +809,7 @@ async function runValidationOnFindings(
           passiveConfirmed++;
           return;
         } else {
-          // Insufficient passive evidence — fall through to active validation
-          console.log(`[analyze-job] Passive evidence INSUFFICIENT for "${v.title}" — falling back to active validation: ${evidenceResult.evidence.slice(0, 80)}`);
+          console.log(`[analyze-job]   Passive INSUFFICIENT — falling back to active validation`);
         }
       }
 
@@ -825,6 +827,7 @@ async function runValidationOnFindings(
 
       const scope = verification.validationScope || 'theoretical';
       const verdict = verification.verdict || (verification.confirmed ? 'EXPLOITABLE' : 'INCONCLUSIVE');
+      console.log(`[analyze-job]   Active validation: verdict=${verdict} scope=${scope}`);
 
       if (verdict === 'EXPLOITABLE') {
         const newStatus = scope === 'target' ? 'confirmed' : 'validated';
