@@ -14,6 +14,7 @@ import { runControlFlowAnalysis } from '@/lib/control-flow-analyzer';
 import { runActiveProbes, buildProbeInputsFromCrawl, type PreConfirmedFinding } from '@/lib/active-probe';
 import { rigorVerifyFinding } from '@/lib/rigor-verify';
 import { writeProgressFile } from '@/lib/progress-file';
+import { withTimeout, fireAndForget } from '@/lib/with-timeout';
 import { createHash } from 'crypto';
 
 const CATEGORY_MAP: Record<string, string> = {
@@ -40,7 +41,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'Missing sourceCode or targetUrl' }, { status: 400 });
     }
 
-    const settings = await db.settings.findFirst().catch(() => null);
+    const settings = await withTimeout(db.settings.findFirst(), 10_000, null, 'findFirst settings') as any;
     const apiKey = process.env.OPENROUTER_API_KEY || settings?.apiKey || '';
     const model = settings?.model || DEFAULT_MODEL;
 
@@ -48,24 +49,39 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'OpenRouter API key not configured' }, { status: 401 });
     }
 
-    const project = await db.project.create({
+    // Wrap ALL Prisma writes with 10s hard timeout. SQLite single-writer
+    // connection can hang on disk I/O or transaction deadlock — without
+    // timeout, ONE hung Prisma call = entire pipeline frozen.
+    const project = await withTimeout(db.project.create({
       data: { name: contractName || targetUrl || 'Analysis', chain: 'ethereum', language: targetType === 'exchange' ? 'web' : 'solidity' },
-    });
-    const contract = await db.contract.create({
+    }), 10_000, null, 'project.create');
+    if (!project) {
+      return NextResponse.json({ error: 'Database unavailable (project.create timed out)' }, { status: 503 });
+    }
+    const contract = await withTimeout(db.contract.create({
       data: { projectId: project.id, name: contractName || 'AnalyzedContract', sourceCode: (sourceCode || '').slice(0, 50000), language: targetType === 'exchange' ? 'web' : 'solidity' },
-    });
-    const audit = await db.audit.create({
+    }), 10_000, null, 'contract.create');
+    if (!contract) {
+      return NextResponse.json({ error: 'Database unavailable (contract.create timed out)' }, { status: 503 });
+    }
+    const audit = await withTimeout(db.audit.create({
       data: { projectId: project.id, workflow: 'background-analysis', status: 'running' },
-    });
+    }), 10_000, null, 'audit.create');
+    if (!audit) {
+      return NextResponse.json({ error: 'Database unavailable (audit.create timed out)' }, { status: 503 });
+    }
 
-    const job = await db.analysisJob.create({
+    const job = await withTimeout(db.analysisJob.create({
       data: {
         status: 'pending', progress: 0, message: 'Job created',
         targetUrl: targetUrl || null, targetType: targetType || 'contract',
         sourceCode: (sourceCode || '').slice(0, 5000), contractName: contractName || null,
         projectId: project.id, contractId: contract.id, auditId: audit.id,
       },
-    });
+    }), 10_000, null, 'analysisJob.create');
+    if (!job) {
+      return NextResponse.json({ error: 'Database unavailable (analysisJob.create timed out)' }, { status: 503 });
+    }
 
     // Start background analysis — do NOT await
     runAnalysisInBackground(job.id, {
@@ -80,10 +96,19 @@ export async function POST(req: NextRequest) {
       discoveredForms: Array.isArray(discoveredForms) ? discoveredForms : [],
       discoveredParams: Array.isArray(discoveredParams) ? discoveredParams : [],
     }).catch(async (err) => {
-      await db.analysisJob.update({
-        where: { id: job.id },
-        data: { status: 'failed', error: String(err).slice(0, 500), progress: 100, message: 'Analysis failed' },
-      }).catch(() => {});
+      // Fire-and-forget on error path — don't block on DB
+      fireAndForget(
+        db.analysisJob.update({
+          where: { id: job.id },
+          data: { status: 'failed', error: String(err).slice(0, 500), progress: 100, message: 'Analysis failed' },
+        }),
+        'error-path analysisJob.update'
+      );
+      // Also write progress file so user sees failure immediately
+      try {
+        const { writeProgressFile } = await import('@/lib/progress-file');
+        writeProgressFile(job.id, { progress: 100, message: `Analysis failed: ${String(err).slice(0, 80)}`, status: 'failed' });
+      } catch {}
     });
 
     return NextResponse.json({
@@ -141,13 +166,14 @@ async function runAnalysisInBackground(jobId: string, config: {
   // Force-flush now (used at completion so user sees final state immediately)
   const flushJobNow = async () => {
     writeProgressFile(jobId, progressState);
-    // Also try DB write — best-effort, don't block
-    try {
-      await db.analysisJob.update({
+    // Also try DB write — best-effort, don't block (5s timeout — fire-and-forget)
+    fireAndForget(
+      withTimeout(db.analysisJob.update({
         where: { id: jobId },
         data: { ...progressState, status: progressState.progress < 100 ? 'running' : 'completed' },
-      }).catch(() => {});
-    } catch {}
+      }), 5_000, null, 'flushJobNow analysisJob.update'),
+      'flushJobNow'
+    );
   };
 
   // ─── GLOBAL TIMEOUT: entire job must complete in 30 min ───
@@ -163,11 +189,13 @@ async function runAnalysisInBackground(jobId: string, config: {
     try {
       await updateJob(95, 'Analysis timeout (30 min) — completing with current findings.');
       // Get whatever findings we have
-      const existingVulns = await db.vulnerability.findMany({ where: { contractId } }).catch(() => []);
-      await db.audit.update({ where: { id: auditId },
-        data: { status: 'completed', completedAt: new Date(), findings: existingVulns.length } }).catch(() => {});
-      await db.analysisJob.update({ where: { id: jobId },
-        data: { status: 'completed', progress: 100, message: `Timeout after 30 min — ${existingVulns.length} findings saved`, resultCount: existingVulns.filter((v: any) => v.status === 'confirmed' || v.status === 'validated').length } }).catch(() => {});
+      const existingVulns = await withTimeout(db.vulnerability.findMany({ where: { contractId } }), 10_000, [], 'globalTimeout findMany') || [];
+      fireAndForget(db.audit.update({ where: { id: auditId },
+        data: { status: 'completed', completedAt: new Date(), findings: existingVulns.length } }), 'globalTimeout audit.update');
+      fireAndForget(db.analysisJob.update({ where: { id: jobId },
+        data: { status: 'completed', progress: 100, message: `Timeout after 30 min — ${existingVulns.length} findings saved`, resultCount: existingVulns.filter((v: any) => v.status === 'confirmed' || v.status === 'validated').length } }), 'globalTimeout analysisJob.update');
+      // Always write progress file too — non-blocking, user sees immediately
+      writeProgressFile(jobId, { progress: 100, message: `Timeout after 30 min — ${existingVulns.length} findings saved`, status: 'completed' });
     } catch {}
   }, 1_800_000); // 30 minutes
 
@@ -305,7 +333,7 @@ async function runAnalysisInBackground(jobId: string, config: {
       for (const f of preConfirmed) {
         const hashSig = makeVulnHash(contractId, f.type, f.title);
         try {
-          await db.vulnerability.create({
+          await withTimeout(db.vulnerability.create({
             data: {
               contractId,
               type: f.type,
@@ -325,7 +353,7 @@ async function runAnalysisInBackground(jobId: string, config: {
               codeSnippet: sourceCode ? sourceCode.slice(0, 200) : null,
               validationScope: 'target',
             },
-          });
+          }), 10_000, null, 'preConfirmed vulnerability.create');
         } catch (e) {
           console.warn('[analyze-job] Failed to save pre-confirmed finding:', String(e).slice(0, 100));
         }
@@ -355,7 +383,7 @@ async function runAnalysisInBackground(jobId: string, config: {
     for (const v of staticResults) {
       const hashSig = makeVulnHash(contractId, v.type, v.title);
       try {
-        const vuln = await db.vulnerability.create({
+        const vuln = await withTimeout(db.vulnerability.create({
           data: { contractId, type: v.type, severity: v.severity || 'medium', title: v.title,
             description: v.description || '', location: v.location || `${contractName}:L1`,
             confidence: v.confidence || 0.5, status: v.confidence >= 0.9 ? 'validated' : 'candidate',
@@ -365,8 +393,8 @@ async function runAnalysisInBackground(jobId: string, config: {
             vulnCategory: CATEGORY_MAP[v.type] || v.type,
             validationSteps: v.validationSteps || '', poc: v.poc || '',
             pocFilename: `${v.type}_attack.t.sol`, codeSnippet: sourceCode ? sourceCode.slice(0, 200) : null },
-        });
-        savedStatic.push({ vuln, rawFinding: v });
+        }), 10_000, null, 'static vuln.create');
+        if (vuln) savedStatic.push({ vuln, rawFinding: v });
       } catch {}
     }
 
@@ -396,15 +424,18 @@ async function runAnalysisInBackground(jobId: string, config: {
         }
       }
       if (dropStatic.length > 0) {
-        try { await db.vulnerability.deleteMany({ where: { id: { in: dropStatic } } }); } catch {}
+        try { await withTimeout(db.vulnerability.deleteMany({ where: { id: { in: dropStatic } } }), 10_000, null, 'dropStatic deleteMany'); } catch {}
       }
       // Final tally
       const finalResults = savedStatic.filter((s: any) => s.vuln.status === 'confirmed' || s.vuln.status === 'validated');
       const exploitCount = finalResults.length + preConfirmed.length;
       await updateJob(100, `Done: ${exploitCount} confirmed exploits (active probes: ${preConfirmed.length}, validated: ${finalResults.length}). AI skipped — already had enough hard evidence.`);
-      await db.audit.update({ where: { id: auditId }, data: { status: 'completed', findings: exploitCount, completedAt: new Date() } }).catch(() => {});
-      await db.analysisJob.update({ where: { id: jobId }, data: { status: 'completed', resultCount: exploitCount } }).catch(() => {});
+      fireAndForget(db.audit.update({ where: { id: auditId }, data: { status: 'completed', findings: exploitCount, completedAt: new Date() } }), 'fast-path audit.update');
+      fireAndForget(db.analysisJob.update({ where: { id: jobId }, data: { status: 'completed', resultCount: exploitCount } }), 'fast-path analysisJob.update');
+      writeProgressFile(jobId, { progress: 100, message: `Done: ${exploitCount} confirmed exploits (active probes: ${preConfirmed.length}, validated: ${finalResults.length}). AI skipped — already had enough hard evidence.`, status: 'completed' });
+      clearInterval(flushTimer);
       clearTimeout(globalTimeout);
+      clearTimeout(panicTimer);
       return;
     }
 
@@ -471,11 +502,13 @@ async function runAnalysisInBackground(jobId: string, config: {
       await updateJob(75, `Saving ${allResults.length} static findings...`);
       await new Promise(r => setTimeout(r, 300));
       await updateJob(100, `Analysis complete (AI failed): ${allResults.length} static findings`);
-      await db.audit.update({ where: { id: auditId }, data: { status: 'completed', findings: allResults.length, completedAt: new Date() } }).catch(() => {});
-      await db.analysisJob.update({ where: { id: jobId }, data: { status: 'completed', resultCount: 0 } }).catch(() => {});
+      fireAndForget(db.audit.update({ where: { id: auditId }, data: { status: 'completed', findings: allResults.length, completedAt: new Date() } }), 'catch audit.update');
+      fireAndForget(db.analysisJob.update({ where: { id: jobId }, data: { status: 'completed', resultCount: 0 } }), 'catch analysisJob.update');
+      writeProgressFile(jobId, { progress: 100, message: `Analysis complete (AI failed): ${allResults.length} static findings`, status: 'completed' });
+      clearInterval(flushTimer);
       clearTimeout(phase2Watchdog);
       clearTimeout(globalTimeout);
-      await flushJobNow();
+      clearTimeout(panicTimer);
       return;
     }
     clearTimeout(phase2Watchdog);
@@ -532,7 +565,7 @@ async function runAnalysisInBackground(jobId: string, config: {
 
       const hashSig = makeVulnHash(contractId, v.type, v.title);
       try {
-        const existing = await db.vulnerability.findFirst({ where: { hashSignature: hashSig } });
+        const existing = await withTimeout(db.vulnerability.findFirst({ where: { hashSignature: hashSig } }), 10_000, null, 'findFirst existing vuln');
         if (existing) continue;
 
         const str = (val: any): string => {
@@ -546,7 +579,7 @@ async function runAnalysisInBackground(jobId: string, config: {
           if (typeof val === 'string') { const n = parseFloat(val); if (!isNaN(n)) return n; }
           return fallback;
         };
-        const vuln = await db.vulnerability.create({
+        const vuln = await withTimeout(db.vulnerability.create({
           data: { contractId,
             type: str(v.type) || 'unknown',
             severity: str(v.severity) || 'medium',
@@ -561,8 +594,8 @@ async function runAnalysisInBackground(jobId: string, config: {
             validationSteps: str(v.validationSteps), poc: str(v.pocOutline || v.poc),
             pocFilename: `${str(v.type) || 'unknown'}_attack.t.sol`,
             codeSnippet: sourceCode ? sourceCode.slice(0, 200) : null },
-        });
-        savedAi.push({ vuln, rawFinding: v });
+        }), 10_000, null, 'ai vuln.create');
+        if (vuln) savedAi.push({ vuln, rawFinding: v });
       } catch (err: any) {
         console.error(`[analyze-job] Failed to save finding "${v?.title}": ${String(err?.message || err).slice(0, 200)}`);
       }
@@ -600,7 +633,7 @@ async function runAnalysisInBackground(jobId: string, config: {
     }
     if (dropIds.length > 0) {
       try {
-        await db.vulnerability.deleteMany({ where: { id: { in: dropIds } } });
+        await withTimeout(db.vulnerability.deleteMany({ where: { id: { in: dropIds } } }), 10_000, null, 'dropIds deleteMany');
         console.log(`[analyze-job] Dropped ${dropIds.length} non-confirmed findings from DB (user wants only confirmed)`);
       } catch (e) {
         console.warn('[analyze-job] Failed to drop non-confirmed findings:', String(e).slice(0, 100));
@@ -612,16 +645,19 @@ async function runAnalysisInBackground(jobId: string, config: {
 
     const summary = `Analysis complete: ${exploitCount} confirmed exploit${exploitCount === 1 ? '' : 's'} (${preConfirmed.length} from active HTTP probes + ${allResults.length} from AI/static validation). All findings passed rigor verification (5 standard questions: repeatability, clean session, public comparison, multi-entity, real-vs-demo). Non-confirmed findings were dropped.`;
     await updateJob(100, summary);
-    await db.audit.update({ where: { id: auditId }, data: { status: 'completed', findings: exploitCount, completedAt: new Date() } }).catch(() => {});
-    await db.analysisJob.update({ where: { id: jobId }, data: { status: 'completed', resultCount: exploitCount } }).catch(() => {});
+    fireAndForget(db.audit.update({ where: { id: auditId }, data: { status: 'completed', findings: exploitCount, completedAt: new Date() } }), 'final audit.update');
+    fireAndForget(db.analysisJob.update({ where: { id: jobId }, data: { status: 'completed', resultCount: exploitCount } }), 'final analysisJob.update');
+    writeProgressFile(jobId, { progress: 100, message: summary, status: 'completed' });
 
   } catch (err: any) {
-    await db.audit.update({ where: { id: auditId },
-      data: { status: 'failed', completedAt: new Date() } }).catch(() => {});
-    await db.analysisJob.update({ where: { id: jobId },
-      data: { status: 'failed', error: String(err).slice(0, 500), progress: 100, message: 'Analysis failed' } }).catch(() => {});
+    fireAndForget(db.audit.update({ where: { id: auditId },
+      data: { status: 'failed', completedAt: new Date() } }), 'catch audit.update');
+    fireAndForget(db.analysisJob.update({ where: { id: jobId },
+      data: { status: 'failed', error: String(err).slice(0, 500), progress: 100, message: 'Analysis failed' } }), 'catch analysisJob.update');
+    writeProgressFile(jobId, { progress: 100, message: `Analysis failed: ${String(err).slice(0, 80)}`, status: 'failed' });
   } finally {
     clearTimeout(globalTimeout);
+    clearTimeout(panicTimer);
     clearInterval(flushTimer);
     // Final force-flush so user sees the latest state immediately
     try {
@@ -682,9 +718,9 @@ async function runValidationOnFindings(
         const label = scope === 'target'
           ? '[CONFIRMED] Exploit confirmed against production target via real HTTP request.'
           : '[CONFIRMED] Exploit confirmed in lab (Foundry test passed).';
-        await db.vulnerability.update({ where: { id: vuln.id },
+        await withTimeout(db.vulnerability.update({ where: { id: vuln.id },
           data: { confidence: 1, status: newStatus, validationScope: scope,
-            description: vuln.description + `\n\n${label}\n${verification.evidence}` } }).catch(() => {});
+            description: vuln.description + `\n\n${label}\n${verification.evidence}` } }), 10_000, null, 'validation vuln.update confirmed');
         vuln.confidence = 1; vuln.status = newStatus; vuln.validationScope = scope;
         confirmed++;
       } else {
