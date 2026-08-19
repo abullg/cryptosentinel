@@ -81,7 +81,12 @@ export default function FindingsList({
       if (statusFilter !== 'all' && v.status !== statusFilter) return false;
       if (typeFilter !== 'all' && v.type !== typeFilter) return false;
       return true;
-    }).sort((a, b) => b.confidence - a.confidence);
+    // Sort by SEVERITY (critical first), not confidence — confidence is
+    // binary in CONFIRM-OR-DROP model: all shown findings are 100% confirmed
+    }).sort((a, b) => {
+      const sevOrder: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
+      return (sevOrder[a.severity] ?? 5) - (sevOrder[b.severity] ?? 5);
+    });
   }, [vulns, searchText, severityFilter, statusFilter, typeFilter]);
 
   return (
@@ -199,32 +204,23 @@ export default function FindingsList({
                   </div>
                 </div>
                 <p className="text-xs text-slate-500">{v.description}</p>
-                <div className="flex items-center gap-4">
-                  <div className="flex-1">
-                    <div className="flex items-center justify-between text-xs mb-1">
-                      <span className="text-slate-500">Confidence</span>
-                      <span className={`font-mono font-bold ${v.confidence >= 0.95 ? 'text-emerald-600' : v.confidence >= 0.8 ? 'text-blue-600' : 'text-yellow-600'}`}>
-                        {(v.confidence * 100).toFixed(1)}%
-                      </span>
-                    </div>
-                    <div className="w-full bg-slate-100 rounded-full h-2">
-                      <div className={`h-2 rounded-full transition-all ${v.confidence >= 0.95 ? 'bg-emerald-500' : v.confidence >= 0.8 ? 'bg-blue-500' : 'bg-yellow-500'}`} style={{ width: `${v.confidence * 100}%` }} />
-                    </div>
-                  </div>
-                  <Badge variant="outline" className="text-xs capitalize">{v.status}</Badge>
-                </div>
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-1">
-                  {[
-                    { label: 'V1 SymEx', value: v.v1Symbolic, color: 'text-cyan-600' },
-                    { label: 'V2 Fuzz', value: v.v2Fuzzing, color: 'text-amber-600' },
-                    { label: 'V3 Formal', value: v.v3Formal, color: 'text-violet-600' },
-                    { label: 'V4 Econ', value: v.v4Economic, color: 'text-emerald-600' },
-                  ].map((val, vi) => (
-                    <div key={vi} className="text-center">
-                      <p className="text-[10px] text-slate-400">{val.label}</p>
-                      <p className={`text-xs font-mono font-bold ${val.color}`}>{val.value != null ? (val.value * 100).toFixed(0) + '%' : '—'}</p>
-                    </div>
-                  ))}
+                <div className="flex items-center gap-3 mt-2">
+                  {/* BINARY STATUS — no more confidence percentages */}
+                  {/* Either confirmed (show) or not (dropped from DB) */}
+                  <Badge variant="outline" className={`text-xs capitalize ${
+                    v.status === 'confirmed' ? 'text-emerald-700 border-emerald-300 bg-emerald-50' :
+                    v.status === 'validated' ? 'text-blue-700 border-blue-300 bg-blue-50' :
+                    'text-slate-600'
+                  }`}>
+                    {v.status === 'confirmed' ? '✓ Confirmed (active proof)' :
+                     v.status === 'validated' ? '✓ Validated (passive proof)' :
+                     v.status}
+                  </Badge>
+                  {v.validationScope && (
+                    <span className="text-[10px] text-slate-400">
+                      via {v.validationScope}
+                    </span>
+                  )}
                 </div>
                 {/* PoC button */}
                 {v.poc && v.poc.trim().length > 0 && (
