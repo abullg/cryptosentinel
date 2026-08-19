@@ -29,7 +29,6 @@ const SENSITIVE_PORTS = new Set([
   110,   // POP3
   143,   // IMAP
   389,   // LDAP
-  443,   // HTTPS — allowed
   465,   // SMTPS
   6379,  // Redis
   3306,  // MySQL
@@ -49,7 +48,7 @@ const SENSITIVE_PORTS = new Set([
   10250, // Kubernetes kubelet
   10255, // Kubernetes kubelet read-only
   6443,  // Kubernetes API
-  // Note: 80, 443, 8080, 8443, 3000, 10000 are allowed (web service ports)
+  // Allowed web ports: 80 (HTTP), 443 (HTTPS), 8080, 8443, 3000, 10000
 ]);
 
 const BLOCKED_HOSTNAMES = new Set([
