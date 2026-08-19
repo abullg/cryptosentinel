@@ -650,9 +650,27 @@ async function fetchWebAppWithAI(parsedUrl: URL, isContractFallback = false) {
         ),
       ]);
     } catch (crawlErr) {
-      // Fallback to legacy shallow crawl if BFS fails (e.g. SSRF block, total timeout)
-      console.warn('[fetchWebAppWithAI] Deep crawl failed, falling back to shallow:', String(crawlErr).slice(0, 150));
-      return await fetchWebsite(parsedUrl, isContractFallback);
+      // deepCrawl failed or timed out — try legacy fetchWebsite BUT with
+      // hard 60s timeout. Previous version called fetchWebsite without
+      // timeout, which itself hung for 2+ min on WAF-protected sites,
+      // defeating the 90s deepCrawl timeout. Now if fetchWebsite can't
+      // complete in 60s, return an error to the user instead of hanging.
+      console.warn('[fetchWebAppWithAI] Deep crawl failed, trying legacy fetchWebsite with 60s timeout:', String(crawlErr).slice(0, 150));
+      try {
+        return await Promise.race([
+          fetchWebsite(parsedUrl, isContractFallback),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error('fetchWebsite hard timeout (60s) — target is too slow or WAF-protected, retry later')), 60_000)
+          ),
+        ]);
+      } catch (fallbackErr: any) {
+        // Both deepCrawl and fetchWebsite failed — return a clear error
+        // to the user instead of hanging forever
+        console.error('[fetchWebAppWithAI] Both crawlers failed:', String(fallbackErr).slice(0, 200));
+        return NextResponse.json({
+          error: `Unable to crawl ${urlStr} within 150s. The target may be behind a WAF that blocks our requests, or the site is too slow. Try with a different URL or paste the source code directly.`,
+        }, { status: 408 });
+      }
     }
 
     // If the deep crawl got 0 successful pages (full WAF block) fall back
