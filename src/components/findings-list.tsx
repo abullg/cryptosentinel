@@ -68,7 +68,7 @@ export default function FindingsList({
     return Array.from(types).sort();
   }, [vulns]);
 
-  const confirmedCount = vulns.filter(v => v.status === 'confirmed').length;
+  const confirmedCount = vulns.filter(v => v.status === 'confirmed' || v.status === 'validated').length;
 
   // Apply filters
   const filteredVulns = useMemo(() => {
