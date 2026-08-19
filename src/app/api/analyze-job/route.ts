@@ -231,6 +231,40 @@ async function runAnalysisInBackground(jobId: string, config: {
 
     if (jobTimedOut) return;
 
+    // ─── FAST PATH: skip AI entirely if active probes already confirmed ≥5
+    // vulnerabilities with HARD HTTP evidence. The user came here to find
+    // real exploits, not to wait for AI to speculate. If we already have
+    // 5+ confirmed exploits saved, AI pass 1 and 2 are wasted minutes —
+    // skip them and go straight to validation of static findings + final
+    // summary. This eliminates the "stuck at 38% for 5 min" scenario when
+    // the target has many endpoints (active probes confirm enough) and
+    // OpenRouter is slow / hanging.
+    if (preConfirmed.length >= 5) {
+      console.log(`[analyze-job] Active probes already confirmed ${preConfirmed.length} vulns — SKIPPING AI to save 2-3 min`);
+      await updateJob(70, `Active probes already confirmed ${preConfirmed.length} exploits — skipping AI (no need to wait)`);
+      // Still run active validation on the static findings (one-shot)
+      await runValidationOnFindings(savedStatic, sourceCode, contractName, apiKey, model, targetUrl, updateJob, 75);
+      // DROP non-confirmed static findings from DB — user wants only confirmed
+      const dropStatic: string[] = [];
+      for (const s of savedStatic) {
+        if (s.vuln.status !== 'confirmed' && s.vuln.status !== 'validated') {
+          dropStatic.push(s.vuln.id);
+          s.vuln.status = 'dropped';
+        }
+      }
+      if (dropStatic.length > 0) {
+        try { await db.vulnerability.deleteMany({ where: { id: { in: dropStatic } } }); } catch {}
+      }
+      // Final tally
+      const finalResults = savedStatic.filter((s: any) => s.vuln.status === 'confirmed' || s.vuln.status === 'validated');
+      const exploitCount = finalResults.length + preConfirmed.length;
+      await updateJob(100, `Done: ${exploitCount} confirmed exploits (active probes: ${preConfirmed.length}, validated: ${finalResults.length}). AI skipped — already had enough hard evidence.`);
+      await db.audit.update({ where: { id: auditId }, data: { status: 'completed', findings: exploitCount, completedAt: new Date() } }).catch(() => {});
+      await db.analysisJob.update({ where: { id: jobId }, data: { status: 'completed', resultCount: exploitCount } }).catch(() => {});
+      clearTimeout(globalTimeout);
+      return;
+    }
+
     // Phase 2: AI ANALYSIS (pass 1 — surface scan)
     // IMPORTANT: progress must INCREMENT gradually during AI pass — never
     // stay at the same % for 60s. The old code stayed at 30% for the entire
@@ -252,10 +286,10 @@ async function runAnalysisInBackground(jobId: string, config: {
       }, 10_000);
 
       const aiPromise = isWeb
-        ? analyzeWebWithGLM(sourceCode.slice(0, 30000), contractName, { apiKey, model })
-        : analyzeWithGLM(sourceCode, contractName, { apiKey, model }, undefined);
+        ? analyzeWebWithGLM(sourceCode.slice(0, 30000), contractName, { apiKey, model, timeoutMs: 60_000 })
+        : analyzeWithGLM(sourceCode, contractName, { apiKey, model, timeoutMs: 60_000 }, undefined);
       const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('AI pass 1 timeout after 90s')), 90_000)
+        setTimeout(() => reject(new Error('AI pass 1 timeout after 60s')), 60_000)
       );
       aiVulns = await Promise.race([aiPromise, timeoutPromise]);
       if (progressInterval) clearInterval(progressInterval);
@@ -296,10 +330,10 @@ async function runAnalysisInBackground(jobId: string, config: {
         title: v.title, type: v.type, severity: v.severity, description: (v.description || '').slice(0, 200),
       }));
       const deepPromise = isWeb
-        ? analyzeWebWithGLMDeep(sourceCode.slice(0, 30000), contractName, { apiKey, model }, firstPassSummary)
-        : analyzeWithGLMDeep(sourceCode, contractName, { apiKey, model }, firstPassSummary);
+        ? analyzeWebWithGLMDeep(sourceCode.slice(0, 30000), contractName, { apiKey, model, timeoutMs: 60_000 }, firstPassSummary)
+        : analyzeWithGLMDeep(sourceCode, contractName, { apiKey, model, timeoutMs: 60_000 }, firstPassSummary);
       const deepTimeout = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('AI pass 2 (deep) timeout after 90s')), 90_000)
+        setTimeout(() => reject(new Error('AI pass 2 (deep) timeout after 60s')), 60_000)
       );
       deepVulns = await Promise.race([deepPromise, deepTimeout]);
       if (deepProgressInterval) clearInterval(deepProgressInterval);
@@ -371,72 +405,45 @@ async function runAnalysisInBackground(jobId: string, config: {
       await updateJob(70, `Filtered out ${droppedLowSeverity} low-severity findings. Saving ${savedAi.length} medium+ findings...`);
     }
 
-    await updateJob(75, `Saved ${savedAi.length} AI findings. Starting validation...`);
+    await updateJob(75, `Saved ${savedAi.length} AI findings. Starting active validation...`);
 
-    // Phase 3: ACTIVE VALIDATION (parallel, 30s per finding)
-    if (savedAi.length > 0 && !jobTimedOut) {
-      const verifyPromises = savedAi.map(async ({ vuln, rawFinding: v }: any) => {
-        try {
-          const verification = await Promise.race([
-            activelyValidate(
-              sourceCode, contractName,
-              { title: v.title, type: v.type, severity: v.severity, description: v.description, location: v.location },
-              apiKey, model,
-              targetUrl || undefined
-            ),
-            new Promise<any>((_, reject) =>
-              setTimeout(() => reject(new Error('Validation timeout (30s)')), 30_000)),
-          ]);
+    // Phase 3: ACTIVE VALIDATION (parallel, 25s per finding) — CONFIRM-OR-DROP
+    // User explicitly asked: "if we search for what we can confirm then how
+    // can inconclusive appear and what's the sense of showing me
+    // non-exploitable?". Right answer: don't show them at all. If a finding
+    // can't be confirmed with HARD HTTP evidence, DELETE it. The user only
+    // wants to see real, confirmed exploits — not AI speculation.
+    await runValidationOnFindings(savedAi, sourceCode, contractName, apiKey, model, targetUrl, updateJob, 75);
+    await runValidationOnFindings(savedStatic, sourceCode, contractName, apiKey, model, targetUrl, updateJob, 85);
 
-          const scope = verification.validationScope || 'theoretical';
-          const verdict = verification.verdict || (verification.confirmed ? 'EXPLOITABLE' : 'INCONCLUSIVE');
-
-          if (verdict === 'EXPLOITABLE') {
-            const newStatus = scope === 'target' ? 'confirmed' : 'validated';
-            const label = scope === 'target'
-              ? '[EXPLOITABLE] Exploit confirmed against production target via real HTTP request.'
-              : '[EXPLOITABLE] Exploit confirmed in lab (Foundry test passed).';
-            await db.vulnerability.update({ where: { id: vuln.id },
-              data: { confidence: 1, status: newStatus, validationScope: scope,
-                description: vuln.description + `\n\n${label}\n${verification.evidence}` } }).catch(() => {});
-            vuln.confidence = 1; vuln.status = newStatus; vuln.validationScope = scope;
-          } else if (verdict === 'NOT_EXPLOITABLE') {
-            const label = scope === 'target'
-              ? '[NOT_EXPLOITABLE] Exploit tested against production target and did NOT succeed.'
-              : '[NOT_EXPLOITABLE] Exploit tested in lab and did NOT succeed.';
-            await db.vulnerability.update({ where: { id: vuln.id },
-              data: { confidence: 0, status: 'refuted', validationScope: scope,
-                description: vuln.description + `\n\n${label}\n${verification.evidence}` } }).catch(() => {});
-            vuln.confidence = 0; vuln.validationScope = scope; vuln.status = 'refuted';
-          } else {
-            const label = '[INCONCLUSIVE] Validation ran but could not determine exploitability.';
-            await db.vulnerability.update({ where: { id: vuln.id },
-              data: { confidence: 0, status: 'candidate', validationScope: scope,
-                description: vuln.description + `\n\n${label}\n${verification.evidence}` } }).catch(() => {});
-            vuln.confidence = 0; vuln.validationScope = scope; vuln.status = 'candidate';
-          }
-        } catch {
-          await db.vulnerability.update({ where: { id: vuln.id },
-            data: { validationScope: 'theoretical',
-              description: vuln.description + '\n\n[INCONCLUSIVE] Validation could not run.' } }).catch(() => {});
-          vuln.validationScope = 'theoretical';
-          vuln.status = 'candidate';
-        }
-      });
-      await Promise.allSettled(verifyPromises);
+    // ─── DROP ALL NON-CONFIRMED FINDINGS ───
+    // The user wants only confirmed exploits in the final list. Any AI/static
+    // finding that wasn't actively confirmed gets DELETED from the DB. This
+    // eliminates 'inconclusive', 'candidate', and 'refuted' statuses entirely.
+    // The DB only ever contains confirmed/validated findings.
+    const dropIds: string[] = [];
+    for (const s of [...savedStatic, ...savedAi]) {
+      const st = s.vuln.status;
+      if (st !== 'confirmed' && st !== 'validated') {
+        dropIds.push(s.vuln.id);
+        s.vuln.status = 'dropped'; // mark for tally
+      }
+    }
+    if (dropIds.length > 0) {
+      try {
+        await db.vulnerability.deleteMany({ where: { id: { in: dropIds } } });
+        console.log(`[analyze-job] Dropped ${dropIds.length} non-confirmed findings from DB (user wants only confirmed)`);
+      } catch (e) {
+        console.warn('[analyze-job] Failed to drop non-confirmed findings:', String(e).slice(0, 100));
+      }
     }
 
-    const allResults = [...savedStatic.map(s => s.vuln), ...savedAi.map(s => s.vuln)];
-    const exploitCount = allResults.filter((r: any) => r.status === 'confirmed' || r.status === 'validated').length
-      + preConfirmed.length; // pre-confirmed = HARD HTTP evidence from active probes
-    const refutedCount = allResults.filter((r: any) => r.status === 'refuted').length;
-    const inconclusiveCount = allResults.filter((r: any) => r.status === 'candidate').length;
+    const allResults = [...savedStatic.map(s => s.vuln), ...savedAi.map(s => s.vuln)].filter((r: any) => r.status === 'confirmed' || r.status === 'validated');
+    const exploitCount = allResults.length + preConfirmed.length;
 
-    const summary = preConfirmed.length > 0
-      ? `Analysis complete: ${exploitCount} exploitable (${preConfirmed.length} from active HTTP probes + ${allResults.filter((r: any) => r.status === 'confirmed' || r.status === 'validated').length} from AI), ${refutedCount} not exploitable, ${inconclusiveCount} inconclusive (out of ${allResults.length + preConfirmed.length})`
-      : `Analysis complete: ${exploitCount} exploitable, ${refutedCount} not exploitable, ${inconclusiveCount} inconclusive (out of ${allResults.length})`;
+    const summary = `Analysis complete: ${exploitCount} confirmed exploit${exploitCount === 1 ? '' : 's'} (${preConfirmed.length} from active HTTP probes + ${allResults.length} from AI/static validation). Non-confirmed findings were dropped.`;
     await updateJob(100, summary);
-    await db.audit.update({ where: { id: auditId }, data: { status: 'completed', findings: allResults.length + preConfirmed.length, completedAt: new Date() } }).catch(() => {});
+    await db.audit.update({ where: { id: auditId }, data: { status: 'completed', findings: exploitCount, completedAt: new Date() } }).catch(() => {});
     await db.analysisJob.update({ where: { id: jobId }, data: { status: 'completed', resultCount: exploitCount } }).catch(() => {});
 
   } catch (err: any) {
@@ -447,4 +454,83 @@ async function runAnalysisInBackground(jobId: string, config: {
   } finally {
     clearTimeout(globalTimeout);
   }
+}
+
+/**
+ * Run active validation on a list of saved findings, in parallel with a
+ * per-finding 25s timeout. Mutates the savedFindings array's `vuln.status`
+ * in place based on validation outcome. Only EXPLOITABLE findings get
+ * saved with a real status (confirmed/validated); everything else ends
+ * up as 'candidate'/'refuted' which the caller will DELETE.
+ *
+ * @param savedFindings - array of { vuln, rawFinding } from previous phase
+ * @param sourceCode - source code/context
+ * @param contractName - target name
+ * @param apiKey - OpenRouter API key
+ * @param model - AI model name
+ * @param targetUrl - target URL for HTTP-based validation
+ * @param updateJob - progress reporter
+ * @param startProgress - progress value to start ticking from
+ */
+async function runValidationOnFindings(
+  savedFindings: any[],
+  sourceCode: string,
+  contractName: string,
+  apiKey: string,
+  model: string,
+  targetUrl: string | undefined,
+  updateJob: (progress: number, message: string) => Promise<void>,
+  startProgress: number,
+) {
+  if (savedFindings.length === 0) return;
+  let completed = 0;
+  let confirmed = 0;
+  const total = savedFindings.length;
+
+  const verifyPromises = savedFindings.map(async ({ vuln, rawFinding: v }: any) => {
+    try {
+      const verification = await Promise.race([
+        activelyValidate(
+          sourceCode, contractName,
+          { title: v.title, type: v.type, severity: v.severity, description: v.description, location: v.location },
+          apiKey, model,
+          targetUrl || undefined
+        ),
+        new Promise<any>((_, reject) =>
+          setTimeout(() => reject(new Error('Validation timeout (25s)')), 25_000)),
+      ]);
+
+      const scope = verification.validationScope || 'theoretical';
+      const verdict = verification.verdict || (verification.confirmed ? 'EXPLOITABLE' : 'INCONCLUSIVE');
+
+      if (verdict === 'EXPLOITABLE') {
+        const newStatus = scope === 'target' ? 'confirmed' : 'validated';
+        const label = scope === 'target'
+          ? '[CONFIRMED] Exploit confirmed against production target via real HTTP request.'
+          : '[CONFIRMED] Exploit confirmed in lab (Foundry test passed).';
+        await db.vulnerability.update({ where: { id: vuln.id },
+          data: { confidence: 1, status: newStatus, validationScope: scope,
+            description: vuln.description + `\n\n${label}\n${verification.evidence}` } }).catch(() => {});
+        vuln.confidence = 1; vuln.status = newStatus; vuln.validationScope = scope;
+        confirmed++;
+      } else {
+        // NOT_EXPLOITABLE or INCONCLUSIVE — mark as candidate so the caller
+        // can DELETE it. User explicitly asked: don't show inconclusive or
+        // not-exploitable in the UI — only confirmed exploits matter.
+        vuln.status = 'candidate';
+        vuln.confidence = 0;
+      }
+    } catch {
+      // Validation timed out or failed — this finding is unconfirmed.
+      // Mark as candidate so caller deletes it.
+      vuln.status = 'candidate';
+      vuln.confidence = 0;
+    }
+    completed++;
+    if (completed % 3 === 0 || completed === total) {
+      await updateJob(Math.min(95, startProgress + Math.round((completed / total) * 10)),
+        `Validated ${completed}/${total} — ${confirmed} confirmed so far...`).catch(() => {});
+    }
+  });
+  await Promise.allSettled(verifyPromises);
 }

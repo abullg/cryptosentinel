@@ -46,7 +46,13 @@ interface FindingsListProps {
 }
 
 const SEVERITY_OPTIONS = ['all', 'critical', 'high', 'medium', 'low', 'info'] as const;
-const STATUS_OPTIONS = ['all', 'confirmed', 'validated', 'candidate', 'refuted'] as const;
+// User explicitly asked: "if we search for what we can confirm then how can
+// inconclusive appear and what's the sense of showing me non-exploitable?".
+// Right answer: don't show them at all. Removed 'candidate' and 'refuted'
+// from STATUS_OPTIONS — only 'confirmed' and 'validated' (= lab-confirmed
+// via Foundry) are shown. The backend also DELETEs non-confirmed findings
+// from the DB, so these options never had anything to display anyway.
+const STATUS_OPTIONS = ['all', 'confirmed', 'validated'] as const;
 
 export default function FindingsList({
   vulns, deleteVuln, generateReport, downloadZip, clearAllFindings, loading, setPocView,

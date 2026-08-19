@@ -122,8 +122,17 @@ export default function CryptoSentinelDashboard() {
   const hasActiveValidation = (v: any): boolean =>
     v.validationScope === 'target' || v.validationScope === 'lab';
 
-  /** No filtering — show all findings. */
-  const onlyValidated = (findings: any[]): any[] => findings;
+  /**
+   * Filter to ONLY confirmed/validated findings. The user explicitly asked:
+   * "if we search for what we can confirm then how can inconclusive appear
+   * and what's the sense of showing me non-exploitable?". Right — only
+   * confirmed exploits should reach the UI. Anything else (candidate,
+   * refuted, dropped) is filtered out. The backend also DELETES non-
+   * confirmed findings from the DB, but this is the client-side safety
+   * net so cached/localStorage data is also clean.
+   */
+  const onlyValidated = (findings: any[]): any[] =>
+    findings.filter(v => v.status === 'confirmed' || v.status === 'validated');
 
   const [patterns, setPatterns] = usePersistedState<MemoryPattern[]>('cs_patterns', []);
   const [loading, setLoading] = useState(false);
@@ -266,14 +275,22 @@ export default function CryptoSentinelDashboard() {
         const serverVulns: Vulnerability[] = await vRes.json();
         // MERGE: keep union of server + localStorage, dedup by ID.
         // Server data ADDS to localStorage — never replaces (fixes data loss on restart)
-        // Apply 90% confidence filter — never display low-confidence findings.
+        // Apply onlyValidated filter — only confirmed/validated reach the UI.
+        // User explicitly asked: "if we search for what we can confirm then
+        // how can inconclusive appear and what's the sense of showing me
+        // non-exploitable?". Right answer: only confirmed exploits show.
         if (serverVulns.length > 0) {
           const highConfServerVulns = onlyValidated(serverVulns);
           setVulns(prev => {
-            const existingIds = new Set(prev.map(v => v.id));
+            // Also drop any stale localStorage entries that are no longer confirmed
+            const cleanPrev = prev.filter(v => v.status === 'confirmed' || v.status === 'validated');
+            const existingIds = new Set(cleanPrev.map(v => v.id));
             const toAdd = highConfServerVulns.filter(v => !existingIds.has(v.id));
-            return toAdd.length > 0 ? [...toAdd, ...prev] : prev;
+            return toAdd.length > 0 ? [...toAdd, ...cleanPrev] : cleanPrev;
           });
+        } else {
+          // Server returned 0 — clear stale localStorage findings too
+          setVulns(prev => prev.filter(v => v.status === 'confirmed' || v.status === 'validated'));
         }
       }
       if (mRes.ok) setPatterns(await mRes.json());
@@ -381,33 +398,36 @@ export default function CryptoSentinelDashboard() {
       const newConfidence = result.confidence ?? 0;
       const scope = result.validationScope || 'theoretical';
 
-      // Update finding with validation results
-      setVulns(prev => prev.map(vn => vn.id === v.id ? {
-        ...vn,
-        confidence: newConfidence,
-        status: result.status || vn.status,
-        validationScope: scope,
-        validationSteps: result.evidence || vn.validationSteps,
-      } : vn));
-
-      const confPct = (newConfidence * 100).toFixed(0);
-      // Map status to verdict label (three-state model)
-      const verdictText = result.verdict ||
-        (result.status === 'confirmed' ? 'EXPLOITABLE' :
-         result.status === 'validated' ? 'EXPLOITABLE (lab)' :
-         result.status === 'refuted' ? 'NOT_EXPLOITABLE' : 'INCONCLUSIVE');
-      const statusLabel = verdictText;
-      addActivity('validation',
-        `Validation: ${v.title} — ${statusLabel} (${scope})`,
-        result.verdict === 'EXPLOITABLE' ? 'success' : result.verdict === 'NOT_EXPLOITABLE' ? 'error' : 'info',
-        result.evidence?.slice(0, 200) || '', 100);
+      // CONFIRM-OR-DROP: only keep confirmed/validated findings. If the
+      // backend said NOT_EXPLOITABLE or INCONCLUSIVE, REMOVE the finding
+      // from localStorage so it doesn't reappear next session.
+      const isConfirmed = result.verdict === 'EXPLOITABLE' ||
+                          result.status === 'confirmed' || result.status === 'validated';
+      if (isConfirmed) {
+        setVulns(prev => prev.map(vn => vn.id === v.id ? {
+          ...vn,
+          confidence: newConfidence,
+          status: result.status || vn.status,
+          validationScope: scope,
+          validationSteps: result.evidence || vn.validationSteps,
+        } : vn));
+        addActivity('validation',
+          `CONFIRMED: ${v.title} — EXPLOITABLE (${scope})`,
+          'success', result.evidence?.slice(0, 200) || '', 100);
+      } else {
+        // Non-confirmed — remove from list. Backend already deleted it from DB.
+        setVulns(prev => prev.filter(vn => vn.id !== v.id));
+        addActivity('validation',
+          `Dropped: ${v.title} — not exploitable (no hard evidence). Only confirmed exploits are kept.`,
+          'info', '', 100);
+      }
     } catch (err: any) {
       const errMsg = String(err)?.slice(0, 100) || 'Network error';
       addActivity('validation', `Validation failed: ${v.title}`, 'error', errMsg, 0);
-      setVulns(prev => prev.map(vn => vn.id === v.id ? {
-        ...vn, validationSteps: vn.validationSteps || `Validation error: ${errMsg}`,
-        status: vn.status === 'candidate' ? 'validated' : vn.status,
-      } : vn));
+      // On validation error, ALSO drop the finding — keeping it as
+      // candidate just creates inconclusive noise the user explicitly
+      // doesn't want to see.
+      setVulns(prev => prev.filter(vn => vn.id !== v.id));
     } finally {
       setValidatingVulns(prev => { const s = new Set(prev); s.delete(v.id); return s; });
     }
