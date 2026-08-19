@@ -4,10 +4,15 @@ export const dynamic = 'force-dynamic';
 import { db } from '@/lib/db';
 
 /** GET /api/job-status/{id} — Poll analysis job status.
- *  Includes a WATCHDOG: if a job is "running" but hasn't been updated in > 5
+ *  Includes a WATCHDOG: if a job is "running" but hasn't been updated in > 2
  *  minutes, it's marked as failed. This handles the case where the server
  *  restarts (deploy, crash, OOM) and kills the in-memory background Promise
  *  — without the watchdog, the job would stay "running" forever.
+ *
+ *  Watchdog reduced from 5 min to 2 min: user reported "stuck at 30s for
+ *  4 min" — with the new in-memory progress state + periodic flush,
+ *  legitimate jobs update every 3s. If 2 min pass without update, the job
+ *  is definitely dead. Fail fast so user can retry.
  */
 export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
@@ -16,12 +21,12 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     if (!job) return NextResponse.json({ error: 'Job not found' }, { status: 404 });
 
     // ─── WATCHDOG ─────────────────────────────────────────────
-    // If the job is "running" or "pending" but hasn't been updated in > 5 min,
+    // If the job is "running" or "pending" but hasn't been updated in > 2 min,
     // the background process is dead (server restart, crash, OOM kill).
     // Mark it as failed so the UI can show an error instead of spinning forever.
     if (job.status === 'running' || job.status === 'pending') {
       const ageMs = Date.now() - job.updatedAt.getTime();
-      const STALE_THRESHOLD = 5 * 60 * 1000; // 5 minutes
+      const STALE_THRESHOLD = 2 * 60 * 1000; // 2 minutes (was 5 min)
       if (ageMs > STALE_THRESHOLD) {
         await db.analysisJob.update({
           where: { id: job.id },
@@ -37,6 +42,12 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
           message: 'Failed (watchdog timeout)',
           error: `Job hasn't been updated in ${Math.round(ageMs / 1000)}s — server likely restarted. Please retry.`,
           contractId: job.contractId, projectId: job.projectId,
+        }, {
+          headers: {
+            'Cache-Control': 'no-store, no-cache, must-revalidate',
+            'Pragma': 'no-cache',
+            'Expires': '0',
+          },
         });
       }
     }
@@ -45,6 +56,12 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
       jobId: job.id, status: job.status, progress: job.progress,
       message: job.message, resultCount: job.resultCount, error: job.error,
       contractId: job.contractId, projectId: job.projectId,
+    }, {
+      headers: {
+        'Cache-Control': 'no-store, no-cache, must-revalidate',
+        'Pragma': 'no-cache',
+        'Expires': '0',
+      },
     });
   } catch (e: any) {
     return NextResponse.json({ error: String(e).slice(0, 300) }, { status: 500 });

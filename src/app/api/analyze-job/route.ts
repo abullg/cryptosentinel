@@ -107,8 +107,55 @@ async function runAnalysisInBackground(jobId: string, config: {
           discoveredEndpoints, discoveredForms, discoveredParams } = config;
   const isWeb = targetType === 'exchange' || contractName.endsWith('.html');
 
+  // ─── IN-MEMORY PROGRESS STATE + PERIODIC FLUSH ───
+  // Previous version did `await db.analysisJob.update(...)` on every
+  // progress change. With 50 parallel HTTP workers + 15 parallel rigor
+  // verifications, each calling updateJob, the SQLite write lock got
+  // CONTENDED — many writes queued up and the DB appeared hung. The
+  // setInterval ticks during AI pass 1 would fire but DB writes would
+  // be stuck, so the user saw frozen progress ("stuck at 30s for 4 min").
+  //
+  // FIX: keep progress in memory (instant, no I/O). A SINGLE flush timer
+  // writes to DB every 3s, but SKIPS if a previous flush is still
+  // pending — so we never queue up multiple writes. This eliminates
+  // SQLite write lock contention entirely.
+  let progressState = { progress: 0, message: 'Job created', status: 'pending' as string };
+  let flushPending = false;
+  const flushTimer = setInterval(async () => {
+    if (flushPending) return; // skip if previous flush is still running
+    flushPending = true;
+    try {
+      await db.analysisJob.update({
+        where: { id: jobId },
+        data: { ...progressState, status: progressState.progress < 100 ? 'running' : 'completed' },
+      });
+    } catch (e) {
+      console.error('[analyze-job] Progress flush failed:', String(e).slice(0, 100));
+    } finally {
+      flushPending = false;
+    }
+  }, 3_000);
+
+  // Instant, non-blocking progress update — just sets the in-memory state
   const updateJob = async (progress: number, message: string) => {
-    await db.analysisJob.update({ where: { id: jobId }, data: { progress, message, status: progress < 100 ? 'running' : 'completed' } }).catch(() => {});
+    progressState = { progress, message, status: 'running' };
+    // Don't await — flush timer will pick it up
+  };
+
+  // Force-flush now (used at completion so user sees final state immediately)
+  const flushJobNow = async () => {
+    if (flushPending) return;
+    flushPending = true;
+    try {
+      await db.analysisJob.update({
+        where: { id: jobId },
+        data: { ...progressState, status: progressState.progress < 100 ? 'running' : 'completed' },
+      });
+    } catch (e) {
+      console.error('[analyze-job] Force flush failed:', String(e).slice(0, 100));
+    } finally {
+      flushPending = false;
+    }
   };
 
   // ─── GLOBAL TIMEOUT: entire job must complete in 30 min ───
@@ -376,6 +423,22 @@ async function runAnalysisInBackground(jobId: string, config: {
     // Now: 30% → 48% during pass 1 (120s), then 50% → 65% during pass 2
     // (120s), so the user always sees forward motion across the full
     // 240s of AI time.
+    //
+    // HARD PHASE 2 TIMEOUT (4 min) — wraps the entire AI pass 1+2 in
+    // a Promise.race. If both pass 1's 120s timeout AND pass 2's 120s
+    // timeout fail to fire (e.g., OpenRouter keeps connection open
+    // indefinitely and AbortController doesn't work in this edge case),
+    // this 4-min hard cap fires and forces the catch handler. User
+    // reported "stuck at 30s for 4 min" — this is the GUARANTEE that
+    // even in the worst case, Phase 2 cannot exceed 4 min.
+    const PHASE2_HARD_TIMEOUT = 240_000; // 4 min hard cap for AI pass 1+2
+    const phase2Start = Date.now();
+    let phase2TimedOut = false;
+    const phase2Watchdog = setTimeout(() => {
+      phase2TimedOut = true;
+      console.error('[analyze-job] PHASE 2 HARD TIMEOUT (4 min) — forcing AI abort');
+    }, PHASE2_HARD_TIMEOUT);
+
     await updateJob(30, 'Starting AI surface analysis (pass 1/2)...');
     let aiVulns: any[] = [];
     // Declare OUTSIDE try so catch block can access it
@@ -389,7 +452,7 @@ async function runAnalysisInBackground(jobId: string, config: {
       progressInterval = setInterval(() => {
         aiPass1Progress = Math.min(48, aiPass1Progress + 2);
         const elapsed = Math.round((Date.now() - (globalStartTime || Date.now())) / 1000);
-        updateJob(aiPass1Progress, `AI pass 1 surface analysis... ${elapsed}s elapsed`).catch(() => {});
+        updateJob(aiPass1Progress, `AI pass 1 surface analysis... ${elapsed}s elapsed`);
       }, 10_000);
 
       const aiPromise = isWeb
@@ -398,7 +461,11 @@ async function runAnalysisInBackground(jobId: string, config: {
       const timeoutPromise = new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error('AI pass 1 timeout after 120s')), 120_000)
       );
-      aiVulns = await Promise.race([aiPromise, timeoutPromise]);
+      // Phase 2 hard timeout also rejects — last-resort safety net
+      const hardTimeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('Phase 2 hard timeout (4 min)')), PHASE2_HARD_TIMEOUT)
+      );
+      aiVulns = await Promise.race([aiPromise, timeoutPromise, hardTimeoutPromise]);
       if (progressInterval) clearInterval(progressInterval);
     } catch (err: any) {
       if (progressInterval) clearInterval(progressInterval);
@@ -414,9 +481,12 @@ async function runAnalysisInBackground(jobId: string, config: {
       await updateJob(100, `Analysis complete (AI failed): ${allResults.length} static findings`);
       await db.audit.update({ where: { id: auditId }, data: { status: 'completed', findings: allResults.length, completedAt: new Date() } }).catch(() => {});
       await db.analysisJob.update({ where: { id: jobId }, data: { status: 'completed', resultCount: 0 } }).catch(() => {});
+      clearTimeout(phase2Watchdog);
       clearTimeout(globalTimeout);
+      await flushJobNow();
       return;
     }
+    clearTimeout(phase2Watchdog);
 
     if (jobTimedOut) return;
 
@@ -430,7 +500,7 @@ async function runAnalysisInBackground(jobId: string, config: {
       deepProgressInterval = setInterval(() => {
         aiPass2Progress = Math.min(68, aiPass2Progress + 2);
         const elapsed = Math.round((Date.now() - globalStartTime) / 1000);
-        updateJob(aiPass2Progress, `AI pass 2 deep analysis... ${elapsed}s elapsed`).catch(() => {});
+        updateJob(aiPass2Progress, `AI pass 2 deep analysis... ${elapsed}s elapsed`);
       }, 10_000);
 
       const firstPassSummary = aiVulns.map(v => ({
@@ -560,6 +630,11 @@ async function runAnalysisInBackground(jobId: string, config: {
       data: { status: 'failed', error: String(err).slice(0, 500), progress: 100, message: 'Analysis failed' } }).catch(() => {});
   } finally {
     clearTimeout(globalTimeout);
+    clearInterval(flushTimer);
+    // Final force-flush so user sees the latest state immediately
+    try {
+      await flushJobNow();
+    } catch {}
   }
 }
 
