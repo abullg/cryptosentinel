@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-export const maxDuration = 600; // VPS KVM 2 — no Render/Vercel limits; allow 10min for slow sites with WAF
+export const maxDuration = 180; // 3 min hard cap (was 10 min — too long)
 // analyzeWebApp removed — lightweight fetchWebsite + multi-pass AI in /api/analyze is faster
 import { checkStandardRateLimit } from '@/lib/rate-limit';
 import { isSsrfBlocked } from '@/lib/ssrf';
@@ -634,10 +634,21 @@ async function fetchWebAppWithAI(parsedUrl: URL, isContractFallback = false) {
     // (replaces the old shallow "3 sitemap pages" crawl). Discovers login,
     // admin, /api/*, forms with input fields, and per-page URL parameters
     // — the security-relevant surfaces that shallow crawling missed.
+    //
+    // HARD 90s TIMEOUT — deepCrawl has its own 90s budget but it's checked
+    // BETWEEN batches, not DURING. If a single batch hangs (slow proxy,
+    // Wayback fallback), it can take 30+ seconds. Wrap in Promise.race
+    // with 90s hard timeout. If exceeded, fall back to legacy shallow
+    // crawl (which is faster and has its own timeout).
     console.log(`[fetchWebAppWithAI] Deep BFS crawl for ${urlStr}`);
     let crawl;
     try {
-      crawl = await deepCrawl(urlStr);
+      crawl = await Promise.race([
+        deepCrawl(urlStr),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('deepCrawl hard timeout (90s)')), 90_000)
+        ),
+      ]);
     } catch (crawlErr) {
       // Fallback to legacy shallow crawl if BFS fails (e.g. SSRF block, total timeout)
       console.warn('[fetchWebAppWithAI] Deep crawl failed, falling back to shallow:', String(crawlErr).slice(0, 150));
