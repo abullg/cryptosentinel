@@ -38,7 +38,11 @@ const nextConfig: NextConfig = {
   async headers() {
     return [
       {
-        source: '/(.*)',
+        // HTML pages: NO CACHE — browser must always fetch fresh HTML
+        // so it gets new JS bundle hashes after deploys. Without this,
+        // browser serves stale HTML referencing old JS files (which
+        // no longer exist on server → 404 → buttons don't work).
+        source: '/:path*',
         headers: [
           { key: 'X-Frame-Options', value: 'DENY' },
           { key: 'X-Content-Type-Options', value: 'nosniff' },
@@ -48,6 +52,17 @@ const nextConfig: NextConfig = {
             key: 'Strict-Transport-Security',
             value: 'max-age=31536000; includeSubDomains; preload',
           },
+          { key: 'Cache-Control', value: 'no-store, no-cache, must-revalidate, max-age=0' },
+          { key: 'Pragma', value: 'no-cache' },
+          { key: 'Expires', value: '0' },
+        ],
+      },
+      {
+        // Static assets WITH hash in filename: cache forever (safe —
+        // content-addressed, hash changes when content changes)
+        source: '/_next/static/:path*',
+        headers: [
+          { key: 'Cache-Control', value: 'public, max-age=31536000, immutable' },
         ],
       },
       {
