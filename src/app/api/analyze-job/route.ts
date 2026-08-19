@@ -154,12 +154,13 @@ async function runAnalysisInBackground(jobId: string, config: {
     // Phase 2: AI ANALYSIS (pass 1 — surface scan)
     await updateJob(30, 'Starting AI surface analysis (pass 1/2)...');
     let aiVulns: any[] = [];
+    // Declare OUTSIDE try so catch block can access it
+    let progressInterval: ReturnType<typeof setInterval> | null = null;
     try {
-      // Progress updates during AI call — so user knows it's not stuck
-      const progressInterval = setInterval(() => {
+      progressInterval = setInterval(() => {
         const elapsed = Math.round((Date.now() - (globalStartTime || Date.now())) / 1000);
         updateJob(30, `AI analysis in progress... ${elapsed}s elapsed`).catch(() => {});
-      }, 15_000); // Update every 15s
+      }, 15_000);
 
       const aiPromise = isWeb
         ? analyzeWebWithGLM(sourceCode.slice(0, 30000), contractName, { apiKey, model })
@@ -168,9 +169,9 @@ async function runAnalysisInBackground(jobId: string, config: {
         setTimeout(() => reject(new Error('AI pass 1 timeout after 60s')), 60_000)
       );
       aiVulns = await Promise.race([aiPromise, timeoutPromise]);
-      clearInterval(progressInterval);
+      if (progressInterval) clearInterval(progressInterval);
     } catch (err: any) {
-      clearInterval(progressInterval);
+      if (progressInterval) clearInterval(progressInterval);
       await updateJob(40, `AI pass 1 ${String(err).slice(0, 100)}. Completing with static findings.`);
       if (jobTimedOut) return;
       const allResults = savedStatic.map(s => s.vuln);
@@ -187,8 +188,9 @@ async function runAnalysisInBackground(jobId: string, config: {
 
     // Pass 2 — DEEP analysis
     let deepVulns: any[] = [];
+    let deepProgressInterval: ReturnType<typeof setInterval> | null = null;
     try {
-      const deepProgressInterval = setInterval(() => {
+      deepProgressInterval = setInterval(() => {
         const elapsed = Math.round((Date.now() - globalStartTime) / 1000);
         updateJob(50, `AI deep analysis in progress... ${elapsed}s elapsed`).catch(() => {});
       }, 15_000);
@@ -203,8 +205,9 @@ async function runAnalysisInBackground(jobId: string, config: {
         setTimeout(() => reject(new Error('AI pass 2 (deep) timeout after 60s')), 60_000)
       );
       deepVulns = await Promise.race([deepPromise, deepTimeout]);
-      clearInterval(deepProgressInterval);
+      if (deepProgressInterval) clearInterval(deepProgressInterval);
     } catch (err: any) {
+      if (deepProgressInterval) clearInterval(deepProgressInterval);
       await updateJob(60, `AI pass 2 (deep) ${String(err).slice(0, 100)}. Continuing with pass 1 only.`);
     }
 
