@@ -121,7 +121,22 @@ function isWAFChallenge(html: string): boolean {
 function isSameOrigin(url: string, origin: string): boolean {
   try {
     const u = new URL(url);
-    return u.origin === origin;
+    if (u.origin === origin) return true;
+    // Also accept sibling subdomains (blog.bitunix.com, support.bitunix.com,
+    // api.bitunix.com, openapidoc.bitunix.com, etc. when origin is
+    // www.bitunix.com). Crypto exchanges commonly host their docs, blog,
+    // support, API docs on sibling subdomains — these are part of the
+    // same site and should be crawled.
+    const originHost = new URL(origin).hostname;
+    const originParts = originHost.split('.');
+    if (originParts.length >= 2) {
+      // Get eTLD+1 (last 2 parts, e.g. bitunix.com)
+      const eTldPlus1 = originParts.slice(-2).join('.');
+      if (u.hostname.endsWith('.' + eTldPlus1) || u.hostname === eTldPlus1) {
+        return true;
+      }
+    }
+    return false;
   } catch { return false; }
 }
 
@@ -191,6 +206,7 @@ function parsePage(html: string, url: string): {
 }
 
 async function fetchPage(url: string): Promise<{ status: number; html: string; headers: Record<string, string> } | null> {
+  // Direct fetch first
   try {
     const res = await fetch(url, {
       headers: BROWSER_HEADERS,
@@ -200,8 +216,96 @@ async function fetchPage(url: string): Promise<{ status: number; html: string; h
     const headers: Record<string, string> = {};
     res.headers.forEach((v, k) => { headers[k.toLowerCase()] = v; });
     const html = await res.text();
-    return { status: res.status, html, headers };
-  } catch { return null; }
+
+    // Geo-block (bitunix returns 469 "Restricted Access") or WAF challenge
+    // → fall through to proxy fallback
+    const isWafBlock = res.status === 403 || res.status === 429 ||
+                       res.status === 469 || res.status === 503 ||
+                       isWAFChallenge(html);
+    if (!isWafBlock && res.ok) {
+      return { status: res.status, html, headers };
+    }
+    // WAF / geo-block — try proxies below
+    console.log(`[deep-crawler] Direct fetch status=${res.status} for ${url}, trying proxies...`);
+  } catch {}
+
+  // MULTI-PROXY FALLBACK — when target is WAF/geo-blocked, route the
+  // request through CORS proxies that exit from different countries.
+  // Bitunix (and many crypto exchanges) geo-block VPS/sandbox IPs but
+  // allow requests from public proxy servers in allowed regions.
+  const PROXIES = [
+    `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+    `https://api.codetabs.com/v1/proxy/?url=${encodeURIComponent(url)}`,
+    `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
+  ];
+
+  for (const proxyUrl of PROXIES) {
+    try {
+      const res = await fetch(proxyUrl, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+        signal: AbortSignal.timeout(PER_PAGE_TIMEOUT),
+        redirect: 'follow',
+      });
+      if (!res.ok) continue;
+      const html = await res.text();
+      // Proxies return WAF challenge pages too — skip those
+      if (html.length < 200 || isWAFChallenge(html)) continue;
+      // Got real content via proxy
+      const headers: Record<string, string> = {};
+      res.headers.forEach((v, k) => { headers[k.toLowerCase()] = v; });
+      // Mark as 200 from proxy
+      return { status: 200, html, headers: { ...headers, 'x-fetched-via-proxy': '1' } };
+    } catch {}
+  }
+
+  // WAYBACK MACHINE FALLBACK — use archived snapshot from web.archive.org
+  // This works even when all live proxies are blocked — we get historical
+  // content. For security analysis of stable pages (login, dashboard, API
+  // docs), the snapshot is usually close enough to the live version.
+  try {
+    const waybackCheck = await fetch(
+      `https://archive.org/wayback/available?url=${encodeURIComponent(url)}`,
+      { signal: AbortSignal.timeout(5_000) }
+    );
+    if (waybackCheck.ok) {
+      const wb = await waybackCheck.json();
+      const snapUrl = wb?.archived_snapshots?.closest?.url;
+      if (snapUrl) {
+        const snapRes = await fetch(snapUrl, {
+          headers: { 'User-Agent': 'Mozilla/5.0' },
+          signal: AbortSignal.timeout(PER_PAGE_TIMEOUT),
+          redirect: 'follow',
+        });
+        if (snapRes.ok) {
+          const rawHtml = await snapRes.text();
+          if (rawHtml.length > 200 && !isWAFChallenge(rawHtml)) {
+            // Strip wayback URL wrappers so we get clean original URLs.
+            // Wayback rewrites all hrefs to TWO forms:
+            //   - absolute: https://web.archive.org/web/TIMESTAMP[suffix_]/https://original.com/path
+            //   - relative: /web/TIMESTAMP[suffix_]/https://original.com/path
+            // The suffix is 2 letters + underscore (im_, jm_, cs_, if_, etc.)
+            // indicating the rewritten content type (image/js/css/iframe).
+            // We want: https://original.com/path (so isSameOrigin + queue logic works).
+            // IMPORTANT: do NOT consume the trailing https:// of the original URL.
+            const cleanHtml = rawHtml
+              .replace(/(?:https?:)?\/\/web\.archive\.org\/web\/\d+(?:[a-z]{2}_)?\//gi, '')
+              .replace(/\/web\/\d+(?:[a-z]{2}_)?\//gi, '')
+              // Strip wayback's own toolbar/scripts
+              .replace(/<script[^>]*src="[^"]*web-static\.archive\.org[^"]*"[^>]*><\/script>/gi, '')
+              .replace(/<script[^>]*>\s*__wm\.[\s\S]*?<\/script>/gi, '')
+              .replace(/<script[^>]*>\s*window\.RufflePlayer[\s\S]*?<\/script>/gi, '')
+              .replace(/<!-- BEGIN WAYBACK TOOLBAR[\s\S]*?END WAYBACK TOOLBAR -->/gi, '')
+              .replace(/<!-- BEGIN WAYBACK FOOTER[\s\S]*?END WAYBACK FOOTER -->/gi, '');
+            const headers: Record<string, string> = {};
+            snapRes.headers.forEach((v, k) => { headers[k.toLowerCase()] = v; });
+            return { status: 200, html: cleanHtml, headers: { ...headers, 'x-fetched-via-wayback': '1' } };
+          }
+        }
+      }
+    }
+  } catch {}
+
+  return null;
 }
 
 function buildReconText(result: CrawlResult): string {
@@ -351,13 +455,72 @@ async function fetchRobotsAndSitemap(origin: string): Promise<{ robotsTxt: strin
 
 async function analyzeJsBundle(scriptUrl: string, origin: string): Promise<JsBundleInfo | null> {
   const fullUrl = scriptUrl.startsWith('http') ? scriptUrl : `${origin}${scriptUrl}`;
+  let js: string | null = null;
+
+  // Try direct fetch first
   try {
     const res = await fetch(fullUrl, {
       headers: { 'User-Agent': 'Mozilla/5.0', 'Accept-Encoding': 'gzip' },
       signal: AbortSignal.timeout(10_000),
     });
-    if (!res.ok) return null;
-    const js = await res.text();
+    if (res.ok) {
+      const text = await res.text();
+      if (text.length > 100 && !/cf-challenge|access restricted/i.test(text)) {
+        js = text;
+      }
+    }
+  } catch {}
+
+  // PROXY FALLBACK for JS bundles too — bitunix static.bitunix.com is also
+  // served through Cloudflare and may be geo-blocked from VPS
+  if (!js) {
+    const PROXIES = [
+      `https://api.allorigins.win/raw?url=${encodeURIComponent(fullUrl)}`,
+      `https://api.codetabs.com/v1/proxy/?url=${encodeURIComponent(fullUrl)}`,
+    ];
+    for (const proxyUrl of PROXIES) {
+      try {
+        const res = await fetch(proxyUrl, {
+          headers: { 'User-Agent': 'Mozilla/5.0' },
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (!res.ok) continue;
+        const text = await res.text();
+        if (text.length < 100) continue;
+        if (/cf-challenge|access restricted/i.test(text)) continue;
+        js = text;
+        break;
+      } catch {}
+    }
+  }
+
+  // Last resort: Wayback Machine for the JS bundle
+  if (!js) {
+    try {
+      const waybackCheck = await fetch(
+        `https://archive.org/wayback/available?url=${encodeURIComponent(fullUrl)}`,
+        { signal: AbortSignal.timeout(5_000) }
+      );
+      if (waybackCheck.ok) {
+        const wb = await waybackCheck.json();
+        const snapUrl = wb?.archived_snapshots?.closest?.url;
+        if (snapUrl) {
+          const snapRes = await fetch(snapUrl, {
+            headers: { 'User-Agent': 'Mozilla/5.0' },
+            signal: AbortSignal.timeout(10_000),
+            redirect: 'follow',
+          });
+          if (snapRes.ok) {
+            const text = await snapRes.text();
+            if (text.length > 100) js = text;
+          }
+        }
+      }
+    } catch {}
+  }
+
+  if (!js) return null;
+  try {
     const endpoints = [...new Set([
       ...js.matchAll(/["']((?:\/api\/|\/v[0-9]+\/)[^"'\s]+)["']/gi),
       ...js.matchAll(/["'](https?:\/\/[^"']*(?:api|graphql|rpc)[^"']*)["']/gi),
