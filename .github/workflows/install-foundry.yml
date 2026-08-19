@@ -1,0 +1,76 @@
+name: Install Foundry
+
+on:
+  workflow_dispatch:
+
+jobs:
+  install:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p 22 -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Install Foundry + deploy latest + restart
+        run: |
+            HOST="${{ secrets.VPS_HOST }}"
+            USER="${{ secrets.VPS_USER || 'root' }}"
+            ssh -p 22 -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 $USER@$HOST bash -s <<'INSTALL'
+            set -e
+
+            echo "=== 1. Install Foundry ==="
+            if ! command -v forge &>/dev/null/null; then
+              curl -L https://foundry.paradigm.xyz | bash
+              export PATH="$HOME/.foundry/bin:$PATH"
+              foundryup
+              echo 'export PATH="$HOME/.foundry/bin:$PATH"' >> ~/.bashrc
+              ln -sf $HOME/.foundry/bin/forge /usr/local/bin/forge
+              ln -sf $HOME/.foundry/bin/cast /usr/local/bin/cast
+              ln -sf $HOME/.foundry/bin/anvil /usr/local/bin/anvil
+            fi
+            forge --version
+
+            echo ""
+            echo "=== 2. Pull latest code ==="
+            cd /opt/cryptosentinel
+            git config --global --add safe.directory /opt/cryptosentinel
+            git fetch origin main && git reset --hard origin/main
+            git log --oneline -3
+
+            echo ""
+            echo "=== 3. Build ==="
+            rm -rf .next
+            npm install 2>&1 | tail -3
+            npx prisma generate 2>&1 | tail -2
+            export NODE_OPTIONS=--max-old-space-size=2048
+            npx next build 2>&1 | tail -10
+
+            echo ""
+            echo "=== 4. Copy static ==="
+            cp -rf .next/static .next/standalone/.next/
+            cp -rf public .next/standalone/ 2>/dev/null || true
+
+            echo ""
+            echo "=== 5. DB + restart PM2 ==="
+            export DATABASE_URL=file:/data/cryptosentinel.db
+            npx prisma db push 2>&1 | tail -3
+            pm2 delete cryptosentinel 2>/dev/null || true
+            set -a; . /etc/cryptosentinel.env; set +a
+            pm2 start ecosystem.config.js --env production 2>&1 | tail -5
+            pm2 save 2>&1 | tail -2
+            sleep 8
+
+            echo ""
+            echo "=== 6. Verify ==="
+            pm2 list 2>&1 | head -5
+            curl -s -o /dev/null -w "UI HTTP=%{http_code}\n" --max-time 10 http://localhost:3000/ 2>&1
+            curl -s --max-time 10 http://localhost:3000/api/settings 2>&1 | head -3
+            forge --version 2>&1
+
+            echo ""
+            echo "=== DONE ==="
+            INSTALL
