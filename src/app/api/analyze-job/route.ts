@@ -849,9 +849,10 @@ async function runValidationOnFindings(
       ]);
 
       console.log(`[analyze-job]   Provenance chain: verdict=${provenance.verdict} confidence=${provenance.confidence}`);
-      console.log(`[analyze-job]   Security checks: ${provenance.securityChecks.map((c: any) => `${c.propertyName}=${c.passed ? 'PASS' : 'FAIL'}`).join(', ')}`);
+      console.log(`[analyze-job]   Security checks: ${provenance.securityChecks.map((c: any) => `${c.propertyName}=${c.passed === true ? 'PASS' : c.passed === false ? 'FAIL' : 'INCONCLUSIVE'}`).join(', ')}`);
 
       if (provenance.verdict === 'CONFIRMED') {
+        // Security property PROVEN — deterministic proof → confidence=1.0
         await withTimeout(db.vulnerability.update({ where: { id: vuln.id },
           data: { confidence: 1, status: 'confirmed', validationScope: 'provenance',
             description: vuln.description + `\n\n== PROVENANCE CHAIN (deterministic proof) ==\n${provenance.evidenceChain}` } }), 10_000, null, 'provenance vuln.update');
@@ -860,8 +861,20 @@ async function runValidationOnFindings(
         vuln.validationScope = 'provenance';
         confirmed++;
         activeValidated++;
+      } else if (provenance.verdict === 'INCONCLUSIVE') {
+        // Evidence AMBIGUOUS — could be real, could be FP. Human should verify.
+        // Save as 'validated' with confidence=0.5 so it shows in UI but
+        // clearly labeled as "requires manual verification"
+        await withTimeout(db.vulnerability.update({ where: { id: vuln.id },
+          data: { confidence: 0.5, status: 'validated', validationScope: 'provenance',
+            description: vuln.description + `\n\n== PROVENANCE CHAIN (INCONCLUSIVE) ==\n${provenance.evidenceChain}\n\n⚠ This finding could NOT be automatically confirmed OR disproven. Evidence is ambiguous. Manual verification recommended.` } }), 10_000, null, 'provenance vuln.update inconclusive');
+        vuln.confidence = 0.5;
+        vuln.status = 'validated';
+        vuln.validationScope = 'provenance';
+        confirmed++;
       } else {
-        console.log(`[analyze-job]   Provenance DROPPED — security property not proven`);
+        // DROP — actively disproven (false positive)
+        console.log(`[analyze-job]   Provenance DROPPED — security property disproven`);
         vuln.status = 'candidate';
         vuln.confidence = 0;
       }

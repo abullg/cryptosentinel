@@ -61,9 +61,10 @@ export interface ProvenanceResult {
   request: ProvenanceRequest;
   response: ProvenanceResponse;
   securityChecks: SecurityPropertyCheck[];
-  verdict: 'CONFIRMED' | 'DROP';
-  confidence: number;        // 1.0 only if security property PROVEN, else 0
-  evidenceChain: string;    // full provenance chain for user to verify
+  verdict: 'CONFIRMED' | 'INCONCLUSIVE' | 'DROP';  // THREE-STATE model
+  confidence: number;        // 1.0 = CONFIRMED, 0.5 = INCONCLUSIVE, 0 = DROP
+  evidenceChain: string;
+  proofContractUsed: string;  // which proof contract was applied
 }
 
 const BROWSER_HEADERS_NO_AUTH: Record<string, string> = {
@@ -481,10 +482,31 @@ export async function runProvenanceChain(
     });
   }
 
-  // ─── 4. VERDICT ───
+  // ─── 4. VERDICT (THREE-STATE MODEL) ─────────────────────────
+  // CONFIRMED: all security checks PASS → security property PROVEN → confidence=1.0
+  // INCONCLUSIVE: some checks PASS, some inconclusive → ambiguous → confidence=0.5
+  // DROP: any check actively FAILED (disproven) → false positive → confidence=0
   const allPassed = securityChecks.every(c => c.passed);
-  const verdict = allPassed ? 'CONFIRMED' : 'DROP';
-  const confidence = allPassed ? 1.0 : 0; // Only deterministic proof → 1.0
+  const anyFailed = securityChecks.some(c => !c.passed);
+  const anyInconclusive = securityChecks.some(c => c.passed === null);
+
+  let verdict: 'CONFIRMED' | 'INCONCLUSIVE' | 'DROP';
+  let confidence: number;
+
+  if (allPassed) {
+    verdict = 'CONFIRMED';
+    confidence = 1.0;
+  } else if (anyFailed && !anyInconclusive) {
+    verdict = 'DROP';
+    confidence = 0;
+  } else {
+    verdict = 'INCONCLUSIVE';
+    confidence = 0.5;
+  }
+
+  // Get proof contract for evidence chain
+  const { getProofContract } = require('./proof-contracts');
+  const contract = getProofContract(findingType);
 
   // ─── 5. BUILD EVIDENCE CHAIN ───
   const evidenceChain = [
@@ -493,6 +515,11 @@ export async function runProvenanceChain(
     `CANDIDATE: ${finding.title}`,
     `TYPE: ${finding.type}`,
     `SEVERITY: ${finding.severity}`,
+    ``,
+    `PROOF CONTRACT: ${contract.type}`,
+    `  Proof required: ${contract.proofRequired}`,
+    `  Misconfig vs vuln: ${contract.misconfigVsVuln}`,
+    `  Drop criteria: ${contract.dropCriteria}`,
     ``,
     `REQUEST:`,
     `  ${request.method} ${request.url}`,
@@ -506,15 +533,17 @@ export async function runProvenanceChain(
     `  Body excerpt: ${response.bodyExcerpt.slice(0, 500)}`,
     ``,
     `SECURITY-PROPERTY CHECKS:`,
-    ...securityChecks.map(c => 
-      `  [${c.passed ? 'PASS' : 'FAIL'}] ${c.propertyName}: ${c.reasoning}\n    Evidence: ${c.evidence}`
+    ...securityChecks.map(c =>
+      `  [${c.passed === true ? 'PASS' : c.passed === false ? 'FAIL' : 'INCONCLUSIVE'}] ${c.propertyName}: ${c.reasoning}\n    Evidence: ${c.evidence}`
     ),
     ``,
     `VERDICT: ${verdict}`,
-    `CONFIDENCE: ${confidence} (${verdict === 'CONFIRMED' ? 'deterministic proof' : 'not proven'})`,
+    `CONFIDENCE: ${confidence} (${verdict === 'CONFIRMED' ? 'deterministic proof' : verdict === 'INCONCLUSIVE' ? 'ambiguous — manual verification recommended' : 'disproven — false positive'})`,
     ``,
     `NOTE: AI confidence is capped at 0.99. Only this deterministic`,
     `provenance chain can set confidence=1.0 (CONFIRMED).`,
+    `INCONCLUSIVE means: evidence is ambiguous — could be real, could`,
+    `be false positive. Human should verify manually.`,
   ].join('\n');
 
   return {
@@ -525,5 +554,6 @@ export async function runProvenanceChain(
     verdict,
     confidence,
     evidenceChain,
+    proofContractUsed: contract.type,
   };
 }
