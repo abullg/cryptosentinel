@@ -1,0 +1,22 @@
+name: Diag Endpoints
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p 22 -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Full endpoint diagnostics
+        run: |
+          HOST="${{ secrets.VPS_HOST }}"
+          USER="${{ secrets.VPS_USER || 'root' }}"
+          ssh -p 22 -o StrictHostKeyChecking=no -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 $USER@$HOST "echo '=== 1. PM2 STATUS ==='; pm2 list 2>&1 | head -10; echo; echo '=== 2. Port 3000 listening? ==='; ss -tlnp 2>&1 | grep -E ':3000|:80' | head -5; echo; echo '=== 3. nginx status ==='; systemctl status nginx 2>&1 | head -10; echo; echo '=== 4. Curl localhost:3000 ==='; curl -sI --max-time 10 http://localhost:3000/ 2>&1 | head -10; echo; echo '=== 5. Curl localhost:80 (nginx proxy) ==='; curl -sI --max-time 10 http://localhost:80/ 2>&1 | head -10; echo; echo '=== 6. Curl /api/health ==='; curl -s --max-time 10 http://localhost:3000/api/health 2>&1 | head -3; echo; echo '=== 7. Curl /api/fetch-url (POST bitunix) ==='; timeout 30 curl -s --max-time 25 -X POST http://localhost:3000/api/fetch-url -H 'Content-Type: application/json' -d '{\"url\":\"https://www.bitunix.com/\",\"type\":\"exchange\"}' 2>&1 | head -c 1000; echo; echo '=== 8. PM2 OUT since 10:30 ==='; awk '/2026-08-19T10:3[0-9]:|2026-08-19T1[0-9]:/' /var/log/cryptosentinel/out.log 2>/dev/null | tail -50; echo; echo '=== 9. PM2 ERR since 10:30 ==='; awk '/2026-08-19T10:3[0-9]:|2026-08-19T1[0-9]:/' /var/log/cryptosentinel/error.log 2>/dev/null | tail -30; echo; echo '=== DONE ==='"
