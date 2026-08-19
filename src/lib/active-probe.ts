@@ -610,5 +610,45 @@ export function buildProbeInputsFromCrawl(args: {
     });
   }
 
+  // 4. SPA FALLBACK — many crypto exchanges (bitunix.com, etc.) are SPAs
+  // with NO URL params and NO forms in the HTML. Their attack surface is
+  // API endpoints discovered in JS bundles. Without this fallback, the
+  // active probes would be EMPTY for SPA targets — that's why bitunix
+  // returned 0 findings.
+  //
+  // For each discovered endpoint, test with common security-relevant
+  // param names. These are the params that REAL bug bounty hunters try
+  // first: redirect/callback/url (open redirect), q/search (XSS),
+  // id/uid (IDOR), debug/test (info exposure).
+  const DEFAULT_PROBE_PARAMS = ['id', 'q', 'search', 'url', 'redirect',
+    'callback', 'next', 'debug', 'test', 'path', 'file', 'page', 'cmd'];
+
+  if (inputs.length === 0 && args.discoveredEndpoints.length > 0) {
+    // No params/forms discovered — use DEFAULT_PROBE_PARAMS on each endpoint
+    for (const ep of args.discoveredEndpoints.slice(0, 15)) {
+      for (const p of DEFAULT_PROBE_PARAMS.slice(0, 7)) {
+        const key = `default|${ep}|${p}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        inputs.push({
+          url: ep,
+          method: 'GET',
+          params: [{ name: p }],
+        });
+      }
+    }
+  }
+
+  // 5. Always probe the target URL itself with default params (last resort)
+  if (inputs.length === 0 && args.targetUrl) {
+    for (const p of DEFAULT_PROBE_PARAMS.slice(0, 5)) {
+      inputs.push({
+        url: args.targetUrl,
+        method: 'GET',
+        params: [{ name: p }],
+      });
+    }
+  }
+
   return inputs;
 }
