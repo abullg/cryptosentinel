@@ -188,13 +188,12 @@ export async function callGLM(
       model: model || DEFAULT_MODEL,
       messages,
       temperature,
+      // Explicitly set max_tokens — without it, OpenRouter's default may
+      // truncate the response mid-JSON, causing 'Failed to parse response
+      // as JSON' errors. 16384 tokens = ~12K words = enough for 30+
+      // findings with full PoC outlines.
+      max_tokens: 16384,
     };
-    // max_tokens: 32768 for GLM models — MAXIMUM reasoning depth.
-    // Render has 15-minute timeout (vs Vercel Hobby 60s), so we can afford
-    // the full reasoning chain. This gives ~24,000 words of output — enough
-    // for thorough multi-finding analysis with full PoC outlines.
-    // No max_tokens limit — model decides when analysis is complete
-    // DeepSeek and other models keep their explicit limits from config
 
     response = await fetch(OPENROUTER_API_URL, {
       method: 'POST',
@@ -1573,12 +1572,40 @@ export async function analyzeWithGLMDeep(
 
   try {
     let jsonStr = response.content.trim();
+    // Strip markdown ```json fences. If response is truncated (no closing
+    // ```), the first regex won't match. Fall back to stripping opening
+    // fence manually.
     const mdMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
-    if (mdMatch) jsonStr = mdMatch[1].trim();
-    else if (jsonStr.includes('```')) jsonStr = jsonStr.replace(/```(?:json)?/gi, '').trim();
+    if (mdMatch) {
+      jsonStr = mdMatch[1].trim();
+    } else if (jsonStr.includes('```')) {
+      jsonStr = jsonStr.replace(/```(?:json)?/gi, '').trim();
+    }
+    // Find JSON array — try strict match first (between first [ and last ])
     const jsonMatch = jsonStr.match(/\[[\s\S]*\]/);
     if (jsonMatch) jsonStr = jsonMatch[0];
-    const parsed = JSON.parse(jsonStr);
+    let parsed;
+    try {
+      parsed = JSON.parse(jsonStr);
+    } catch {
+      // PARTIAL JSON RECOVERY — AI response was truncated mid-array.
+      // Try to find individual complete objects and parse them.
+      // Each object looks like { "field": "value", ... }
+      const objects: any[] = [];
+      const objRegex = /\{[\s\S]*?\}(?=\s*[,}\]])/g;
+      const matches = jsonStr.matchAll(objRegex);
+      for (const m of matches) {
+        try {
+          objects.push(JSON.parse(m[0]));
+        } catch {}
+      }
+      if (objects.length > 0) {
+        console.log(`[analyzeWebWithGLMDeep] Recovered ${objects.length} partial findings from truncated JSON`);
+        parsed = objects;
+      } else {
+        throw new Error('Could not parse JSON or recover partial objects');
+      }
+    }
     if (Array.isArray(parsed)) {
       return parsed.map(v => ({
         title: normalizeString(v.title, 'Deep Vulnerability'),

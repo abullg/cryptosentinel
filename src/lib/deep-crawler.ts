@@ -573,8 +573,14 @@ export async function deepCrawl(targetUrl: string): Promise<CrawlResult> {
   const origin = parsed.origin;
 
   // SSRF safety check — never crawl internal/private IPs
-  if (isSsrfBlocked(targetUrl)) {
-    throw new Error('SSRF safety check failed — cannot crawl this URL');
+  // CRITICAL BUG FIX: isSsrfBlocked() returns an OBJECT {blocked: boolean, reason}
+  // Checking `if (isSsrfBlocked(...))` is ALWAYS TRUE because the object is truthy.
+  // This caused EVERY URL (including bitunix.com) to throw 'SSRF safety check failed'.
+  // The deep crawler never ran — only the legacy shallow fallback ran (3 sitemap pages).
+  // Now correctly check the .blocked property.
+  const ssrfCheck = isSsrfBlocked(targetUrl);
+  if (ssrfCheck.blocked) {
+    throw new Error(`SSRF safety check failed: ${ssrfCheck.reason || 'blocked'} — cannot crawl this URL`);
   }
 
   const startTime = Date.now();
