@@ -1,0 +1,22 @@
+name: Diag Frontend
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p 22 -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Test frontend JS loading
+        run: |
+          HOST="${{ secrets.VPS_HOST }}"
+          USER="${{ secrets.VPS_USER || 'root' }}"
+          ssh -p 22 -o StrictHostKeyChecking=no -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 $USER@$HOST "echo '=== 1. Homepage HTML (look for script src) ==='; curl -s --max-time 10 http://localhost:3000/ | grep -oE 'src=\"[^\"]+\\.js[^\"]*\"' | head -10; echo; echo '=== 2. CSS link ==='; curl -s --max-time 10 http://localhost:3000/ | grep -oE 'href=\"[^\"]+\\.css[^\"]*\"' | head -5; echo; echo '=== 3. Test each JS bundle URL ==='; for url in \$(curl -s --max-time 10 http://localhost:3000/ | grep -oE 'src=\"[^\"]+\\.js[^\"]*\"' | sed 's/src=\"//;s/\"//'); do code=\$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \"http://localhost:3000\$url\"); echo \"  \$url -> HTTP \$code\"; done; echo; echo '=== 4. Check .next/static directory ==='; ls -la /opt/cryptosentinel/.next/standalone/.next/static/ 2>&1 | head -10; echo; echo '=== 5. List chunks in build ==='; find /opt/cryptosentinel/.next/standalone/.next -name '*.js' 2>&1 | head -15; echo; echo '=== 6. Check if static assets copied ==='; ls -la /opt/cryptosentinel/.next/standalone/.next/static/chunks/ 2>&1 | head -10; echo; echo '=== 7. nginx config for static ==='; cat /etc/nginx/sites-enabled/* 2>&1 | grep -A 3 'static\|chunks' | head -20; echo; echo '=== 8. Test direct static file ==='; curl -sI --max-time 5 http://localhost:3000/_next/static/chunks/ 2>&1 | head -5; echo; echo '=== DONE ==='"
