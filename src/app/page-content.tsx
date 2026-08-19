@@ -1068,7 +1068,25 @@ export default function CryptoSentinelDashboard() {
           const status = await statusRes.json();
 
           if (status.progress !== undefined && status.progress < 100) {
-            addActivity('scan', status.message || `Progress: ${status.progress}%`, 'running', `${status.progress}%`, status.progress);
+            // Only add NEW activity entries — dedupe by message
+            // (prevents duplicate 30% entries when job stays at same progress)
+            const msg = status.message || `Progress: ${status.progress}%`;
+            setActivities(prev => {
+              const lastEntry = prev[0];
+              // Skip if same message as last entry (dedupe)
+              if (lastEntry && lastEntry.message === msg) return prev;
+              // Skip if same progress as last entry (dedupe)
+              if (lastEntry && lastEntry.detail === `${status.progress}%`) return prev;
+              const entry = {
+                type: 'scan',
+                message: msg,
+                status: 'running' as const,
+                detail: `${status.progress}%`,
+                progress: status.progress,
+                timestamp: Date.now(),
+              };
+              return [entry, ...prev];
+            });
           }
 
           if (status.status === 'completed') {
