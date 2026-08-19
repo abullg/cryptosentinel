@@ -1142,22 +1142,26 @@ export default function CryptoSentinelDashboard() {
           }
 
           if (status.status === 'completed') {
-            addActivity('scan', `Analysis complete: ${status.resultCount} high-confidence findings`, 'success', 'Done', 100);
+            addActivity('scan', `Analysis complete: ${status.resultCount} confirmed findings`, 'success', 'Done', 100);
             // Fetch results — with cache-busting timestamp to bypass browser cache
             try {
               const vulnsRes = await fetch(`/api/vulnerabilities?t=${Date.now()}`);
               if (vulnsRes.ok) {
                 const serverVulns: Vulnerability[] = await vulnsRes.json();
-                const highConf = serverVulns.filter(v => (v.confidence || 0) >= 0.90);
-                if (highConf.length > 0) {
+                // Use onlyValidated (status=confirmed|validated) instead of
+                // confidence threshold. Passive evidence findings have
+                // confidence=0.85 (appropriate for config weaknesses) but
+                // are still validated — should be shown.
+                const validated = onlyValidated(serverVulns);
+                if (validated.length > 0) {
                   setVulns(prev => {
                     const existingIds = new Set(prev.map(v => v.id));
-                    const toAdd = highConf.filter((f: any) => !existingIds.has(f.id));
+                    const toAdd = validated.filter((f: any) => !existingIds.has(f.id));
                     return toAdd.length > 0 ? [...toAdd, ...prev] : prev;
                   });
-                  addActivity('scan', `Loaded ${highConf.length} findings into UI`, 'success', `${highConf.length} results`, 100);
+                  addActivity('scan', `Loaded ${validated.length} confirmed findings into UI`, 'success', `${validated.length} results`, 100);
                 } else {
-                  addActivity('scan', 'No findings above 70% confidence — try with different input', 'warning', '', 100);
+                  addActivity('scan', 'No confirmed findings — try with different input', 'warning', '', 100);
                 }
               }
             } catch (e) {
