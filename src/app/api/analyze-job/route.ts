@@ -17,6 +17,7 @@ import { writeProgressFile } from '@/lib/progress-file';
 import { withTimeout, fireAndForget } from '@/lib/with-timeout';
 import { checkPassiveEvidence } from '@/lib/passive-evidence';
 import { runProvenanceChain } from '@/lib/provenance-chain';
+import { fullVerify } from '@/lib/impact-engine';
 import { createHash } from 'crypto';
 
 const CATEGORY_MAP: Record<string, string> = {
@@ -851,27 +852,74 @@ async function runValidationOnFindings(
       console.log(`[analyze-job]   Provenance chain: verdict=${provenance.verdict} confidence=${provenance.confidence}`);
       console.log(`[analyze-job]   Security checks: ${provenance.securityChecks.map((c: any) => `${c.propertyName}=${c.passed === true ? 'PASS' : c.passed === false ? 'FAIL' : 'INCONCLUSIVE'}`).join(', ')}`);
 
-      if (provenance.verdict === 'CONFIRMED') {
-        // Security property PROVEN — deterministic proof → confidence=1.0
-        await withTimeout(db.vulnerability.update({ where: { id: vuln.id },
-          data: { confidence: 1, status: 'confirmed', validationScope: 'provenance',
-            description: vuln.description + `\n\n== PROVENANCE CHAIN (deterministic proof) ==\n${provenance.evidenceChain}` } }), 10_000, null, 'provenance vuln.update');
-        vuln.confidence = 1;
-        vuln.status = 'confirmed';
-        vuln.validationScope = 'provenance';
-        confirmed++;
-        activeValidated++;
-      } else if (provenance.verdict === 'INCONCLUSIVE') {
-        // Evidence AMBIGUOUS — could be real, could be FP. Human should verify.
-        // Save as 'validated' with confidence=0.5 so it shows in UI but
-        // clearly labeled as "requires manual verification"
-        await withTimeout(db.vulnerability.update({ where: { id: vuln.id },
-          data: { confidence: 0.5, status: 'validated', validationScope: 'provenance',
-            description: vuln.description + `\n\n== PROVENANCE CHAIN (INCONCLUSIVE) ==\n${provenance.evidenceChain}\n\n⚠ This finding could NOT be automatically confirmed OR disproven. Evidence is ambiguous. Manual verification recommended.` } }), 10_000, null, 'provenance vuln.update inconclusive');
-        vuln.confidence = 0.5;
-        vuln.status = 'validated';
-        vuln.validationScope = 'provenance';
-        confirmed++;
+      if (provenance.verdict === 'CONFIRMED' || provenance.verdict === 'INCONCLUSIVE') {
+        // ─── IMPACT ENGINE: Security Boundary + Impact + Severity ───
+        // After provenance chain confirms/inconclusive, run FULL verification:
+        // Detection → Evidence → Security Property → Boundary → Exploitability → Impact → Severity
+        const fullResult = fullVerify(
+          { title: v.title, type: v.type, severity: v.severity, description: v.description, location: v.location },
+          { bodyExcerpt: provenance.response?.bodyExcerpt || '', status: provenance.response?.status || 0, headers: provenance.response?.headers || {} },
+          sourceCode,
+        );
+
+        console.log(`[analyze-job]   Impact engine: verdict=${fullResult.verdict} severity=${fullResult.severity}`);
+        console.log(`[analyze-job]   Boundary: violated=${fullResult.boundary?.boundaryViolated} ownerData=${fullResult.boundary?.isOwnerData}`);
+        console.log(`[analyze-job]   Impact: ${fullResult.impact?.realImpact || 'N/A'}`);
+
+        // Map full verdict to DB status
+        let dbStatus: string;
+        let dbConfidence: number;
+        if (fullResult.verdict === 'EXPECTED_BEHAVIOR') {
+          // Normal app behavior — NOT a vulnerability → DROP
+          console.log(`[analyze-job]   EXPECTED_BEHAVIOR — not a vulnerability, dropping`);
+          vuln.status = 'candidate';
+          vuln.confidence = 0;
+          // Don't increment confirmed — this gets dropped
+        } else if (fullResult.verdict === 'EXPLOITABLE' || fullResult.verdict === 'IMPACT_CONFIRMED') {
+          dbStatus = 'confirmed';
+          dbConfidence = fullResult.confidence.exploitability;
+          await withTimeout(db.vulnerability.update({ where: { id: vuln.id },
+            data: { confidence: dbConfidence, status: dbStatus, validationScope: 'provenance',
+              severity: fullResult.severity,
+              description: vuln.description + `\n\n${fullResult.evidenceChain}` } }), 10_000, null, 'fullVerify vuln.update exploitable');
+          vuln.confidence = dbConfidence;
+          vuln.status = dbStatus;
+          vuln.severity = fullResult.severity;
+          vuln.validationScope = 'provenance';
+          confirmed++;
+          activeValidated++;
+        } else if (fullResult.verdict === 'CONFIRMED_CONFIGURATION' || fullResult.verdict === 'NOT_DIRECTLY_EXPLOITABLE') {
+          // Real finding but not directly exploitable — save as 'validated'
+          // with severity computed from impact (not type)
+          dbStatus = 'validated';
+          dbConfidence = fullResult.confidence.evidence;
+          await withTimeout(db.vulnerability.update({ where: { id: vuln.id },
+            data: { confidence: dbConfidence, status: dbStatus, validationScope: 'provenance',
+              severity: fullResult.severity,
+              description: vuln.description + `\n\n${fullResult.evidenceChain}` } }), 10_000, null, 'fullVerify vuln.update config');
+          vuln.confidence = dbConfidence;
+          vuln.status = dbStatus;
+          vuln.severity = fullResult.severity;
+          vuln.validationScope = 'provenance';
+          confirmed++;
+        } else if (fullResult.verdict === 'OBSERVED') {
+          // Pattern observed but not verified — INCONCLUSIVE for human review
+          dbStatus = 'validated';
+          dbConfidence = 0.5;
+          await withTimeout(db.vulnerability.update({ where: { id: vuln.id },
+            data: { confidence: dbConfidence, status: dbStatus, validationScope: 'provenance',
+              severity: fullResult.severity,
+              description: vuln.description + `\n\n${fullResult.evidenceChain}\n\n⚠ Requires manual verification.` } }), 10_000, null, 'fullVerify vuln.update observed');
+          vuln.confidence = dbConfidence;
+          vuln.status = dbStatus;
+          vuln.severity = fullResult.severity;
+          vuln.validationScope = 'provenance';
+          confirmed++;
+        } else {
+          // DROP — disproven
+          vuln.status = 'candidate';
+          vuln.confidence = 0;
+        }
       } else {
         // DROP — actively disproven (false positive)
         console.log(`[analyze-job]   Provenance DROPPED — security property disproven`);
