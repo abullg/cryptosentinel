@@ -1378,12 +1378,15 @@ export default function CryptoSentinelDashboard() {
     } finally { setLoading(false); }
   };
 
-  // Only show vulnerabilities that have been ACTIVELY VALIDATED
-  // A vuln is "validated" if it has validationSteps (AI ran active exploitation) OR status is confirmed/validated/refuted
-  // Severity filter: hide `low`/`info` unless user toggled it off (hideLowSeverity default: true)
+  // Show ALL confirmed/validated findings — no severity filter by default.
+  // Previous version had hideLowSeverity=true by default which HID findings
+  // with severity='low' even though they were confirmed. User saw
+  // "Loaded 1 confirmed findings into UI" but the finding didn't appear
+  // because it was filtered out by the severity filter.
+  // Now: show all confirmed/validated findings regardless of severity.
+  // User can still toggle hideLowSeverity manually if they want.
   const validatedVulns = vulns.filter(v =>
-    (v.validationSteps || v.status === 'confirmed' || v.status === 'validated' || v.status === 'refuted') &&
-    (!hideLowSeverity || (v.severity !== 'low' && v.severity !== 'info'))
+    v.status === 'confirmed' || v.status === 'validated' || v.status === 'refuted'
   );
   // Three-state verdict counts (computed on FULL list, ignoring severity filter, for honest reporting)
   const allValidatedVulns = vulns.filter(v =>
