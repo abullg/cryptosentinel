@@ -1,9 +1,11 @@
 import { NextResponse } from 'next/server';
-export const maxDuration = 180; // 3 min hard cap (was 10 min — too long)
+export const maxDuration = 60; // 1 min hard cap — was 3 min, way too long
 // analyzeWebApp removed — lightweight fetchWebsite + multi-pass AI in /api/analyze is faster
 import { checkStandardRateLimit } from '@/lib/rate-limit';
 import { isSsrfBlocked } from '@/lib/ssrf';
-import { deepCrawl } from '@/lib/deep-crawler';
+import { simpleFetchUrl } from '@/lib/simple-fetch';
+// Keep deepCrawl import for type compatibility but don't use it
+// import { deepCrawl } from '@/lib/deep-crawler';
 
 /**
  * GitHub API headers — includes Authorization token if GITHUB_TOKEN is set.
@@ -121,19 +123,62 @@ export async function POST(req: Request) {
 
     if (type === 'contract') {
       if (!hostname.includes('github')) {
-        // Non-GitHub contract URL: could be a web app hosting contracts
-        // Use the new web app analyzer for comprehensive analysis
-        return await fetchWebAppWithAI(parsedUrl, true);
+        // Non-GitHub contract URL: use simple fetcher
+        return await simpleFetchUrlHandler(parsedUrl);
       }
       return await fetchGitHubRepo(parsedUrl);
     } else {
-      // Web application analysis: use the new comprehensive analyzer
-      return await fetchWebAppWithAI(parsedUrl);
+      // Web application analysis: SIMPLE fetcher — direct fetch + allorigins fallback
+      return await simpleFetchUrlHandler(parsedUrl);
     }
   } catch (e) {
     console.error('[fetch-url] POST error', e);
     return NextResponse.json({ error: String(e) }, { status: 500 });
   }
+}
+
+/**
+ * SIMPLE URL HANDLER — replaces complex fetchWebAppWithAI
+ * 1. Direct fetch (10s timeout)
+ * 2. allorigins proxy fallback (10s timeout)
+ * 3. If both fail: return clear HTTP 408 error to user
+ *
+ * Total time: max 20s. User ALWAYS gets a response within 30s.
+ * No deep BFS, no multi-proxy, no Wayback, no JS bundle downloads.
+ */
+async function simpleFetchUrlHandler(parsedUrl: URL) {
+  const urlStr = parsedUrl.toString();
+  console.log(`[fetch-url] Simple fetch for ${urlStr}`);
+
+  const result = await simpleFetchUrl(urlStr);
+
+  if (!result.fetched) {
+    // Both fetches failed — return clear error
+    console.warn(`[fetch-url] Fetch failed: ${result.error?.slice(0, 100)}`);
+    return NextResponse.json({
+      error: result.error || `Could not fetch ${urlStr}`,
+    }, { status: 408 });
+  }
+
+  // Success — return crawl data for AI analysis
+  return NextResponse.json({
+    sourceCode: result.sourceCode,
+    contractName: result.contractName,
+    language: 'web',
+    filesCount: 1,
+    totalSize: result.sourceCode.length,
+    url: result.url,
+    title: result.title,
+    scriptsFound: 0,           // not used in simple mode
+    apiEndpointsFound: 0,      // not used in simple mode
+    formsFound: 0,             // not used in simple mode
+    wafDetected: false,
+    reconType: `Simple fetch (${result.method})`,
+    // Pass these for analyze-job (active probes can use them)
+    discoveredEndpoints: [],
+    discoveredForms: [],
+    discoveredParams: [],
+  });
 }
 
 /**
