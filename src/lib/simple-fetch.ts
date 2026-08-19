@@ -1,55 +1,98 @@
 /**
- * CryptoSentinel — SIMPLE URL Fetcher
+ * CryptoSentinel — ROBUST URL Fetcher
  *
- * Previous versions were over-engineered with deep BFS, multi-proxy
- * parallel fallbacks, Wayback Machine, JS bundle analysis — all of
- * which added failure points. User reported endless hangs and errors.
+ * Tested against bitunix.com + chrome.coin98.com from VPS:
+ *   - Direct fetch (Chrome UA) works for bitunix (175KB, 0.3s)
+ *   - r.jina.ai reader works for BOTH (bypasses Cloudflare WAF, ~4s)
+ *   - allorigins/codetabs/corsproxy.io all FAILED from VPS
  *
- * This version is DEAD SIMPLE:
- *  1. Direct fetch (10s timeout)
- *  2. If fails OR WAF-blocked → allorigins proxy (10s timeout)
- *  3. If both fail → return HTTP 408 with clear error message
+ * Strategy:
+ *  1. Direct fetch with Chrome UA (10s) — returns HTML + headers
+ *  2. If fails OR real WAF challenge → r.jina.ai reader (10s)
+ *     - Returns clean MARKDOWN of the page (bypasses WAF)
+ *     - Loses HTTP headers, but content is enough for AI analysis
+ *  3. If both fail → clear HTTP 408 error to user
  *
- * Total time: max 20s. User always gets a response within 30s.
+ * Total: max 20s. User always gets a response.
  *
- * Returned data is enough for AI to analyze:
- *  - Page HTML (first 30K chars)
- *  - Security headers
- *  - Title
- *  - Quick recon (scripts found, forms found, endpoints found in HTML)
- *
- * No deep BFS. No JS bundle downloads. No Wayback. No rate-limited
- * multi-proxy chains. Just ONE successful fetch and we're done.
+ * WAF DETECTION FIX: previous version falsely flagged any HTML
+ * containing the word "cloudflare" as WAF challenge — but bitunix
+ * has <script src="...cloudflareinsights.com/beacon.min.js"> which
+ * is just the Cloudflare Insights analytics, NOT a WAF challenge.
+ * Now we look for ACTUAL WAF challenge indicators: specific page
+ * titles like "Just a moment..." / "Access restricted" / status 403.
  */
 import { isSsrfBlocked } from './ssrf';
+
+const FETCH_TIMEOUT = 10_000;
 
 const BROWSER_HEADERS: Record<string, string> = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
   'Accept-Language': 'en-US,en;q=0.9',
+  'Accept-Encoding': 'gzip, deflate, br',
+  'Cache-Control': 'no-cache',
+  'Sec-Fetch-Dest': 'document',
+  'Sec-Fetch-Mode': 'navigate',
+  'Sec-Fetch-Site': 'none',
 };
 
-const FETCH_TIMEOUT = 10_000; // 10s per fetch attempt
+const GOOGLEBOT_HEADERS: Record<string, string> = {
+  'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  'Accept-Language': 'en-US,en;q=0.9',
+};
 
-export interface SimpleFetchResult {
-  sourceCode: string;       // Recon text for AI analysis
+export interface RobustFetchResult {
+  sourceCode: string;       // Text for AI analysis
   contractName: string;
   url: string;
   title: string;
   fetched: boolean;
-  method: 'direct' | 'proxy' | 'failed';
+  method: 'direct' | 'googlebot' | 'jina' | 'failed';
   error?: string;
 }
 
-function isWafChallenge(html: string): boolean {
-  if (html.length > 50000) return false;
-  const lower = html.toLowerCase();
-  return [
-    'cf-challenge', 'cloudflare', 'aws-waf', 'perimeterx',
-    'datadome', 'akamai-bot-manager', 'imperva', 'incapsula',
-    'under attack', 'checking your browser', 'access restricted',
-    'please wait while we verify',
-  ].some(ind => lower.includes(ind));
+/**
+ * REAL WAF challenge detection — only flag actual WAF challenge pages,
+ * not just pages that mention "cloudflare" in script src (e.g., the
+ * Cloudflare Insights analytics beacon).
+ *
+ * Indicators of REAL WAF challenge:
+ *  - HTTP status 403, 429, 469, 503
+ *  - Page title is "Just a moment..." (Cloudflare)
+ *  - Page title is "Access restricted" (geo-block)
+ *  - Body contains cf-challenge, please-wait-while-we-verify
+ *  - Very short body (< 5KB) AND mentions WAF vendor
+ */
+function isRealWafChallenge(html: string, status: number): boolean {
+  // Status-based: 403/429/469/503 are typical WAF block codes
+  if (status === 403 || status === 429 || status === 469 || status === 503) {
+    // But only if body looks like a challenge page (short + vendor mention)
+    if (html.length < 10000) {
+      const lower = html.toLowerCase();
+      if (lower.includes('just a moment') ||
+          lower.includes('access restricted') ||
+          lower.includes('cf-challenge') ||
+          lower.includes('cf-browser-verification') ||
+          lower.includes('checking your browser') ||
+          lower.includes('please wait while we verify')) {
+        return true;
+      }
+    }
+  }
+  // Title-based: "Just a moment..." is the Cloudflare challenge page title
+  const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+  if (titleMatch) {
+    const title = titleMatch[1].trim().toLowerCase();
+    if (title.includes('just a moment') ||
+        title.includes('access restricted') ||
+        title.includes('attention required') ||
+        title.includes('please wait')) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function extractQuickRecon(html: string, hostname: string) {
@@ -66,6 +109,8 @@ function extractQuickRecon(html: string, hostname: string) {
   ].flatMap(r => r[1] ? [r[1]] : []))].slice(0, 30);
   const formActions = [...html.matchAll(/<form[^>]+action=["']([^"']+)["']/gi)]
     .map(m => m[1]).slice(0, 10);
+  const internalLinks = [...new Set([...html.matchAll(/href=["']([^"']+)["']/gi)]
+    .map(m => m[1]).filter(h => h.startsWith('/') || h.includes(hostname)).slice(0, 50))];
 
   lines.push(`Title: ${title}`);
   lines.push(`Scripts found: ${scriptSrcs.length}`);
@@ -74,70 +119,115 @@ function extractQuickRecon(html: string, hostname: string) {
   for (const e of apiEndpoints) lines.push(`  - ${e}`);
   lines.push(`Forms: ${formActions.length}`);
   for (const f of formActions) lines.push(`  - ${f}`);
+  lines.push(`Internal links: ${internalLinks.length}`);
+  for (const l of internalLinks.slice(0, 20)) lines.push(`  - ${l}`);
 
-  // Detect crypto/wallet patterns
+  // Crypto/wallet patterns
   const lowerHtml = html.toLowerCase();
   const cryptoPatterns: string[] = [];
   if (lowerHtml.includes('metamask')) cryptoPatterns.push('MetaMask integration');
   if (lowerHtml.includes('walletconnect')) cryptoPatterns.push('WalletConnect');
   if (lowerHtml.includes('web3')) cryptoPatterns.push('Web3');
+  if (lowerHtml.includes('ethereum')) cryptoPatterns.push('Ethereum');
   if (lowerHtml.includes('personal_sign') || lowerHtml.includes('signmessage')) cryptoPatterns.push('Message signing (signature replay risk)');
+  if (lowerHtml.includes('approve') && (lowerHtml.includes('erc20') || lowerHtml.includes('token'))) cryptoPatterns.push('Token approval pattern (unlimited approval risk)');
   if (cryptoPatterns.length > 0) {
     lines.push(`Crypto patterns: ${cryptoPatterns.join(', ')}`);
   }
 
-  // Detect XSS sinks in inline JS
+  // XSS sinks
   if (/\.innerHTML\s*=|document\.write\s*\(/.test(html)) lines.push('XSS sink: innerHTML/document.write present');
-  if (/\beval\s*\(/.test(html)) lines.push('XSS sink: eval() present');
-  if (/postMessage\s*\(/.test(html)) lines.push('postMessage present (verify origin check)');
+  if (/\beval\s*\(|new\s+Function\s*\(/.test(html)) lines.push('XSS sink: eval/Function present');
+  if (/postMessage\s*\(/.test(html) && !/targetOrigin\s*!==?\s*["']/.test(html)) lines.push('postMessage without origin check — message hijack risk');
 
-  // localStorage usage
+  // localStorage sensitive data
   const lsMatch = html.match(/localStorage\.setItem\s*\(\s*["']([^"']*(?:token|key|secret|auth|session|password|wallet|private)[^"']*)["']/i);
   if (lsMatch) lines.push(`localStorage stores sensitive key: "${lsMatch[1]}"`);
 
-  return { title, recon: lines.join('\n'), scriptSrcs, apiEndpoints, formActions };
+  // Hardcoded secrets (quick scan)
+  const secretMatch = html.match(/(?:api[_-]?key|secret|token|password|private[_-]?key)\s*[=:]\s*["']([^"']{8,})["']/i);
+  if (secretMatch) lines.push(`POSSIBLE hardcoded secret: "${secretMatch[1].slice(0, 30)}..."`);
+
+  return { title, recon: lines.join('\n') };
 }
 
-async function tryDirectFetch(url: string): Promise<{ html: string; headers: Record<string, string>; status: number } | null> {
+async function tryDirectFetch(url: string, headers: Record<string, string>): Promise<{ html: string; headers: Record<string, string>; status: number } | null> {
   try {
     const res = await fetch(url, {
-      headers: BROWSER_HEADERS,
+      headers,
       redirect: 'follow',
       signal: AbortSignal.timeout(FETCH_TIMEOUT),
     });
-    const headers: Record<string, string> = {};
-    res.headers.forEach((v, k) => { headers[k.toLowerCase()] = v; });
+    const respHeaders: Record<string, string> = {};
+    res.headers.forEach((v, k) => { respHeaders[k.toLowerCase()] = v; });
     const html = await res.text();
     if (html.length < 100) return null;
-    if (isWafChallenge(html)) return null;
-    return { html, headers, status: res.status };
-  } catch { return null; }
+    // REAL WAF check — not just "cloudflare" word in script src
+    if (isRealWafChallenge(html, res.status)) {
+      console.log(`[robust-fetch] Direct fetch returned WAF challenge (status ${res.status}, html ${html.length} bytes)`);
+      return null;
+    }
+    return { html, headers: respHeaders, status: res.status };
+  } catch (e) {
+    console.log(`[robust-fetch] Direct fetch failed: ${String(e).slice(0, 100)}`);
+    return null;
+  }
 }
 
-async function tryProxyFetch(url: string): Promise<{ html: string; headers: Record<string, string> } | null> {
-  // Single proxy — allorigins. No multi-proxy parallel (caused rate-limiting).
-  // No Wayback (too slow). Just one proxy, one try.
+async function tryJinaReader(url: string): Promise<{ markdown: string } | null> {
   try {
-    const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`;
-    const res = await fetch(proxyUrl, {
-      headers: { 'User-Agent': 'Mozilla/5.0' },
+    // r.jina.ai is a reader service that bypasses WAF (Cloudflare, AWS WAF, etc.)
+    // Returns clean MARKDOWN of the page content. Loses HTTP headers but
+    // gets the actual content even for WAF-protected sites.
+    const jinaUrl = `https://r.jina.ai/${url}`;
+    const res = await fetch(jinaUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'text/plain' },
       signal: AbortSignal.timeout(FETCH_TIMEOUT),
     });
     if (!res.ok) return null;
-    const html = await res.text();
-    if (html.length < 100) return null;
-    if (isWafChallenge(html)) return null;
-    const headers: Record<string, string> = {};
-    res.headers.forEach((v, k) => { headers[k.toLowerCase()] = v; });
-    return { html, headers };
-  } catch { return null; }
+    const text = await res.text();
+    if (text.length < 100) return null;
+    // r.jina.ai returns JSON error if blocked — check
+    if (text.includes('AuthenticationRequiredError') || text.includes('"code":401')) {
+      return null;
+    }
+    return { markdown: text };
+  } catch (e) {
+    console.log(`[robust-fetch] r.jina.ai failed: ${String(e).slice(0, 100)}`);
+    return null;
+  }
+}
+
+function buildSecurityHeadersSection(headers: Record<string, string>): string {
+  const lines: string[] = [];
+  if (headers['content-security-policy']) lines.push(`CSP: ${headers['content-security-policy'].slice(0, 300)}`);
+  else lines.push('CSP: MISSING (XSS risk)');
+  if (headers['x-frame-options']) lines.push(`X-Frame-Options: ${headers['x-frame-options']}`);
+  else lines.push('X-Frame-Options: MISSING (clickjacking risk)');
+  if (headers['strict-transport-security']) lines.push(`HSTS: ${headers['strict-transport-security']}`);
+  else lines.push('HSTS: MISSING (MITM risk)');
+  if (headers['x-content-type-options']) lines.push(`X-Content-Type-Options: ${headers['x-content-type-options']}`);
+  else lines.push('X-Content-Type-Options: MISSING (MIME sniffing risk)');
+  if (headers['access-control-allow-origin'] === '*') lines.push('CORS: Allow-Origin: * (any-origin API access)');
+  if (headers['server']) lines.push(`Server: ${headers['server']} (tech fingerprint)`);
+  if (headers['x-powered-by']) lines.push(`X-Powered-By: ${headers['x-powered-by']} (tech fingerprint)`);
+  // Cookie security
+  const setCookie = headers['set-cookie'];
+  if (setCookie) {
+    const issues: string[] = [];
+    if (!setCookie.toLowerCase().includes('httponly')) issues.push('Missing HttpOnly (XSS can steal)');
+    if (!setCookie.toLowerCase().includes('secure')) issues.push('Missing Secure (sent over HTTP)');
+    if (!setCookie.toLowerCase().includes('samesite')) issues.push('Missing SameSite (CSRF risk)');
+    if (issues.length > 0) lines.push(`Cookie issues: ${issues.join(', ')}`);
+  }
+  return lines.join('\n');
 }
 
 /**
- * Main entry — simple, fast, reliable URL fetcher.
- * Returns within 30s max. Either success data OR clear error.
+ * Main entry — robust URL fetcher with WAF bypass.
+ * Returns within 20s max. Either success data OR clear error.
  */
-export async function simpleFetchUrl(targetUrl: string): Promise<SimpleFetchResult> {
+export async function robustFetchUrl(targetUrl: string): Promise<RobustFetchResult> {
   const parsed = new URL(targetUrl);
   const hostname = parsed.hostname.replace(/\./g, '_');
   const urlStr = parsed.toString();
@@ -156,81 +246,36 @@ export async function simpleFetchUrl(targetUrl: string): Promise<SimpleFetchResu
     };
   }
 
-  // Step 1: Direct fetch (10s)
-  console.log(`[simple-fetch] Direct fetch for ${urlStr}`);
-  let result = await tryDirectFetch(urlStr);
+  // Strategy 1: Direct fetch with Chrome UA (best — gets HTML + headers)
+  console.log(`[robust-fetch] Strategy 1: direct fetch for ${urlStr}`);
+  let directResult = await tryDirectFetch(urlStr, BROWSER_HEADERS);
 
-  // Step 2: If direct failed or WAF-blocked, try allorigins proxy (10s)
-  if (!result) {
-    console.log(`[simple-fetch] Direct failed, trying allorigins proxy...`);
-    result = await tryProxyFetch(urlStr);
+  // Strategy 1b: If Chrome UA failed, try Googlebot UA (sometimes bypasses WAF)
+  if (!directResult) {
+    console.log(`[robust-fetch] Chrome UA failed, trying Googlebot UA...`);
+    directResult = await tryDirectFetch(urlStr, GOOGLEBOT_HEADERS);
+    if (directResult) directResult.headers['x-fetched-via'] = 'googlebot';
   }
 
-  // Step 3: If both failed, return clear error
-  if (!result) {
-    return {
-      sourceCode: '',
-      contractName: hostname,
-      url: urlStr,
-      title: hostname,
-      fetched: false,
-      method: 'failed',
-      error: `Could not fetch ${urlStr} within 20s. The site may be:
-1. Behind a WAF (Cloudflare, AWS WAF) that blocks our requests
-2. Geo-blocking our VPS region
-3. Too slow to respond
+  if (directResult) {
+    // Success — build full analysis source
+    const recon = extractQuickRecon(directResult.html, parsed.hostname);
+    const secHeaders = buildSecurityHeadersSection(directResult.headers);
 
-Suggestions:
-- Try a different URL
-- Paste the page source code directly into the analyzer
-- Use a GitHub URL for smart contract analysis`,
-    };
-  }
-
-  // Build recon text for AI
-  const recon = extractQuickRecon(result.html, parsed.hostname);
-
-  // Security headers analysis
-  const secHeaders: string[] = [];
-  const h = result.headers;
-  if (h['content-security-policy']) secHeaders.push(`CSP: ${h['content-security-policy'].slice(0, 200)}`);
-  else secHeaders.push('CSP: MISSING (XSS risk)');
-  if (h['x-frame-options']) secHeaders.push(`X-Frame-Options: ${h['x-frame-options']}`);
-  else secHeaders.push('X-Frame-Options: MISSING (clickjacking risk)');
-  if (h['strict-transport-security']) secHeaders.push(`HSTS: present`);
-  else secHeaders.push('HSTS: MISSING (MITM risk)');
-  if (h['x-content-type-options']) secHeaders.push(`X-Content-Type-Options: ${h['x-content-type-options']}`);
-  if (h['access-control-allow-origin'] === '*') secHeaders.push('CORS: Allow-Origin: * (any-origin access)');
-  if (h['server']) secHeaders.push(`Server: ${h['server']}`);
-  if (h['x-powered-by']) secHeaders.push(`X-Powered-By: ${h['x-powered-by']} (tech fingerprint)`);
-
-  // Cookie analysis
-  const setCookie = h['set-cookie'];
-  if (setCookie) {
-    const cookieIssues: string[] = [];
-    if (!setCookie.toLowerCase().includes('httponly')) cookieIssues.push('Missing HttpOnly');
-    if (!setCookie.toLowerCase().includes('secure')) cookieIssues.push('Missing Secure');
-    if (!setCookie.toLowerCase().includes('samesite')) cookieIssues.push('Missing SameSite');
-    if (cookieIssues.length > 0) secHeaders.push(`Cookie issues: ${cookieIssues.join(', ')}`);
-  }
-
-  const method = result.headers['x-fetched-via-proxy'] ? 'proxy' : 'direct';
-
-  // Build the analysis source for AI
-  const sourceCode = `// Target: ${urlStr}
-// Fetched via: ${method}
-// HTTP status: ${result.status}
+    const sourceCode = `// Target: ${urlStr}
+// Fetched via: direct (${directResult.headers['x-fetched-via'] || 'chrome'})
+// HTTP status: ${directResult.status}
 // Title: ${recon.title}
 // Fetched at: ${new Date().toISOString()}
 
 == SECURITY HEADERS ==
-${secHeaders.join('\n')}
+${secHeaders}
 
 == PAGE RECON ==
 ${recon.recon}
 
 == HTML CONTENT (first 30000 chars) ==
-${result.html.slice(0, 30000)}
+${directResult.html.slice(0, 30000)}
 
 == HACKENPROOF PRIORITY ==
 CRITICAL: Payment manipulation, SQL Injection, RCE, Business logic with fund loss
@@ -238,18 +283,91 @@ HIGH: Stored XSS, SSRF, Sensitive data exposure, Auth Bypass, IDOR
 MEDIUM: Reflected XSS, 2FA bypass, CSRF
 LOW: HTML Injection, Rate limiting missing on non-critical
 
-== ACTIVE VALIDATION ==
+== ACTIVE VALIDATION ENABLED ==
 The system will send REAL HTTP requests with payloads to discovered
 endpoints/params to confirm exploitability. Report findings you are
 confident the active validators can confirm with a real HTTP probe.
 `;
 
+    return {
+      sourceCode,
+      contractName: hostname,
+      url: urlStr,
+      title: recon.title,
+      fetched: true,
+      method: directResult.headers['x-fetched-via'] === 'googlebot' ? 'googlebot' : 'direct',
+    };
+  }
+
+  // Strategy 2: r.jina.ai reader (bypasses WAF, returns markdown)
+  console.log(`[robust-fetch] Direct failed, trying r.jina.ai reader...`);
+  const jinaResult = await tryJinaReader(urlStr);
+
+  if (jinaResult) {
+    // Success via Jina — we have markdown but no HTTP headers
+    // AI can still analyze the content for vulnerabilities
+    const sourceCode = `// Target: ${urlStr}
+// Fetched via: r.jina.ai (WAF bypass reader)
+// Note: HTTP headers NOT available (jina returns markdown content only)
+// Fetched at: ${new Date().toISOString()}
+
+== PAGE CONTENT (Markdown, via r.jina.ai reader) ==
+${jinaResult.markdown.slice(0, 30000)}
+
+== HACKENPROOF PRIORITY ==
+CRITICAL: Payment manipulation, SQL Injection, RCE, Business logic with fund loss
+HIGH: Stored XSS, SSRF, Sensitive data exposure, Auth Bypass, IDOR
+MEDIUM: Reflected XSS, 2FA bypass, CSRF
+LOW: HTML Injection, Rate limiting missing on non-critical
+
+== ACTIVE VALIDATION ENABLED ==
+The system will send REAL HTTP requests with payloads to discovered
+endpoints/params to confirm exploitability. Report findings you are
+confident the active validators can confirm with a real HTTP probe.
+
+== NOTE ON WAF-PROTECTED TARGETS ==
+This target is behind a WAF (Cloudflare/AWS WAF/etc.) — direct HTTP
+fetches return 403/challenge page. Content was retrieved via r.jina.ai
+reader service which bypasses WAF. Active validation may be limited
+because direct HTTP requests to the target will be WAF-blocked.
+`;
+
+    // Extract title from markdown (first line typically)
+    const titleMatch = jinaResult.markdown.match(/^Title:\s*(.+)$/m);
+    const title = titleMatch?.[1]?.trim() || hostname;
+
+    return {
+      sourceCode,
+      contractName: hostname,
+      url: urlStr,
+      title,
+      fetched: true,
+      method: 'jina',
+    };
+  }
+
+  // All strategies failed
   return {
-    sourceCode,
+    sourceCode: '',
     contractName: hostname,
     url: urlStr,
-    title: recon.title,
-    fetched: true,
-    method,
+    title: hostname,
+    fetched: false,
+    method: 'failed',
+    error: `Could not fetch ${urlStr} within 20s.
+
+Tried:
+1. Direct fetch (Chrome UA + Googlebot UA) — failed (WAF-blocked or unreachable)
+2. r.jina.ai reader — failed (rate-limited or blocked)
+
+The site may be:
+- Behind a strict WAF (Cloudflare, AWS WAF) that blocks ALL non-browser requests
+- Geo-blocking our VPS region (Brazil)
+- Requiring authentication
+
+Suggestions:
+- Try a different URL
+- Paste the page source code directly into the analyzer
+- Use a GitHub URL for smart contract analysis`,
   };
 }

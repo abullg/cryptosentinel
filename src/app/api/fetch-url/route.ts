@@ -3,7 +3,7 @@ export const maxDuration = 60; // 1 min hard cap — was 3 min, way too long
 // analyzeWebApp removed — lightweight fetchWebsite + multi-pass AI in /api/analyze is faster
 import { checkStandardRateLimit } from '@/lib/rate-limit';
 import { isSsrfBlocked } from '@/lib/ssrf';
-import { simpleFetchUrl } from '@/lib/simple-fetch';
+import { robustFetchUrl } from '@/lib/simple-fetch';
 // Keep deepCrawl import for type compatibility but don't use it
 // import { deepCrawl } from '@/lib/deep-crawler';
 
@@ -148,12 +148,12 @@ export async function POST(req: Request) {
  */
 async function simpleFetchUrlHandler(parsedUrl: URL) {
   const urlStr = parsedUrl.toString();
-  console.log(`[fetch-url] Simple fetch for ${urlStr}`);
+  console.log(`[fetch-url] Robust fetch for ${urlStr}`);
 
-  const result = await simpleFetchUrl(urlStr);
+  const result = await robustFetchUrl(urlStr);
 
   if (!result.fetched) {
-    // Both fetches failed — return clear error
+    // All strategies failed — return clear error
     console.warn(`[fetch-url] Fetch failed: ${result.error?.slice(0, 100)}`);
     return NextResponse.json({
       error: result.error || `Could not fetch ${urlStr}`,
@@ -161,6 +161,7 @@ async function simpleFetchUrlHandler(parsedUrl: URL) {
   }
 
   // Success — return crawl data for AI analysis
+  console.log(`[fetch-url] Success via ${result.method}, ${result.sourceCode.length} chars`);
   return NextResponse.json({
     sourceCode: result.sourceCode,
     contractName: result.contractName,
@@ -169,12 +170,11 @@ async function simpleFetchUrlHandler(parsedUrl: URL) {
     totalSize: result.sourceCode.length,
     url: result.url,
     title: result.title,
-    scriptsFound: 0,           // not used in simple mode
-    apiEndpointsFound: 0,      // not used in simple mode
-    formsFound: 0,             // not used in simple mode
-    wafDetected: false,
-    reconType: `Simple fetch (${result.method})`,
-    // Pass these for analyze-job (active probes can use them)
+    scriptsFound: 0,
+    apiEndpointsFound: 0,
+    formsFound: 0,
+    wafDetected: result.method === 'jina',  // jina means WAF was bypassed
+    reconType: `Robust fetch (${result.method})`,
     discoveredEndpoints: [],
     discoveredForms: [],
     discoveredParams: [],
