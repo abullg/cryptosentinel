@@ -24,22 +24,47 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     // The background job writes progress to /tmp/cs-progress/{jobId}.json
     // every 1s using writeFileSync (fast, non-blocking kernel I/O).
     // Reading this file is instant — no Prisma, no SQLite.
+    //
+    // CRITICAL: do NOT query DB while status is 'running' — SQLite has
+    // 1 connection (single-writer), background analysis holds it during
+    // vulnerability.create/update. DB query here would BLOCK until the
+    // write completes, causing /api/job-status to hang for 10-30s.
+    // Frontend polls every 5s → if response takes >5s → poller piles up →
+    // UI freezes.
+    //
+    // FIX: only query DB when status='completed' (need resultCount).
+    // During 'running', return file data immediately (no DB query).
     const fileState = readProgressFile(id);
     if (fileState) {
       // ─── WATCHDOG ───
-      // If file hasn't been updated in 2 min, the background process is dead.
-      // Mark as failed so UI can show an error instead of spinning.
       const ageMs = Date.now() - (fileState.updatedAt || 0);
       const STALE_THRESHOLD = 2 * 60 * 1000;
       if ((fileState.status === 'running' || fileState.status === 'pending') && ageMs > STALE_THRESHOLD) {
         return NextResponse.json({
           jobId: id, status: 'failed', progress: 100,
           message: 'Failed (watchdog timeout)',
-          error: `Job hasn't been updated in ${Math.round(ageMs / 1000)}s — server likely restarted (deploy/crash/OOM). Please retry.`,
+          error: `Job hasn't been updated in ${Math.round(ageMs / 1000)}s — server likely restarted. Please retry.`,
         }, { headers: cacheBustHeaders });
       }
-      // Try DB for additional fields (resultCount, contractId, projectId) —
-      // but don't block if DB is slow
+
+      // ─── FAST PATH: return file data immediately (NO DB query) ───
+      // During 'running' phase, we don't need resultCount/contractId.
+      // Only query DB when status='completed' (need resultCount for UI).
+      if (fileState.status === 'running' || fileState.status === 'pending') {
+        return NextResponse.json({
+          jobId: id,
+          status: fileState.status,
+          progress: fileState.progress,
+          message: fileState.message,
+          resultCount: 0,  // not available during running — will be set on completion
+          error: null,
+          contractId: null,
+          projectId: null,
+          _source: 'file-fast',
+        }, { headers: cacheBustHeaders });
+      }
+
+      // ─── COMPLETED/FAILED: query DB for resultCount (safe — no more writes) ───
       let dbData: any = null;
       try {
         dbData = await db.analysisJob.findUnique({
@@ -57,7 +82,7 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
         error: dbData?.error ?? null,
         contractId: dbData?.contractId ?? null,
         projectId: dbData?.projectId ?? null,
-        _source: 'file',  // for debugging
+        _source: 'file+db',
       }, { headers: cacheBustHeaders });
     }
 
