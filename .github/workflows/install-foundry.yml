@@ -51,8 +51,10 @@ jobs:
 
             echo ""
             echo "=== 4. Copy static ==="
+            mkdir -p .next/standalone/.next
             cp -rf .next/static .next/standalone/.next/
             cp -rf public .next/standalone/ 2>/dev/null || true
+            ls .next/standalone/.next/static/ | head -5
 
             echo ""
             echo "=== 5. DB + restart PM2 ==="
