@@ -369,13 +369,115 @@ export async function runProvenanceChain(
     const payloadMatch = finding.description.match(/payload[:\s]+["']?([^"'\n]{5,50})/i);
     const payload = payloadMatch?.[1] || '<script>alert(1)</script>';
     securityChecks.push(checkXss(response, payload));
-  } else {
-    // For other types, basic check: did we get a non-error response?
+  } else if (findingType === 'api_leak') {
+    // PROOF CONTRACT for api_leak:
+    // 1. Find EXACT secret value in response body
+    // 2. Value matches REAL secret pattern (sk-/AKIA/ghp_/etc.)
+    // 3. Value is NOT a placeholder/test
+    // 4. If only UUID-like string → likely tracking ID, NOT a secret → DROP
+    //
+    // HTTP 200 proves ONLY that the page is accessible.
+    // It does NOT prove the page contains a leaked credential.
+    const realSecretPatterns: Array<{ regex: RegExp; type: string }> = [
+      { regex: /\bsk-[\w-]{20,}\b/g, type: 'OpenAI/Stripe key' },
+      { regex: /\beyJ[\w-]+\.[\w-]+\.[\w-]+\b/g, type: 'JWT token' },
+      { regex: /\bAKIA[\w]{16}\b/g, type: 'AWS access key ID' },
+      { regex: /\bghp_[\w]{36,}\b/g, type: 'GitHub PAT' },
+      { regex: /\bAIza[\w]{35}\b/g, type: 'Google API key' },
+      { regex: /\bxox[baprs]-[\w-]{10,}\b/g, type: 'Slack token' },
+    ];
+    const placeholderPatterns = /^(sk-test|sk-leaked|sk-fake|sk-placeholder|test|example|demo|sample|your[_-]?api|placeholder|changeme|default|foo|bar|baz|password|secret|token|abc123|123456789)/i;
+    let secretFound = false;
+    let secretEvidence = '';
+    for (const { regex, type } of realSecretPatterns) {
+      const matches = [...response.bodyExcerpt.matchAll(regex)];
+      for (const m of matches) {
+        if (!placeholderPatterns.test(m[0])) {
+          secretFound = true;
+          secretEvidence = `Real ${type} found in response: "${m[0].slice(0, 20)}..."`;
+          break;
+        }
+      }
+      if (secretFound) break;
+    }
+    // Check if finding mentions UUID — likely tracking ID, not secret
+    const findingDesc = (finding.description || '').toLowerCase();
+    const isUuidFinding = findingDesc.includes('uuid') || findingDesc.includes('identifier') ||
+                          findingDesc.includes('tracking') || findingDesc.includes('analytics');
     securityChecks.push({
-      propertyName: 'basic',
-      passed: response.status >= 200 && response.status < 300,
-      reasoning: `Endpoint returned ${response.status}. Basic check — type-specific security property not implemented for "${findingType}".`,
-      evidence: `Status: ${response.status}, body length: ${response.bodyLength}`,
+      propertyName: 'api_leak_proof_contract',
+      passed: secretFound,
+      reasoning: secretFound
+        ? `Real secret pattern detected in HTTP response body — credential exposure confirmed.`
+        : isUuidFinding
+          ? `Finding mentions UUID/identifier — likely a PUBLIC tracking ID, not a credential. HTTP 200 proves only that the page is accessible, NOT that it contains a leaked secret. No real secret pattern (sk-/AKIA/ghp_/etc.) found in response. DROP.`
+          : `No real secret pattern (sk-/AKIA/ghp_/etc.) found in HTTP response. HTTP 200 proves only that the page is accessible, NOT that it contains a leaked credential. DROP.`,
+      evidence: secretEvidence || `Status: ${response.status}, body length: ${response.bodyLength}. No secret patterns detected.`,
+    });
+  } else if (findingType === 'subdomain_takeover') {
+    // PROOF CONTRACT for subdomain_takeover:
+    // 1. Extract subdomain from finding description
+    // 2. DNS check: does subdomain have CNAME to cloud service?
+    // 3. Resource check: is the cloud resource UNCLAIMED (dangling)?
+    // 4. If can't verify DNS → DROP (don't CONFIRM based on HTTP 200)
+    //
+    // "Unregistered domain ≠ subdomain takeover."
+    // Need to prove: DNS → dangling resource → attacker control → app uses it → impact
+    const findingDesc = finding.description || '';
+    const subdomainMatch = findingDesc.match(/([\w.-]+\.(?:fun|fans|link|top|plus|com|net|org|io))/);
+    const subdomain = subdomainMatch?.[1];
+    let dnsCheckPassed = false;
+    let dnsReason = '';
+    if (subdomain) {
+      try {
+        const dns = require('dns').promises;
+        const cnames = await dns.resolveCname(subdomain).catch(() => []);
+        const cloudServices = ['s3.amazonaws.com', 'herokuapp.com', 'github.io', 'azurewebsites.net', 'cloudfront.net', 'storage.googleapis.com'];
+        const hasCloudCNAME = cnames.some(c => cloudServices.some(s => c.includes(s)));
+        if (cnames.length === 0) {
+          dnsReason = `No CNAME record for ${subdomain} — cannot verify subdomain takeover without DNS data.`;
+        } else if (!hasCloudCNAME) {
+          dnsReason = `CNAME for ${subdomain} (${cnames.join(', ')}) does NOT point to a known cloud service — not a takeover candidate.`;
+        } else {
+          // Try to access the subdomain — if it returns "NoSuchBucket" etc., it's dangling
+          try {
+            const subRes = await fetch(`https://${subdomain}`, { signal: AbortSignal.timeout(5000) });
+            const subBody = await subRes.text();
+            if (subBody.includes('NoSuchBucket') || subBody.includes('Repository not found') || subBody.includes('There isn\'t a GitHub Pages site here') || subBody.includes('The specified bucket does not exist')) {
+              dnsCheckPassed = true;
+              dnsReason = `Subdomain ${subdomain} has DANGLING CNAME to unclaimed cloud resource — subdomain takeover CONFIRMED.`;
+            } else {
+              dnsReason = `Subdomain ${subdomain} is accessible (status ${subRes.status}) — resource is CLAIMED, not dangling.`;
+            }
+          } catch {
+            dnsReason = `Could not access ${subdomain} — DNS resolved but resource unreachable. Cannot confirm takeover.`;
+          }
+        }
+      } catch {
+        dnsReason = `DNS lookup failed for ${subdomain}. Cannot verify subdomain takeover without DNS data.`;
+      }
+    } else {
+      dnsReason = `No specific subdomain found in finding description — cannot perform DNS check.`;
+    }
+    securityChecks.push({
+      propertyName: 'subdomain_takeover_proof_contract',
+      passed: dnsCheckPassed,
+      reasoning: dnsReason || 'Subdomain takeover not proven — HTTP 200 does not prove DNS dangling or resource claimability.',
+      evidence: subdomain ? `Subdomain: ${subdomain}` : 'No subdomain identified.',
+    });
+  } else {
+    // NO FALLBACK "basic" CHECK — previous version checked "HTTP 200" and said
+    // CONFIRMED. User correctly identified: "Deterministic provenance ≠
+    // deterministic security proof." HTTP 200 proves ONLY that the page is
+    // accessible, NOT that a vulnerability exists.
+    //
+    // For types WITHOUT a type-specific proof contract → DROP.
+    // We do NOT confirm based on HTTP 200 alone.
+    securityChecks.push({
+      propertyName: 'no_proof_contract',
+      passed: false,
+      reasoning: `No type-specific security-property check implemented for "${findingType}". HTTP ${response.status} proves only that the endpoint is reachable, NOT that a vulnerability exists. Deterministic provenance ≠ deterministic security proof. DROP.`,
+      evidence: `Status: ${response.status}, body length: ${response.bodyLength}. No security property verified.`,
     });
   }
 
