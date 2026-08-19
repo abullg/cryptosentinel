@@ -13,44 +13,8 @@ import { runAnomalyDetection } from '@/lib/anomaly-detector';
 import { runControlFlowAnalysis } from '@/lib/control-flow-analyzer';
 import { runActiveProbes, buildProbeInputsFromCrawl, type PreConfirmedFinding } from '@/lib/active-probe';
 import { rigorVerifyFinding } from '@/lib/rigor-verify';
+import { writeProgressFile } from '@/lib/progress-file';
 import { createHash } from 'crypto';
-import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'fs';
-
-// ─── PROGRESS FILE STORAGE ───
-// SQLite Prisma has a single-writer connection by default. When many
-// concurrent operations try to write (50 parallel HTTP workers saving
-// findings + 15 parallel rigor verifications updating findings +
-// flushTimer writing progress), they queue up at the single connection.
-// If one write hangs (disk I/O, transaction deadlock), ALL writes are
-// blocked — user sees frozen progress forever.
-//
-// FIX: progress updates go to a JSON FILE instead of SQLite. File I/O
-// is non-blocking (uses kernel async I/O, not a serialized connection
-// pool). /tmp/cs-progress/ directory is fast (often tmpfs). The
-// /api/job-status endpoint reads this file FIRST (instant) and falls
-// back to SQLite only if the file is missing.
-const PROGRESS_DIR = '/tmp/cs-progress';
-try { if (!existsSync(PROGRESS_DIR)) mkdirSync(PROGRESS_DIR, { recursive: true }); } catch {}
-
-function progressFilePath(jobId: string): string {
-  return `${PROGRESS_DIR}/${jobId}.json`;
-}
-
-function writeProgressFile(jobId: string, state: { progress: number; message: string; status: string }) {
-  try {
-    writeFileSync(progressFilePath(jobId), JSON.stringify({ ...state, updatedAt: Date.now() }));
-  } catch (e) {
-    console.error('[analyze-job] writeProgressFile failed:', String(e).slice(0, 100));
-  }
-}
-
-export function readProgressFile(jobId: string): { progress: number; message: string; status: string; updatedAt: number } | null {
-  try {
-    if (!existsSync(progressFilePath(jobId))) return null;
-    const data = readFileSync(progressFilePath(jobId), 'utf8');
-    return JSON.parse(data);
-  } catch { return null; }
-}
 
 const CATEGORY_MAP: Record<string, string> = {
   reentrancy: 'Reentrancy', oracle_manipulation: 'Oracle Manipulation',

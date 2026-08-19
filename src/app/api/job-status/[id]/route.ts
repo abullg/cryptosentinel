@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 export const dynamic = 'force-dynamic';
 
 import { db } from '@/lib/db';
-import { readProgressFile } from '../analyze-job/route';
+import { readProgressFile } from '@/lib/progress-file';
 
 /** GET /api/job-status/{id} — Poll analysis job status.
  *  Reads from JSON FILE FIRST (instant, non-blocking) — falls back to
