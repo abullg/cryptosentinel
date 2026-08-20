@@ -689,8 +689,11 @@ async function runAnalysisInBackground(jobId: string, config: {
                   confidence: 0.95,  // oracle-confirmed = deterministic
                   validationScope: 'active-fuzzer',
                   hashSignature: hashSig,
-                  cwe: f.type === 'sqli' ? 'CWE-89' : f.type === 'reflected_xss' ? 'CWE-79' : '',
-                  pocOutline: `Active probe: ${f.payload} → ${f.oracle} oracle confirmed`,
+                  // Embed CWE + PoC outline in the validationSteps field
+                  // (prisma schema doesn't have cwe/pocOutline as separate
+                  // fields — was causing 'Invalid prisma.vulnerability.create()'
+                  // errors, so all confirmed findings were lost!)
+                  validationSteps: `[CWE ${f.type === 'sqli' ? '89' : f.type === 'reflected_xss' || f.type === 'stored_xss' ? '79' : f.type === 'command_injection' ? '78' : f.type === 'file_inclusion' || f.type === 'file_upload' ? '434' : f.type === 'csrf' ? '352' : '?'}] Active probe: ${f.payload} → ${f.oracle} oracle confirmed`,
                 } as any,
               }), 10_000, null, 'fuzzer vuln.create');
               if (fuzzVuln) {
