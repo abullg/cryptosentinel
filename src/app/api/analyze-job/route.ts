@@ -18,6 +18,7 @@ import { withTimeout, fireAndForget } from '@/lib/with-timeout';
 import { checkPassiveEvidence } from '@/lib/passive-evidence';
 import { runProvenanceChain } from '@/lib/provenance-chain';
 import { fullVerify } from '@/lib/impact-engine';
+import { isolateEvidence, verifyEvidenceIsolation } from '@/lib/evidence-isolation';
 import { createHash } from 'crypto';
 
 const CATEGORY_MAP: Record<string, string> = {
@@ -806,17 +807,34 @@ async function runValidationOnFindings(
       const findingType = (v.type || '').toLowerCase();
       console.log(`[analyze-job] Validating finding: type="${findingType}" title="${(v.title || '').slice(0, 60)}" — isPassiveType=${PASSIVE_EVIDENCE_TYPES.has(findingType)}`);
 
-      // ─── PASSIVE EVIDENCE CHECK ───
+      // ─── PASSIVE EVIDENCE CHECK (with EVIDENCE ISOLATION) ───
+      // CRITICAL: use ISOLATED evidence context, not full sourceCode.
+      // Previous version searched the ENTIRE sourceCode (containing data
+      // from ALL findings) → finding B could get evidence from finding A.
+      // Now: each finding gets its OWN scoped evidence.
       if (PASSIVE_EVIDENCE_TYPES.has(findingType)) {
-        const evidenceResult = checkPassiveEvidence(findingType, sourceCode, v);
+        // Isolate evidence for THIS finding only
+        const isoCtx = isolateEvidence(
+          { type: v.type, title: v.title, description: v.description, location: v.location, severity: v.severity },
+          sourceCode, // full sourceCode — but isolateEvidence scopes it
+          null, // no HTTP response yet for passive check
+        );
+        const isoCheck = verifyEvidenceIsolation(isoCtx);
+        if (!isoCheck.isIsolated) {
+          console.warn(`[analyze-job]   EVIDENCE CONTAMINATION detected: ${isoCheck.contaminationRisk}`);
+        }
+
+        // Use ISOLATED scopedSourceCode, NOT full sourceCode
+        const evidenceResult = checkPassiveEvidence(findingType, isoCtx.scopedSourceCode, v);
         console.log(`[analyze-job]   Passive evidence: sufficient=${evidenceResult.sufficient} confidence=${evidenceResult.confidence} evidence="${evidenceResult.evidence.slice(0, 80)}"`);
+        console.log(`[analyze-job]   Evidence sources: ${isoCtx.evidenceSources.join(', ')}`);
         if (evidenceResult.sufficient) {
           const label = `[CONFIRMED via passive evidence] ${evidenceResult.evidence}`;
           const newSeverity = evidenceResult.severity || v.severity || 'medium';
           const updateResult = await withTimeout(db.vulnerability.update({ where: { id: vuln.id },
             data: { confidence: evidenceResult.confidence, status: 'validated',
               validationScope: 'passive', severity: newSeverity,
-              description: vuln.description + `\n\n${label}\n\n== RIGOR VERIFICATION (passive) ==\nEvidence: ${evidenceResult.evidence}\nConfidence: ${evidenceResult.confidence}` } }), 10_000, null, 'passive vuln.update');
+              description: vuln.description + `\n\n${label}\n\n== RIGOR VERIFICATION (passive, isolated evidence) ==\nEvidence sources: ${isoCtx.evidenceSources.join(', ')}\nEvidence: ${evidenceResult.evidence}\nConfidence: ${evidenceResult.confidence}` } }), 10_000, null, 'passive vuln.update');
           console.log(`[analyze-job]   DB update result: ${updateResult ? 'SUCCESS' : 'FAILED (null)'} — setting in-memory status='validated'`);
           vuln.confidence = evidenceResult.confidence;
           vuln.status = 'validated';
@@ -853,13 +871,26 @@ async function runValidationOnFindings(
       console.log(`[analyze-job]   Security checks: ${provenance.securityChecks.map((c: any) => `${c.propertyName}=${c.passed === true ? 'PASS' : c.passed === false ? 'FAIL' : 'INCONCLUSIVE'}`).join(', ')}`);
 
       if (provenance.verdict === 'CONFIRMED' || provenance.verdict === 'INCONCLUSIVE') {
-        // ─── IMPACT ENGINE: Security Boundary + Impact + Severity ───
-        // After provenance chain confirms/inconclusive, run FULL verification:
-        // Detection → Evidence → Security Property → Boundary → Exploitability → Impact → Severity
+        // ─── IMPACT ENGINE with EVIDENCE ISOLATION ───
+        // Isolate evidence for THIS finding only — prevent contamination
+        const httpResp = provenance.response
+          ? { bodyExcerpt: provenance.response.bodyExcerpt, status: provenance.response.status, headers: provenance.response.headers }
+          : null;
+        const isoCtx = isolateEvidence(
+          { type: v.type, title: v.title, description: v.description, location: v.location, severity: v.severity },
+          sourceCode,
+          httpResp,
+        );
+        const isoCheck = verifyEvidenceIsolation(isoCtx);
+        if (!isoCheck.isIsolated) {
+          console.warn(`[analyze-job]   EVIDENCE CONTAMINATION in impact engine: ${isoCheck.contaminationRisk}`);
+        }
+        console.log(`[analyze-job]   Evidence isolation: sources=${isoCtx.evidenceSources.join(', ')}`);
+
         const fullResult = fullVerify(
           { title: v.title, type: v.type, severity: v.severity, description: v.description, location: v.location },
-          { bodyExcerpt: provenance.response?.bodyExcerpt || '', status: provenance.response?.status || 0, headers: provenance.response?.headers || {} },
-          sourceCode,
+          { bodyExcerpt: isoCtx.scopedSourceCode, status: httpResp?.status || 0, headers: httpResp?.headers || {} },
+          isoCtx.scopedSourceCode, // ISOLATED, not full sourceCode
         );
 
         console.log(`[analyze-job]   Impact engine: verdict=${fullResult.verdict} severity=${fullResult.severity}`);
