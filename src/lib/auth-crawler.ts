@@ -51,10 +51,12 @@ const DVWA_ENDPOINTS = [
  * Returns cookies string or null if login failed.
  */
 async function loginDvwa(baseUrl: string): Promise<string | null> {
-  console.log(`[auth-crawler] Logging into DVWA at ${baseUrl}/login.php`);
+  // Strip trailing slash to avoid double-slash in URLs
+  const base = baseUrl.replace(/\/+$/, '');
+  console.log(`[auth-crawler] Logging into DVWA at ${base}/login.php`);
 
   // Step 1: GET /login.php to get PHPSESSID + user_token
-  const loginPageRes = await fetch(`${baseUrl}/login.php`, {
+  const loginPageRes = await fetch(`${base}/login.php`, {
     headers: { 'User-Agent': 'CryptoSentinel-AuthCrawler/1.0' },
     signal: AbortSignal.timeout(10_000),
     redirect: 'manual',
@@ -73,12 +75,14 @@ async function loginDvwa(baseUrl: string): Promise<string | null> {
   const loginHtml = await loginPageRes.text();
   const userToken = loginHtml.match(/user_token'\s*value\s*=\s*'([^']+)'/i)?.[1]
     || loginHtml.match(/name="user_token"\s+value="([^"]+)"/i)?.[1]
+    || loginHtml.match(/value='([^']+)'\s+name="user_token"/i)?.[1]
+    || loginHtml.match(/value="([^"]+)"\s+name="user_token"/i)?.[1]
     || '';
   if (!userToken) {
-    console.warn('[auth-crawler] No user_token found in login page');
-    // Try login without token (DVWA low security doesn't always require it)
+    console.warn('[auth-crawler] No user_token found in login page HTML');
+  } else {
+    console.log(`[auth-crawler] Got user_token: ${userToken.slice(0, 8)}...`);
   }
-  console.log(`[auth-crawler] Got user_token: ${userToken ? userToken.slice(0, 8) + '...' : '(none)'}`);
 
   // Step 2: POST /login.php with credentials
   const loginBody = new URLSearchParams({
@@ -88,7 +92,9 @@ async function loginDvwa(baseUrl: string): Promise<string | null> {
     ...(userToken ? { user_token: userToken } : {}),
   }).toString();
 
-  const loginRes = await fetch(`${baseUrl}/login.php`, {
+  console.log(`[auth-crawler] POSTing login with admin/password${userToken ? ' + token' : ' (no token)'}...`);
+
+  const loginRes = await fetch(`${base}/login.php`, {
     method: 'POST',
     headers: {
       'User-Agent': 'CryptoSentinel-AuthCrawler/1.0',
@@ -100,6 +106,8 @@ async function loginDvwa(baseUrl: string): Promise<string | null> {
     signal: AbortSignal.timeout(10_000),
   });
 
+  console.log(`[auth-crawler] Login response: status=${loginRes.status}, location=${loginRes.headers.get('location') || '(none)'}`);
+
   // Check if login succeeded (302 redirect to index.php = success)
   const location = loginRes.headers.get('location') || '';
   if (loginRes.status === 302 && location.includes('index.php')) {
@@ -109,12 +117,13 @@ async function loginDvwa(baseUrl: string): Promise<string | null> {
 
   // Check response body for "Welcome" or "login_failed"
   const loginRespHtml = await loginRes.text();
-  if (loginRespHtml.includes('Welcome') || loginRespHtml.includes('You have logged in')) {
-    console.log('[auth-crawler] ✓ Login successful (Welcome message)');
+  if (loginRespHtml.includes('Welcome') || loginRespHtml.includes('You have logged in') || loginRespHtml.includes('logout.php')) {
+    console.log('[auth-crawler] ✓ Login successful (logout link found in body)');
     return `PHPSESSID=${phpsessid}; security=low`;
   }
 
-  console.warn(`[auth-crawler] Login failed — status ${loginRes.status}, location ${location}`);
+  // Log first 200 chars of response for debugging
+  console.warn(`[auth-crawler] Login failed — status ${loginRes.status}, body starts with: ${loginRespHtml.slice(0, 200)}`);
   return null;
 }
 
@@ -123,8 +132,9 @@ async function loginDvwa(baseUrl: string): Promise<string | null> {
  * GET /security.php with security=low cookie.
  */
 async function setSecurityLow(baseUrl: string, cookies: string): Promise<void> {
+  const base = baseUrl.replace(/\/+$/, '');
   try {
-    await fetch(`${baseUrl}/security.php`, {
+    await fetch(`${base}/security.php`, {
       headers: {
         'User-Agent': 'CryptoSentinel-AuthCrawler/1.0',
         'Cookie': cookies,
@@ -143,8 +153,9 @@ async function setSecurityLow(baseUrl: string, cookies: string): Promise<void> {
  * @returns AuthCrawlResult with endpoints + cookies
  */
 export async function crawlDvwa(baseUrl: string): Promise<AuthCrawlResult> {
+  const base = baseUrl.replace(/\/+$/, '');
   // Step 1: Login
-  const cookies = await loginDvwa(baseUrl);
+  const cookies = await loginDvwa(base);
   if (!cookies) {
     return {
       loggedIn: false,
@@ -155,12 +166,12 @@ export async function crawlDvwa(baseUrl: string): Promise<AuthCrawlResult> {
   }
 
   // Step 2: Set security to low
-  await setSecurityLow(baseUrl, cookies);
+  await setSecurityLow(base, cookies);
 
   // Step 3: Crawl each known endpoint
   const endpoints: AuthEndpoint[] = [];
   for (const ep of DVWA_ENDPOINTS) {
-    const url = `${baseUrl}${ep.path}`;
+    const url = `${base}${ep.path}`;
     try {
       const res = await fetch(url, {
         headers: {
