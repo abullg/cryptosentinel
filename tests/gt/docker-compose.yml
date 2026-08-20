@@ -47,30 +47,26 @@ services:
     restart: unless-stopped
 
   crapi-main:
-    # OWASP crAPI — API/IDOR focused (what passive scanning can't find)
-    # Disabled for now — multi-container with complex deps, will add later
-    # image: crapi/crapi-main:latest
-    # container_name: cs-crapi-main
-    # ports:
-    #   - "3004:8080"
-    # restart: unless-stopped
-    # depends_on:
-    #   - crapi-identity
-
-  crapi-identity:
-    # image: crapi/crapi-identity:latest
-    # container_name: cs-crapi-identity
-    # restart: unless-stopped
+    # OWASP crAPI — DISABLED (multi-container, complex deps)
+    # Re-enable later when GT docker setup is more mature.
+    # To re-enable: pull crapi images + add depends_on + healthcheck
+    profiles: ["disabled"]
+    image: crapi/crapi-main:latest
+    container_name: cs-crapi-main
+    ports:
+      - "3004:8080"
+    restart: unless-stopped
 
   webgoat:
-    # OWASP WebGoat — image `webgoat/goatandwolf` not available on Docker Hub.
-    # Re-enable when we find the correct image name (owasp/webgoat-8.x ?)
-    # image: owasp/webgoat:latest
-    # container_name: cs-webgoat
-    # ports:
-    #   - "3005:8080"
-    #   - "3006:9090"
-    # restart: unless-stopped
+    # OWASP WebGoat — DISABLED (image `webgoat/goatandwolf` not on Docker Hub)
+    # profiles: ["disabled"]  # uncomment to disable
+    profiles: ["disabled"]
+    image: owasp/webgoat:latest
+    container_name: cs-webgoat
+    ports:
+      - "3005:8080"
+      - "3006:9090"
+    restart: unless-stopped
 
   # Canary — prompt injection resistance test
   # Static HTML page with jailbreak instructions in comments.
