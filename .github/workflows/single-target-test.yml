@@ -1,0 +1,142 @@
+name: Single Target Test
+
+# Full-pipeline test against ONE target (bitunix.com by default).
+# Verifies:
+#   1. AI produces findings (fetch-url → analyze-job → validation)
+#   2. passive-evidence fix (Task 23) auto-confirms sufficient findings
+#   3. debug logging (Task 24) shows verdicts per finding
+#
+# Output artifact contains:
+#   - pipeline_output.txt  — API responses (fetch/analyze/vulns)
+#   - pm2_out.log         — last 400 lines of PM2 out.log (debug logging)
+#   - pm2_err.log         — last 200 lines of PM2 error.log
+#   - db_findings.json    — raw vulnerabilities table dump
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: 'Target URL to test'
+        required: false
+        default: 'https://www.bitunix.com/'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p 22 -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Run full pipeline + collect logs
+        run: |
+          HOST="${{ secrets.VPS_HOST }}"
+          USER="${{ secrets.VPS_USER || 'root' }}"
+          TARGET="${{ github.event.inputs.target_url }}"
+          ssh -p 22 -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -i ~/.ssh/id_ed25519 $USER@$HOST "bash -s" <<REMOTE_EOF | tee /tmp/pipeline_output.txt
+          set -e
+          echo "=== TARGET: $TARGET ==="
+          echo "=== \$(date) — Step 1: POST /api/fetch-url ==="
+          FETCH_RESP=\$(curl -s --max-time 30 -X POST http://localhost:3000/api/fetch-url \\
+            -H 'Content-Type: application/json' \\
+            -d "{\"url\":\"$TARGET\",\"type\":\"exchange\"}")
+          echo "\$FETCH_RESP" | head -c 2000
+          echo
+          SOURCE_CODE=\$(echo "\$FETCH_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('sourceCode',''))" 2>/dev/null || echo "")
+          ENDPOINTS=\$(echo "\$FETCH_RESP" | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin).get('discoveredEndpoints',[])))" 2>/dev/null || echo "[]")
+          FORMS=\$(echo "\$FETCH_RESP" | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin).get('discoveredForms',[])))" 2>/dev/null || echo "[]")
+          PARAMS=\$(echo "\$FETCH_RESP" | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin).get('discoveredParams',[])))" 2>/dev/null || echo "[]")
+          CONTRACT_NAME=\$(echo "\$TARGET" | sed -E 's|https?://||' | cut -d/ -f1)
+          echo
+          echo "=== sourceCode length: \${#SOURCE_CODE} ==="
+          echo "=== endpoints: \$ENDPOINTS ==="
+          echo
+          if [ -z "\$SOURCE_CODE" ]; then
+            echo "ERROR: empty sourceCode — abort"
+            exit 1
+          fi
+          
+          echo "=== \$(date) — Step 2: POST /api/analyze-job ==="
+          ANALYZE_RESP=\$(curl -s --max-time 15 -X POST http://localhost:3000/api/analyze-job \\
+            -H 'Content-Type: application/json' \\
+            -d "{\"sourceCode\":\$(echo "\$SOURCE_CODE" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))'),\"contractName\":\"\$CONTRACT_NAME\",\"targetType\":\"exchange\",\"targetUrl\":\"\$TARGET\",\"discoveredEndpoints\":\$ENDPOINTS,\"discoveredForms\":\$FORMS,\"discoveredParams\":\$PARAMS}")
+          echo "\$ANALYZE_RESP" | head -c 500
+          echo
+          JOB_ID=\$(echo "\$ANALYZE_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('jobId',''))" 2>/dev/null || echo "")
+          echo "=== jobId: \$JOB_ID ==="
+          
+          if [ -z "\$JOB_ID" ]; then
+            echo "ERROR: no jobId returned — abort"
+            exit 1
+          fi
+          
+          echo "=== \$(date) — Step 3: Poll /api/job-status/\$JOB_ID (up to 15 min) ==="
+          for i in \$(seq 1 180); do
+            sleep 5
+            STATUS_RESP=\$(curl -s --max-time 10 "http://localhost:3000/api/job-status/\$JOB_ID?t=\$(date +%s)")
+            STATUS=\$(echo "\$STATUS_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
+            PROGRESS=\$(echo "\$STATUS_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('progress',''))" 2>/dev/null || echo "")
+            MESSAGE=\$(echo "\$STATUS_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('message','')[:80])" 2>/dev/null || echo "")
+            if [ \$((i % 6)) -eq 0 ]; then
+              echo "  poll #\$i: status=\$STATUS progress=\$PROGRESS msg=\$MESSAGE"
+            fi
+            if [ "\$STATUS" = "completed" ] || [ "\$STATUS" = "failed" ]; then
+              echo "=== JOB FINISHED at poll #\$i: status=\$STATUS ==="
+              echo "=== Final status payload: ==="
+              echo "\$STATUS_RESP" | head -c 2000
+              echo
+              break
+            fi
+          done
+          
+          echo
+          echo "=== \$(date) — Step 4: GET /api/vulnerabilities ==="
+          VULN_RESP=\$(curl -s --max-time 10 "http://localhost:3000/api/vulnerabilities?t=\$(date +%s)")
+          echo "\$VULN_RESP" | python3 -m json.tool 2>/dev/null | head -200
+          
+          echo
+          echo "=== \$(date) — Step 5: DB dump — raw findings table ==="
+          if [ -f /opt/cryptosentinel/db/custom.db ]; then
+            DB_FILE=/opt/cryptosentinel/db/custom.db
+          elif [ -f /opt/cryptosentinel/prisma/dev.db ]; then
+            DB_FILE=/opt/cryptosentinel/prisma/dev.db
+          else
+            DB_FILE=\$(find /opt/cryptosentinel -name "*.db" -type f 2>/dev/null | head -1)
+          fi
+          echo "DB file: \$DB_FILE"
+          if [ -n "\$DB_FILE" ]; then
+            sqlite3 "\$DB_FILE" "SELECT id, type, severity, status, title, confidence, validationScope FROM Vulnerability ORDER BY createdAt DESC LIMIT 20;" 2>&1 || echo "sqlite3 query failed"
+          fi
+          
+          echo
+          echo "=== \$(date) — Step 6: PM2 OUT (last 400 lines) ==="
+          tail -400 /var/log/cryptosentinel/out.log 2>/dev/null
+          echo
+          echo "=== \$(date) — Step 7: PM2 ERR (last 200 lines) ==="
+          tail -200 /var/log/cryptosentinel/error.log 2>/dev/null
+          echo
+          echo "=== DONE ==="
+          REMOTE_EOF
+          
+          # Split the captured output into separate artifact files for easier analysis.
+          mkdir -p /tmp/artifacts
+          cp /tmp/pipeline_output.txt /tmp/artifacts/pipeline_output.txt
+          
+          # Extract PM2 OUT section (between markers)
+          awk '/=== Step 6: PM2 OUT/,/=== Step 7: PM2 ERR/' /tmp/pipeline_output.txt > /tmp/artifacts/pm2_out.log 2>/dev/null || true
+          awk '/=== Step 7: PM2 ERR/,/=== DONE ===/' /tmp/pipeline_output.txt > /tmp/artifacts/pm2_err.log 2>/dev/null || true
+          
+          # Extract DB dump section if present
+          awk '/=== Step 5: DB dump/,/=== Step 6: PM2 OUT/' /tmp/pipeline_output.txt > /tmp/artifacts/db_dump.txt 2>/dev/null || true
+          
+          ls -la /tmp/artifacts/
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: single-target-results
+          path: /tmp/artifacts/
