@@ -23,44 +23,60 @@ jobs:
           HOST="${{ secrets.VPS_HOST }}"
           USER="${{ secrets.VPS_USER || 'root' }}"
           ssh -p 22 -o StrictHostKeyChecking=no -o ConnectTimeout=60 -i ~/.ssh/id_ed25519 $USER@$HOST "bash -s" <<'REMOTE_EOF' | tee /tmp/check.log
-          set -e
           echo "=== Searching for analyze-job route in deployed code ==="
 
+          echo "--- List /opt/cryptosentinel/ ---"
+          ls -la /opt/cryptosentinel/ 2>&1 | head -20
+
+          echo ""
+          echo "--- List /opt/cryptosentinel/.next/ ---"
+          ls -la /opt/cryptosentinel/.next/ 2>&1 | head -20
+
+          echo ""
+          echo "--- List /opt/cryptosentinel/.next/standalone/ ---"
+          ls -la /opt/cryptosentinel/.next/standalone/ 2>&1 | head -10
+
+          echo ""
+          echo "--- List /opt/cryptosentinel/.next/server/ ---"
+          ls -la /opt/cryptosentinel/.next/server/ 2>&1 | head -20
+
+          echo ""
+          echo "--- List /opt/cryptosentinel/.next/server/app/ ---"
+          ls -la /opt/cryptosentinel/.next/server/app/ 2>&1 | head -20
+
+          echo ""
+          echo "--- List /opt/cryptosentinel/.next/server/app/api/ ---"
+          ls -la /opt/cryptosentinel/.next/server/app/api/ 2>&1 | head -30
+
+          echo ""
+          echo "--- List /opt/cryptosentinel/.next/server/app/api/analyze-job/ ---"
+          ls -la /opt/cryptosentinel/.next/server/app/api/analyze-job/ 2>&1
+
+          echo ""
           echo "--- Find ALL .js files in .next (top 30) ---"
-          find /opt/cryptosentinel/.next -name "*.js" -type f 2>/dev/null | head -30
+          find /opt/cryptosentinel/.next -name "*.js" -type f 2>&1 | head -30
 
           echo ""
-          echo "--- List server/app/api directory ---"
-          ls -la /opt/cryptosentinel/.next/server/app/api/ 2>/dev/null
-          ls -la /opt/cryptosentinel/.next/server/app/api/analyze-job/ 2>/dev/null
-
-          echo ""
-          echo "--- Grep 'STATIC-FIRST' in all .js files (recursive, binary too) ---"
-          grep -r --include='*.js' --binary-files=text "STATIC-FIRST" /opt/cryptosentinel/.next/ 2>/dev/null | head -3 || echo "  NOT FOUND"
+          echo "--- Grep 'STATIC-FIRST' in all .js files ---"
+          grep -rn --include='*.js' --binary-files=text "STATIC-FIRST" /opt/cryptosentinel/.next/ 2>&1 | head -5 || true
 
           echo ""
           echo "--- Grep 'DEBUG staticAnalysis' ---"
-          grep -r --include='*.js' --binary-files=text "DEBUG staticAnalysis" /opt/cryptosentinel/.next/ 2>/dev/null | head -3 || echo "  NOT FOUND"
-
-          echo ""
-          echo "--- Grep 'Static analysis:' (fetch-url) ---"
-          grep -r --include='*.js' --binary-files=text "Static analysis:" /opt/cryptosentinel/.next/ 2>/dev/null | head -3 || echo "  NOT FOUND"
-
-          echo ""
-          echo "--- Grep 'analyzeWebWithGLM' ---"
-          grep -r --include='*.js' --binary-files=text "analyzeWebWithGLM" /opt/cryptosentinel/.next/ 2>/dev/null | head -3 || echo "  NOT FOUND"
+          grep -rn --include='*.js' --binary-files=text "DEBUG staticAnalysis" /opt/cryptosentinel/.next/ 2>&1 | head -5 || true
 
           echo ""
           echo "--- Grep 'sourceCode length' (truncation log) ---"
-          grep -r --include='*.js' --binary-files=text "sourceCode length" /opt/cryptosentinel/.next/ 2>/dev/null | head -3 || echo "  NOT FOUND"
+          grep -rn --include='*.js' --binary-files=text "sourceCode length" /opt/cryptosentinel/.next/ 2>&1 | head -5 || true
 
           echo ""
-          echo "--- Grep 'Analysis complete' (final job message) ---"
-          grep -r --include='*.js' --binary-files=text "Analysis complete" /opt/cryptosentinel/.next/ 2>/dev/null | head -3 || echo "  NOT FOUND"
+          echo "--- Grep 'Static analysis:' (fetch-url) ---"
+          grep -rn --include='*.js' --binary-files=text "Static analysis:" /opt/cryptosentinel/.next/ 2>&1 | head -5 || true
 
           echo ""
-          echo "--- PM2 process info ---"
-          pm2 describe cryptosentinel 2>&1 | head -20
+          echo "--- Grep 'analyzeWebWithGLM' ---"
+          grep -rn --include='*.js' --binary-files=text "analyzeWebWithGLM" /opt/cryptosentinel/.next/ 2>&1 | head -5 || true
+
+          echo ""
           echo "=== Done ==="
           REMOTE_EOF
 
