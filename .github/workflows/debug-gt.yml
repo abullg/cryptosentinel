@@ -23,28 +23,55 @@ jobs:
           echo "=== docker ps -a (all containers) ==="
           docker ps -a --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | head -20
           echo ""
-          echo "=== docker images ==="
-          docker images --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}\t{{.CreatedSince}}" | head -20
+          echo "=== docker network ls ==="
+          docker network ls
           echo ""
-          echo "=== docker compose ls ==="
+          echo "=== docker network inspect bridge (subnets) ==="
+          docker network inspect bridge 2>&1 | grep -E "Subnet|Gateway|Name|Containers" | head -20
+          echo ""
+          echo "=== docker inspect cs-webgoat (network settings) ==="
+          docker inspect cs-webgoat --format '{{json .NetworkSettings.IPAddress}} {{json .NetworkSettings.Ports}}' 2>&1
+          echo ""
+          echo "=== docker inspect cs-juice-shop ==="
+          docker inspect cs-juice-shop --format '{{json .NetworkSettings.IPAddress}} {{json .NetworkSettings.Ports}}' 2>&1
+          echo ""
+          echo "=== docker inspect cs-vampi ==="
+          docker inspect cs-vampi --format '{{json .NetworkSettings.IPAddress}} {{json .NetworkSettings.Ports}}' 2>&1
+          echo ""
+          echo "=== iptables -L OUTPUT -n -v --line-numbers ==="
+          iptables -L OUTPUT -n -v --line-numbers 2>&1 | head -40
+          echo ""
+          echo "=== iptables -L INPUT -n -v --line-numbers ==="
+          iptables -L INPUT -n -v --line-numbers 2>&1 | head -30
+          echo ""
+          echo "=== iptables -L FORWARD -n -v --line-numbers ==="
+          iptables -L FORWARD -n -v --line-numbers 2>&1 | head -30
+          echo ""
+          echo "=== ip6tables -L OUTPUT -n -v --line-numbers ==="
+          ip6tables -L OUTPUT -n -v --line-numbers 2>&1 | head -20
+          echo ""
+          echo "=== curl each GT port with explicit IPv4 (127.0.0.1) ==="
+          for port in 3001 3002 3005 3007 3008 3009; do
+            echo "--- 127.0.0.1:$port ---"
+            curl -4 -s -o /dev/null -w "HTTP=%{http_code} time=%{time_total}s\n" --max-time 10 http://127.0.0.1:$port/ 2>&1
+          done
+          echo ""
+          echo "=== curl with explicit IPv6 (::1) ==="
+          for port in 3001 3002 3005 3007 3008 3009; do
+            echo "--- [::1]:$port ---"
+            curl -6 -s -o /dev/null -w "HTTP=%{http_code} time=%{time_total}s\n" --max-time 5 "http://[::1]:$port/" 2>&1
+          done
+          echo ""
+          echo "=== docker compose logs (last 10 lines per service) ==="
           cd /opt/cryptosentinel/tests/gt
-          docker compose ps 2>&1
-          echo ""
-          echo "=== docker compose logs (last 20 lines per service) ==="
           for svc in juice-shop dvwa webgoat vampi canary negative-static; do
             echo "--- $svc ---"
-            docker compose logs --tail=20 $svc 2>&1 | tail -30
+            docker compose logs --tail=10 $svc 2>&1 | tail -15
             echo ""
           done
-          echo "=== curl each GT port ==="
-          for port in 3001 3002 3005 3007 3008 3009; do
-            echo "--- localhost:$port ---"
-            curl -s -o /dev/null -w "HTTP=%{http_code} time=%{time_total}s\n" --max-time 10 http://localhost:$port/ 2>&1
-          done
-          echo ""
-          echo "=== df -h /var/lib/docker (disk space for images) ==="
+          echo "=== df -h /var/lib/docker ==="
           df -h /var/lib/docker /var / 2>&1 | head -10
           echo ""
-          echo "=== free -h (memory) ==="
+          echo "=== free -h ==="
           free -h
           REMOTE_EOF
