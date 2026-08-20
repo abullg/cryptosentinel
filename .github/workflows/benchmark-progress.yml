@@ -1,0 +1,52 @@
+name: Benchmark Progress
+
+# Quick check of benchmark progress by listing /tmp/cs-progress/*.json
+# files on VPS. Each file = one analyze-job with target URL + status.
+# Upload artifact for download.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  progress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p 22 -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: List /tmp/cs-progress files + dump recent
+        run: |
+          HOST="${{ secrets.VPS_HOST }}"
+          USER="${{ secrets.VPS_USER || 'root' }}"
+          mkdir -p /tmp/artifacts
+          ssh -p 22 -o StrictHostKeyChecking=no -o ConnectTimeout=60 -o ServerAliveInterval=30 -i ~/.ssh/id_ed25519 $USER@$HOST "bash -s" <<'REMOTE_EOF' | tee /tmp/artifacts/progress.txt
+          echo "=== $(date -u) ==="
+          echo "=== /tmp/cs-progress/ contents ==="
+          ls -la /tmp/cs-progress/ 2>/dev/null | tail -50
+          echo
+          echo "=== Count: total files vs completed ==="
+          echo "Total files: $(ls /tmp/cs-progress/*.json 2>/dev/null | wc -l)"
+          echo "Completed: $(grep -l '\"status\":\"completed\"' /tmp/cs-progress/*.json 2>/dev/null | wc -l)"
+          echo "Running:   $(grep -l '\"status\":\"running\"' /tmp/cs-progress/*.json 2>/dev/null | wc -l)"
+          echo
+          echo "=== Latest 30 progress files (by mtime) ==="
+          for f in $(ls -t /tmp/cs-progress/*.json 2>/dev/null | head -30); do
+            echo "--- $f ---"
+            cat "$f" 2>/dev/null
+            echo
+          done
+          echo "=== Recent PM2 OUT (last 60 lines, fetch-url only) ==="
+          grep -E 'fetch-url|Success via' /var/log/cryptosentinel/out.log 2>/dev/null | tail -60
+          echo "=== DONE ==="
+          REMOTE_EOF
+
+      - name: Upload progress
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-progress
+          path: /tmp/artifacts/progress.txt
