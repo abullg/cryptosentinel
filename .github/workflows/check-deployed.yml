@@ -1,0 +1,60 @@
+name: Check Deployed Code
+
+# Verify that the deployed .next/standalone server.js contains
+# the latest source code markers (DEBUG logs, static-first check).
+
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p 22 -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Grep deployed server.js for our markers
+        run: |
+          HOST="${{ secrets.VPS_HOST }}"
+          USER="${{ secrets.VPS_USER || 'root' }}"
+          ssh -p 22 -o StrictHostKeyChecking=no -o ConnectTimeout=60 -i ~/.ssh/id_ed25519 $USER@$HOST "bash -s" <<'REMOTE_EOF' | tee /tmp/check.log
+          set -e
+          echo "=== Searching for analyze-job route in deployed code ==="
+
+          # Look for analyze-job compiled route
+          echo "--- Find analyze-job in .next/standalone ---"
+          find /opt/cryptosentinel/.next -name "*.js" -newer /opt/cryptosentinel/package.json 2>/dev/null | head -20
+
+          echo "--- Search for STATIC-FIRST marker in server bundle ---"
+          grep -r "STATIC-FIRST" /opt/cryptosentinel/.next/ 2>/dev/null | head -5
+          echo ""
+          echo "--- Search for DEBUG staticAnalysis marker ---"
+          grep -r "DEBUG staticAnalysis" /opt/cryptosentinel/.next/ 2>/dev/null | head -5
+          echo ""
+          echo "--- Search for 'Static analysis:' marker (fetch-url) ---"
+          grep -r "Static analysis:" /opt/cryptosentinel/.next/ 2>/dev/null | head -5
+          echo ""
+          echo "--- Search for analyzeWebWithGLM ---"
+          grep -r "analyzeWebWithGLM" /opt/cryptosentinel/.next/ 2>/dev/null | head -3
+          echo ""
+          echo "--- ls server.js or chunk files ---"
+          ls -la /opt/cryptosentinel/.next/standalone/ 2>/dev/null | head -10
+          echo ""
+          echo "--- PM2 process info ---"
+          pm2 describe cryptosentinel 2>&1 | head -20
+          echo ""
+          echo "=== Done ==="
+          REMOTE_EOF
+
+      - name: Upload check log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployed-code-check
+          path: /tmp/check.log
+          if-no-files-found: ignore
