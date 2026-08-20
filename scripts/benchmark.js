@@ -12,10 +12,11 @@
  * 
  * Results show: detection rate, validation accuracy, FP indicators
  */
-// Simplified per user request — just Juice Shop (single target, 116 challenges).
-// Focus on recall measurement, not breadth.
+// Simplified per user request — single GT target for recall measurement.
+// Juice-shop was not responding on port 3001 (Docker networking issue).
+// DVWA responds with 302 (login redirect) — use it instead.
 const TARGETS = [
-  'http://localhost:3001/',  // OWASP Juice Shop — 116 challenges, known GT
+  'http://localhost:3002/',  // DVWA — classic SQLi/XSS, known GT, responds 302
 ];
 
 async function benchmark() {
