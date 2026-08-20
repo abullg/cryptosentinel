@@ -573,6 +573,96 @@ async function runAnalysisInBackground(jobId: string, config: {
       } catch (e: any) {
         console.error(`[analyze-job] DEBUG log threw: ${String(e).slice(0, 200)}`);
       }
+
+      // ─── ACTIVE FUZZER (Phase C per Claude §4+§5) ───
+      // Run REAL active fuzzing with deterministic oracles on discovered
+      // endpoints. This is the path that actually finds SQLi/XSS —
+      // LLM-only path generates candidates but can't confirm with proof.
+      //
+      // Per Claude: "строй oracle'ы и не дропай candidates" + "Fuzzing =
+      // corpus, мутации, coverage, oracle'ы (time delay, diff, OOB)"
+      //
+      // Safety: only probe allowlisted targets (localhost GT containers).
+      // Egress iptables allowlist is backup.
+      if (targetUrl && (targetUrl.startsWith('http://localhost') || targetUrl.startsWith('http://127.0.0.1'))) {
+        console.log(`[analyze-job] ACTIVE FUZZER: target is GT localhost — running fuzzers`);
+        try {
+          const { fuzzAllOracles } = await import('../../../lib/active-fuzzer');
+          const { crawlForEndpoints } = await import('../../../lib/endpoint-crawler');
+
+          // 1. Crawl for endpoints
+          const endpoints = crawlForEndpoints(sourceCode, targetUrl);
+          console.log(`[analyze-job]   Crawler found ${endpoints.length} endpoints`);
+          // Probe the main URL + first 5 endpoints
+          const urlsToProbe = [targetUrl, ...endpoints.slice(0, 5).map(e => e.url)];
+
+          // 2. Run active fuzzers on each URL
+          const fuzzFindings: any[] = [];
+          for (const probeUrl of urlsToProbe) {
+            console.log(`[analyze-job]   Fuzzing: ${probeUrl}`);
+            const findings = await fuzzAllOracles(probeUrl);
+            for (const f of findings) {
+              if (f.confirmed) {
+                fuzzFindings.push(f);
+                console.log(`[analyze-job]     ✅ CONFIRMED ${f.type} via ${f.oracle}: ${f.evidence.slice(0, 80)}`);
+              }
+            }
+          }
+
+          // 3. Save confirmed findings from active fuzzer
+          for (const f of fuzzFindings) {
+            try {
+              const hashSig = makeVulnHash(contractId, f.type, `Active fuzzer confirmed: ${f.target}`);
+              const existing = await withTimeout(db.vulnerability.findFirst({ where: { hashSignature: hashSig } }), 10_000, null, 'fuzzer findFirst');
+              if (existing) continue;
+              const fuzzVuln = await withTimeout(db.vulnerability.create({
+                data: {
+                  id: `vuln_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+                  contractId,
+                  type: f.type,
+                  severity: f.severity,
+                  status: 'confirmed',  // Active fuzzer with oracle = high confidence
+                  title: `Active fuzzer: ${f.type} on ${f.target}`,
+                  description: f.evidence,
+                  location: f.target,
+                  codeSnippet: f.payload,
+                  confidence: 0.95,  // oracle-confirmed = deterministic
+                  validationScope: 'active-fuzzer',
+                  hashSignature: hashSig,
+                  cwe: f.type === 'sqli' ? 'CWE-89' : f.type === 'reflected_xss' ? 'CWE-79' : '',
+                  pocOutline: `Active probe: ${f.payload} → ${f.oracle} oracle confirmed`,
+                } as any,
+              }), 10_000, null, 'fuzzer vuln.create');
+              if (fuzzVuln) {
+                savedStatic.push({ vuln: fuzzVuln, rawFinding: f });
+              }
+            } catch (e) {
+              console.warn(`[analyze-job]   Failed to save fuzzer finding: ${String(e).slice(0, 100)}`);
+            }
+          }
+
+          const fuzzConfirmed = fuzzFindings.length;
+          console.log(`[analyze-job] ACTIVE FUZZER complete: ${fuzzConfirmed} confirmed findings from ${urlsToProbe.length} probed URLs`);
+          if (fuzzConfirmed > 0) {
+            // Active fuzzer found real vulns — no need for LLM
+            const confirmedCount = savedStatic.length;
+            await updateJob(100, `Analysis complete (active fuzzer): ${confirmedCount} confirmed via deterministic oracles (time-delay, reflection, error-message). LLM skipped — found real vulns.`);
+            fireAndForget(db.audit.update({ where: { id: auditId }, data: { status: 'completed', findings: confirmedCount, completedAt: new Date() } }), 'catch audit.update fuzzer');
+            fireAndForget(db.analysisJob.update({ where: { id: jobId }, data: { status: 'completed', resultCount: confirmedCount } }), 'catch analysisJob.update fuzzer');
+            writeProgressFile(jobId, { progress: 100, message: `Analysis complete (active fuzzer): ${confirmedCount} confirmed`, status: 'completed' });
+            if (progressInterval) clearInterval(progressInterval);
+            clearInterval(flushTimer); clearInterval(heartbeatTimer);
+            clearTimeout(globalTimeout);
+            clearTimeout(panicTimer);
+            await flushJobNow();
+            console.log(`[analyze-job] ✓ Active fuzzer completion — ${confirmedCount} findings, no LLM call`);
+            return;
+          }
+        } catch (e) {
+          console.error(`[analyze-job] Active fuzzer failed: ${String(e).slice(0, 200)}`);
+        }
+      }
+
       if (sa && sa.skipLLM) {
         console.log(`[analyze-job] STATIC-FIRST: skipping LLM (no sink-hints found in static analysis)`);
         console.log(`[analyze-job]   Static findings: ${sa.findings?.length || 0}, sink-hints: ${sa.sinkHints?.length || 0}, total static time: ${sa.stats?.totalMs || 'N/A'}ms`);

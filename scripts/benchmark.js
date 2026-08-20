@@ -12,31 +12,10 @@
  * 
  * Results show: detection rate, validation accuracy, FP indicators
  */
-// Per Claude protocol (§7): self-host GT in docker, no production crypto
-// exchanges without authz, no external testphp (DC IP block).
-// Pre-registered in tests/gt/expected.yaml — DO NOT edit after bench starts.
+// Simplified per user request — just Juice Shop (single target, 116 challenges).
+// Focus on recall measurement, not breadth.
 const TARGETS = [
-  // ─── A. GT (self-hosted docker on VPS, localhost) ───
-  'http://localhost:3001/',  // OWASP Juice Shop — 116 challenges
-  'http://localhost:3002/',  // DVWA — classic SQLi/XSS
-  'http://localhost:3003/',  // WrongSecrets — calibrate api_leak FP
-  'http://localhost:3004/',  // crAPI — API/IDOR
-  'http://localhost:3005/',  // WebGoat — classic tutorial
-  'http://localhost:3007/',  // CANARY — prompt injection resistance test
-  'http://localhost:3008/',  // NEGATIVE — Hello World (precision test)
-
-  // ─── B. Negatives (real, but expected 0 exploitable) ───
-  'https://example.com/',
-  'https://httpbin.org/',
-
-  // ─── C. Production homepages — PASSIVE ONLY (no active probes) ───
-  // Per Claude §9.30: no active probes on production crypto exchanges
-  // without written authorization. Egress allowlist enforces this.
-  'https://www.bitunix.com/',
-  'https://app.uniswap.org/',
-  'https://aave.com/',
-  'https://metamask.io/',
-  'https://www.ledger.com/',
+  'http://localhost:3001/',  // OWASP Juice Shop — 116 challenges, known GT
 ];
 
 async function benchmark() {

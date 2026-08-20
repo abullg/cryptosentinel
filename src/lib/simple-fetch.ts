@@ -25,6 +25,9 @@
 import { isSsrfBlocked } from './ssrf';
 
 const FETCH_TIMEOUT = 10_000;
+// GT (Ground Truth) docker containers on localhost may take longer to start
+// (juice-shop Node.js boot is ~30s). Allow 60s for localhost targets.
+const FETCH_TIMEOUT_GT = 60_000;
 
 const BROWSER_HEADERS: Record<string, string> = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
@@ -153,10 +156,13 @@ function extractQuickRecon(html: string, hostname: string) {
 
 async function tryDirectFetch(url: string, headers: Record<string, string>): Promise<{ html: string; headers: Record<string, string>; status: number } | null> {
   try {
+    // Use longer timeout for GT (localhost) targets — juice-shop is slow to boot
+    const isGt = url.startsWith('http://localhost') || url.startsWith('http://127.0.0.1');
+    const timeout = isGt ? FETCH_TIMEOUT_GT : FETCH_TIMEOUT;
     const res = await fetch(url, {
       headers,
       redirect: 'follow',
-      signal: AbortSignal.timeout(FETCH_TIMEOUT),
+      signal: AbortSignal.timeout(timeout),
     });
     const respHeaders: Record<string, string> = {};
     res.headers.forEach((v, k) => { respHeaders[k.toLowerCase()] = v; });
