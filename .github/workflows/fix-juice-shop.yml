@@ -1,0 +1,66 @@
+name: Fix Juice Shop Network
+
+on:
+  workflow_dispatch:
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p 22 -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Full recreate juice-shop network
+        run: |
+          HOST="${{ secrets.VPS_HOST }}"
+          USER="${{ secrets.VPS_USER || 'root' }}"
+          ssh -p 22 -o StrictHostKeyChecking=no -o ConnectTimeout=60 -i ~/.ssh/id_ed25519 $USER@$HOST "bash -s" <<'REMOTE_EOF' | tee /tmp/fix.log
+          echo "=== 1. docker compose down (full network recreate) ==="
+          cd /opt/cryptosentinel/tests/gt
+          docker compose down 2>&1 | tail -10
+
+          echo ""
+          echo "=== 2. docker compose up -d ==="
+          docker compose up -d --no-deps 2>&1 | tail -10
+
+          echo "=== Waiting 90s for juice-shop to start ==="
+          sleep 90
+
+          echo ""
+          echo "=== 3. Check container IP + DOCKER iptables ==="
+          CONTAINER_IP=$(docker inspect cs-juice-shop --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null)
+          echo "Container IP: $CONTAINER_IP"
+
+          echo ""
+          echo "=== iptables DOCKER chain (should have rule for container IP) ==="
+          iptables -L DOCKER -n --line-numbers 2>&1 | head -10
+
+          echo ""
+          echo "=== 4. curl --http1.1 http://127.0.0.1:3001/ ==="
+          curl -v --http1.1 --max-time 30 http://127.0.0.1:3001/ 2>&1 | head -20
+
+          echo ""
+          echo "=== 5. curl http://127.0.0.1:3001/rest/products/search ==="
+          curl -s --max-time 30 http://127.0.0.1:3001/rest/products/search 2>&1 | head -5
+          echo "Exit: $?"
+
+          echo ""
+          echo "=== 6. docker logs (last 10) ==="
+          docker logs cs-juice-shop --tail 10 2>&1
+
+          echo ""
+          echo "=== DONE ==="
+          REMOTE_EOF
+
+      - name: Upload fix log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fix-juice-shop
+          path: /tmp/fix.log
+          if-no-files-found: ignore
