@@ -46,19 +46,19 @@ jobs:
           # Per Claude §9.30: GT is self-hosted in docker (localhost:3001-3008)
           # Egress iptables allowlist (already applied) provides backup defense
           # against prompt-injection-driven SSRF.
-          echo "=== Setting GT_ALLOWLIST_ENABLED=true in PM2 env ==="
-          # Add env var to PM2 ecosystem file if not present
-          ECOSYSTEM_FILE=/opt/cryptosentinel/ecosystem.config.cjs
-          if [ -f "$ECOSYSTEM_FILE" ]; then
-            if ! grep -q "GT_ALLOWLIST_ENABLED" "$ECOSYSTEM_FILE"; then
-              echo "Adding GT_ALLOWLIST_ENABLED to ecosystem.config.cjs"
-              sed -i 's/env: {/env: {\n        GT_ALLOWLIST_ENABLED: "true",/' "$ECOSYSTEM_FILE"
+          echo "=== Setting GT_ALLOWLIST_ENABLED=true for PM2 process ==="
+          # Try ecosystem.config.js (not .cjs — file extension matters!)
+          for ECOSYSTEM_FILE in /opt/cryptosentinel/ecosystem.config.js /opt/cryptosentinel/ecosystem.config.cjs; do
+            if [ -f "$ECOSYSTEM_FILE" ]; then
+              if ! grep -q "GT_ALLOWLIST_ENABLED" "$ECOSYSTEM_FILE"; then
+                echo "Adding GT_ALLOWLIST_ENABLED to $ECOSYSTEM_FILE"
+                sed -i 's/env: {/env: {\n        GT_ALLOWLIST_ENABLED: "true",/' "$ECOSYSTEM_FILE"
+              fi
+              echo "Verified GT_ALLOWLIST_ENABLED in $ECOSYSTEM_FILE:"
+              grep "GT_ALLOWLIST_ENABLED" "$ECOSYSTEM_FILE"
+              break
             fi
-            grep "GT_ALLOWLIST_ENABLED" "$ECOSYSTEM_FILE" || echo "GT_ALLOWLIST_ENABLED=true"
-          else
-            # Set via PM2 env directly
-            pm2 set cryptosentinel:GT_ALLOWLIST_ENABLED true 2>/dev/null || true
-          fi
+          done
 
           # Restart PM2 to pick up env change
           echo "=== Restarting PM2 ==="
