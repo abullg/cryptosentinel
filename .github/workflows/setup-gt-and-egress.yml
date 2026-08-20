@@ -97,6 +97,13 @@ jobs:
             # Allow NTP
             iptables -A OUTPUT -p udp --dport 123 -j ACCEPT -m comment --comment "cs-egress-allow-ntp"
 
+            # Allow GT docker ports (3001-3008) — Docker port-forwarded traffic
+            # goes through docker0 after DNAT, not lo. Without this, the REJECT
+            # rule blocks all GT container access (juice-shop, dvwa, canary, negative).
+            for gt_port in 3001 3002 3003 3004 3005 3007 3008; do
+              iptables -A OUTPUT -p tcp --dport $gt_port -j ACCEPT -m comment --comment "cs-egress-allow-gt-port-$gt_port"
+            done
+
             # Allow HTTPS to github.com (for git pull, deps)
             # (covered by 443 above)
 
