@@ -564,6 +564,8 @@ async function runAnalysisInBackground(jobId: string, config: {
       // V3 of analyze-job: read staticAnalysis from POST body
       // (was: re-run static analysis here. But fetch-url already did it.)
       const sa = (reqBody as any)?.staticAnalysis;
+      // DEBUG: log what we got from staticAnalysis field (to diagnose why static-first isn't triggering)
+      console.log(`[analyze-job] DEBUG staticAnalysis: sa=${sa ? 'object' : 'null/undefined'}, keys=${sa ? Object.keys(sa).join(',') : 'N/A'}, skipLLM=${sa?.skipLLM}, sinkHints.len=${sa?.sinkHints?.length || 0}`);
       if (sa && sa.skipLLM) {
         console.log(`[analyze-job] STATIC-FIRST: skipping LLM (no sink-hints found in static analysis)`);
         console.log(`[analyze-job]   Static findings: ${sa.findings?.length || 0}, sink-hints: ${sa.sinkHints?.length || 0}, total static time: ${sa.stats?.totalMs || 'N/A'}ms`);

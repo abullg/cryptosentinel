@@ -204,6 +204,7 @@ async function simpleFetchUrlHandler(parsedUrl: URL) {
     staticAnalysis: staticAnalysis ? {
       findings: staticAnalysis.findings,
       sinkHints: staticAnalysis.sinkHints,
+      llmContext: staticAnalysis.llmContext,  // ←4K sink-driven context for LLM
       skipLLM: staticAnalysis.skipLLM,
       stats: staticAnalysis.stats,
     } : null,
