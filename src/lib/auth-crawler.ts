@@ -115,6 +115,61 @@ async function loginDvwa(baseUrl: string): Promise<string | null> {
     return `PHPSESSID=${phpsessid}; security=low`;
   }
 
+  // DVWA redirects to setup.php if DB not initialized — auto-setup
+  if (loginRes.status === 302 && location.includes('setup.php')) {
+    console.log('[auth-crawler] DVWA needs DB setup — auto-initializing...');
+    // GET setup.php to see the form
+    const setupRes = await fetch(`${base}/setup.php`, {
+      headers: { 'User-Agent': 'CryptoSentinel-AuthCrawler/1.0', 'Cookie': `PHPSESSID=${phpsessid}; security=low` },
+      signal: AbortSignal.timeout(10_000),
+    });
+    const setupHtml = await setupRes.text();
+    // Extract create_db token if present
+    const createToken = setupHtml.match(/user_token'\s*value\s*=\s*'([^']+)'/i)?.[1]
+      || setupHtml.match(/name="user_token"\s+value="([^"]+)"/i)?.[1]
+      || '';
+    console.log(`[auth-crawler] Setup token: ${createToken ? createToken.slice(0, 8) + '...' : '(none)'}`);
+
+    // POST to setup.php to create/reset DB
+    const setupBody = new URLSearchParams({
+      create_db: '1',
+      ...(createToken ? { user_token: createToken } : {}),
+    }).toString();
+    const createRes = await fetch(`${base}/setup.php`, {
+      method: 'POST',
+      headers: {
+        'User-Agent': 'CryptoSentinel-AuthCrawler/1.0',
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Cookie': `PHPSESSID=${phpsessid}; security=low`,
+      },
+      body: setupBody,
+      signal: AbortSignal.timeout(15_000),
+    });
+    const createHtml = await createRes.text();
+    if (createHtml.includes('Database has been created') || createHtml.includes('created') || createRes.status === 200) {
+      console.log('[auth-crawler] ✓ Database created — retrying login...');
+    }
+
+    // Retry login with same session
+    const loginRes2 = await fetch(`${base}/login.php`, {
+      method: 'POST',
+      headers: {
+        'User-Agent': 'CryptoSentinel-AuthCrawler/1.0',
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Cookie': `PHPSESSID=${phpsessid}; security=low`,
+      },
+      body: loginBody,
+      redirect: 'manual',
+      signal: AbortSignal.timeout(10_000),
+    });
+    const location2 = loginRes2.headers.get('location') || '';
+    console.log(`[auth-crawler] Retry login: status=${loginRes2.status}, location=${location2 || '(none)'}`);
+    if (loginRes2.status === 302 && location2.includes('index.php')) {
+      console.log('[auth-crawler] ✓ Login successful after DB setup!');
+      return `PHPSESSID=${phpsessid}; security=low`;
+    }
+  }
+
   // Check response body for "Welcome" or "login_failed"
   const loginRespHtml = await loginRes.text();
   if (loginRespHtml.includes('Welcome') || loginRespHtml.includes('You have logged in') || loginRespHtml.includes('logout.php')) {

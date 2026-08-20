@@ -680,7 +680,7 @@ async function runAnalysisInBackground(jobId: string, config: {
           }
 
           const fuzzConfirmed = fuzzFindings.length;
-          console.log(`[analyze-job] ACTIVE FUZZER complete: ${fuzzConfirmed} confirmed findings from ${urlsToProbe.length} probed URLs`);
+          console.log(`[analyze-job] ACTIVE FUZZER complete: ${fuzzConfirmed} confirmed findings from ${allEndpoints.length} probed URLs`);
           if (fuzzConfirmed > 0) {
             // Active fuzzer found real vulns — no need for LLM
             const confirmedCount = savedStatic.length;
