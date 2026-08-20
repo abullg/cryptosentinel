@@ -54,7 +54,11 @@ export async function POST(req: NextRequest) {
     const apiKey = process.env.OPENROUTER_API_KEY || settings?.apiKey || '';
     const model = settings?.model || DEFAULT_MODEL;
 
-    if (!apiKey || !apiKey.startsWith('sk-or-v1-')) {
+    // For GT (localhost) targets, API key is NOT required — static-first
+    // pipeline + active fuzzer can complete without LLM.
+    // Only production targets need LLM (and thus API key).
+    const isGtTarget = targetUrl && (targetUrl.startsWith('http://localhost') || targetUrl.startsWith('http://127.0.0.1'));
+    if (!isGtTarget && (!apiKey || !apiKey.startsWith('sk-or-v1-'))) {
       return NextResponse.json({ error: 'OpenRouter API key not configured' }, { status: 401 });
     }
 
