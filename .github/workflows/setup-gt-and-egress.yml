@@ -109,35 +109,41 @@ jobs:
           # at the END of OUTPUT chain (after the REJECT rule). The docker
           # bridge subnet rule was at position 180, AFTER REJECT at position 10,
           # so packets were rejected before reaching it.
-          # Fix: delete all cs-egress-* rules, then re-add them in correct order.
+          # Fix: use iptables-save + grep filter + iptables-restore to
+          # remove ALL cs-egress-* rules from OUTPUT chain in one shot.
+          # (Per-rule iptables -D didn't work because rules had extra params
+          # like -o lo, -p tcp that the delete command didn't specify.)
           echo "=== Flushing all cs-egress-* rules from OUTPUT chain ==="
-          # Loop deletion — iptables -D removes one instance at a time
-          for comment_match in \
-            "cs-egress-allow-loopback" \
-            "cs-egress-allow-established" \
-            "cs-egress-allow-dns-udp" \
-            "cs-egress-allow-dns-tcp" \
-            "cs-egress-allow-http" \
-            "cs-egress-allow-https" \
-            "cs-egress-allow-ssh" \
-            "cs-egress-allow-ntp" \
-            "cs-egress-allow-docker-bridge-subnet" \
-            "cs-egress-allow-docker0-iface" \
-            "cs-egress-deny-default"; do
-            while iptables -D OUTPUT -m comment --comment "$comment_match" 2>/dev/null; do
-              echo "  deleted $comment_match"
-            done
-          done
-          # Delete GT port rules
-          for gt_port in 3001 3002 3003 3004 3005 3006 3007 3008 3009; do
-            while iptables -D OUTPUT -p tcp --dport $gt_port -m comment --comment "cs-egress-allow-gt-port-$gt_port" 2>/dev/null; do
-              echo "  deleted gt-port-$gt_port"
-            done
-          done
-          # Delete br-* interface rules
-          for br_iface in br-0 br-1 br-2 br-3 br-4 br-5 br-6 br-7 br-8 br-9; do
-            while iptables -D OUTPUT -o "$br_iface"+ -m comment --comment "cs-egress-allow-$br_iface-iface" 2>/dev/null; do :; done
-          done
+          iptables-save > /tmp/iptables-before-flush.bak
+          # Filter: keep all lines EXCEPT those in OUTPUT chain with cs-egress- comment
+          python3 << 'PYEOF' > /tmp/iptables-filtered.txt
+          import sys
+          lines = open('/tmp/iptables-before-flush.bak').read().split('\n')
+          in_output = False
+          out = []
+          for line in lines:
+              if line.startswith('*'):
+                  in_output = False
+                  out.append(line)
+                  continue
+              if line.startswith(':OUTPUT'):
+                  in_output = True
+                  out.append(line)
+                  continue
+              if line.startswith('COMMIT') or (line.startswith(':') and not line.startswith(':OUTPUT')):
+                  in_output = False
+                  out.append(line)
+                  continue
+              # Skip rules in OUTPUT chain that have cs-egress- comment
+              if in_output and '--comment "cs-egress-' in line:
+                  continue
+              if in_output and "--comment cs-egress-" in line:
+                  continue
+              out.append(line)
+          print('\n'.join(out))
+          PYEOF
+          # Restore filtered rules
+          iptables-restore < /tmp/iptables-filtered.txt 2>&1 | head -5 || true
           echo "=== Flush complete ==="
 
           echo "=== Applying CryptoSentinel egress allowlist (fresh) ==="
