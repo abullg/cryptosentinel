@@ -346,8 +346,12 @@ export function fullVerify(
   if (findingType === 'csp_missing') {
     // CSP missing = confirmed configuration, not exploitable
     verdict = 'CONFIRMED_CONFIGURATION';
-  } else if (boundary?.isPublicByDesign) {
-    // Public by design = expected behavior
+  } else if (boundary?.isPublicByDesign && boundary?.isOwnerData) {
+    // Public by design + own data = NOT a vuln but worth noting (informational)
+    // User assessment: "Severity Low: 🟢 Reasonable" — KEEP, don't drop
+    verdict = 'NOT_DIRECTLY_EXPLOITABLE';
+  } else if (boundary?.isPublicByDesign && !boundary?.isOwnerData) {
+    // Public by design but NOT own data (e.g., public API docs) = expected
     verdict = 'EXPECTED_BEHAVIOR';
   } else if (boundary?.boundaryViolated && !boundary.isOwnerData) {
     // Cross-user data without auth = exploitable
