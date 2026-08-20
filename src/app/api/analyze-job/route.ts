@@ -626,7 +626,7 @@ async function runAnalysisInBackground(jobId: string, config: {
     for (const v of aiVulns) {
       const sev = (v.severity || 'medium').toLowerCase();
       const isLow = sev === 'low' || sev === 'info';
-      const allowedLowTypes = new Set(['api_leak', 'info_exposure']);
+      const allowedLowTypes = new Set(['api_leak', 'info_exposure', 'information_disclosure']);
       const hasConcreteChain = /(\bRCE\b|data exfiltrat|fund theft|wallet drain|credential leak|private key|mnemonic)/i.test(v.description || '');
       if (isLow && !allowedLowTypes.has((v.type || '').toLowerCase()) && !hasConcreteChain) {
         droppedLowSeverity++;
@@ -777,6 +777,7 @@ async function runAnalysisInBackground(jobId: string, config: {
 const PASSIVE_EVIDENCE_TYPES = new Set([
   'csp_missing',
   'info_exposure',
+  'information_disclosure', // AI sometimes uses this synonym for info_exposure
   'api_leak',
   'cors_misconfig',
   'clickjacking',

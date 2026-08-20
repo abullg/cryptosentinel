@@ -297,6 +297,7 @@ export const PASSIVE_EVIDENCE_CHECKERS: Record<string, EvidenceChecker> = {
   cors_misconfig: checkCorsMisconfig,
   api_leak: checkApiLeak,
   info_exposure: checkInfoExposure,
+  information_disclosure: checkInfoExposure, // AI synonym — same handler
   clickjacking: checkClickjacking,
   hsts_missing: checkHstsMissing,
   cookie_security: checkCookieSecurity,
