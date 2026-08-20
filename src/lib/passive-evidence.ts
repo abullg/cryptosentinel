@@ -29,6 +29,7 @@ export interface EvidenceResult {
   evidence: string;      // human-readable explanation of why this is/isn't sufficient
   confidence: number;    // 0.0 - 1.0
   severity?: string;     // override severity based on evidence strength
+  dropReason?: string;   // if sufficient=false, why this should be dropped (for histogram)
 }
 
 export type EvidenceChecker = (sourceCode: string, finding: any) => EvidenceResult;
@@ -94,6 +95,12 @@ const checkCorsMisconfig: EvidenceChecker = (sc) => {
 const checkApiLeak: EvidenceChecker = (sc, finding) => {
   // For api_leak: sufficient evidence = REAL secret pattern in JS bundle.
   // NOT placeholders like 'your_api_key_here' or 'sk-test'.
+  //
+  // Post Claude-audit (§6): every CRITICAL api_leak must publish its matched
+  // string (redacted prefix + length + entropy + first/last 3 chars) so the
+  // finding can be audited. Without matched string, finding does not exist.
+  // This catches false positives like example.com CRITICAL api_leak (where
+  // no real secret can exist).
   const realSecretPatterns: Array<{ regex: RegExp; type: string }> = [
     { regex: /\bsk-[\w-]{20,}\b/g, type: 'OpenAI/Stripe-style key' },
     { regex: /\beyJ[\w-]+\.[\w-]+\.[\w-]+\b/g, type: 'JWT token' },
@@ -111,9 +118,22 @@ const checkApiLeak: EvidenceChecker = (sc, finding) => {
     for (const m of matches) {
       const val = m[0];
       if (!placeholderPatterns.test(val)) {
+        // Compute redacted fingerprint for audit trail
+        // Show first 3 + last 3 chars + length + Shannon entropy
+        const prefix = val.slice(0, 3);
+        const suffix = val.slice(-3);
+        const len = val.length;
+        // Shannon entropy (bits per char) — high entropy = real key, low = base64 noise
+        const freq: Record<string, number> = {};
+        for (const c of val) freq[c] = (freq[c] || 0) + 1;
+        let entropy = 0;
+        for (const c in freq) {
+          const p = freq[c] / val.length;
+          entropy -= p * Math.log2(p);
+        }
         return {
           sufficient: true,
-          evidence: `Real ${type} detected in recon data: "${val.slice(0, 20)}${val.length > 20 ? '...' : ''}". This is NOT a placeholder (rejected pattern check). Direct credential exposure — attacker can use this key immediately.`,
+          evidence: `Real ${type} detected in recon data. Matched string fingerprint: prefix="${prefix}" suffix="${suffix}" length=${len} entropy=${entropy.toFixed(2)} bits/char. Full value NOT logged here (audit trail redaction). To verify: re-fetch the target URL and grep for the pattern — the value MUST be retrievable from live HTML/JS, otherwise this is a stale/false match.`,
           confidence: 0.97,
           severity: 'critical',
         };
@@ -126,7 +146,7 @@ const checkApiLeak: EvidenceChecker = (sc, finding) => {
   if (findingDesc.includes('hardcoded') && (findingDesc.includes('sk-') || findingDesc.includes('akia') || findingDesc.includes('ghp_'))) {
     return {
       sufficient: true,
-      evidence: 'AI finding explicitly mentions a hardcoded secret pattern (sk-/AKIA/ghp_) in description. Treat as confirmed credential exposure.',
+      evidence: 'AI finding explicitly mentions a hardcoded secret pattern (sk-/AKIA/ghp_) in description. Treat as confirmed credential exposure. ⚠ Audit note: AI may hallucinate specific patterns — verify by re-grepping the target HTML/JS for the mentioned prefix.',
       confidence: 0.85,
       severity: 'critical',
     };
@@ -136,54 +156,56 @@ const checkApiLeak: EvidenceChecker = (sc, finding) => {
     sufficient: false,
     evidence: 'No REAL secret pattern found in recon data (only generic mentions or placeholders detected). Active validation needed to confirm if any "secret" is actually exploitable.',
     confidence: 0,
+    dropReason: 'no_real_secret_pattern',
   };
 };
 
 const checkInfoExposure: EvidenceChecker = (sc, finding) => {
   // info_exposure is VERY context-dependent. Insufficient to auto-confirm
   // just because the type matches. Need SPECIFIC evidence.
+  //
+  // CRITICAL (post Claude-audit): window.__net_track__ + clientIp/city/country/
+  // requestId of the REQUESTER (i.e. our scanner's own IP) is NOT a
+  // vulnerability — it's how Cloudflare Edge / CDN geo / first-party RUM
+  // works. The site is reflecting OUR OWN IP back to us. Bounty programs
+  // reject these as N/A. Auto-confirming them inflates detection rate
+  // and is Goodhart (commit cf9ea33 was direct metric-gaming).
+  //
+  // Real info_exposure must leak OTHER users' data, internal infrastructure,
+  // source maps, .git, env dumps, etc. — NOT the requester's own metadata.
   const findingDesc = (finding?.description || '').toLowerCase();
   const findingTitle = (finding?.title || '').toLowerCase();
 
-  // Case 1: window.__net_track__ or similar client-side state leak
+  // Case 1: window.__net_track__ with clientIp — THIS IS NOISE, NOT A VULN
+  // Reject as sufficient=false. Falls back to active validation, which will
+  // likely also fail (no real exploit), so finding will be dropped.
+  // If AI labels this as info_exposure/information_disclosure, the candidate
+  // is kept in DB as 'dropped' with reason='requester_self_data' (see §1B).
   if (findingDesc.includes('__net_track__') || sc.includes('__net_track__')) {
     if (sc.includes('clientIp') || sc.includes('client_ip') || sc.toLowerCase().includes('ip address')) {
       return {
-        sufficient: true,
-        evidence: 'window.__net_track__ (or similar) found in HTML, contains clientIp field. Server is leaking client IP, city, country, requestId to client-side JS. Real info exposure — could be used for fingerprinting/tracking.',
-        confidence: 0.85,
-        severity: 'low',  // info exposure, not exploitable
+        sufficient: false,
+        evidence: 'window.__net_track__ contains clientIp/city/country/requestId — but this is the REQUESTER\'s OWN metadata reflected by Cloudflare Edge / CDN. NOT a vulnerability: this is how geo, RUM, and bot-management work for half the internet. Bounty programs reject as N/A. Real info_exposure would leak OTHER users\' PII, internal infrastructure paths, source maps, .git, env dumps, etc.',
+        confidence: 0,
+        dropReason: 'requester_self_data',
       };
     }
   }
 
-  // Case 2: Stack traces / error messages with internal paths
+  // Case 1b: Stack traces / error messages with internal paths
+  // This IS a real leak — internal infrastructure disclosure.
   if (findingDesc.includes('stack trace') || findingDesc.includes('error message')) {
     if (sc.includes('/usr/') || sc.includes('/var/') || sc.includes('/home/') || sc.includes('c:\\')) {
       return {
         sufficient: true,
-        evidence: 'Stack trace or error message in HTML reveals internal file system paths. Info exposure — could enable targeted path traversal attacks.',
+        evidence: 'Stack trace or error message in HTML reveals internal file system paths. Real info exposure — could enable targeted path traversal attacks.',
         confidence: 0.85,
         severity: 'low',
       };
     }
   }
 
-  // Case 3: User PII (emails, phones) in HTML
-  const emailMatches = [...sc.matchAll(/[\w.+-]+@(?:[\w-]+\.)+[\w]{2,}/g)];
-  const realEmails = emailMatches.filter(m => !/test@|example@|demo@|admin@example|user@example/i.test(m[0]));
-  if (findingDesc.includes('email') || findingDesc.includes('pii')) {
-    if (realEmails.length >= 5) {
-      return {
-        sufficient: true,
-        evidence: `${realEmails.length} real-looking email addresses found in HTML. Potential PII exposure — could be spam list or user enumeration.`,
-        confidence: 0.8,
-        severity: 'medium',
-      };
-    }
-  }
-
-  // Case 4: Internal API structure leaked in JS
+  // Case 1c: Internal API endpoints leaked in JS (NOT requester self-data)
   if (findingDesc.includes('internal') && (findingDesc.includes('api') || findingDesc.includes('endpoint'))) {
     if (sc.includes('/api/internal/') || sc.includes('/api/admin/') || sc.includes('/_next/data/')) {
       return {
@@ -195,7 +217,40 @@ const checkInfoExposure: EvidenceChecker = (sc, finding) => {
     }
   }
 
-  // Case 5: Public API docs (swagger/openapi) — INSUFFICIENT alone
+  // Case 1d: Source maps, .git, backup files, env dumps — REAL leaks
+  if (sc.includes('sourceMappingURL=') && !sc.includes('.map.js')) {
+    return {
+      sufficient: true,
+      evidence: 'Source map URL exposed in production JS bundle. Real info exposure — attacker can recover original source code, variable names, comments.',
+      confidence: 0.9,
+      severity: 'medium',
+    };
+  }
+  if (sc.toLowerCase().includes('.git/config') || sc.toLowerCase().includes('.env') || sc.toLowerCase().includes('backup.sql')) {
+    return {
+      sufficient: true,
+      evidence: 'Sensitive file (.git/config, .env, backup.sql) accessible or referenced. Real info exposure — potential credential/source code leak.',
+      confidence: 0.9,
+      severity: 'high',
+    };
+  }
+
+  // Case 2: User PII (emails) in HTML — at least 5 real emails
+  // This is real if they're OTHER users' emails, not the requester's.
+  const emailMatches = [...sc.matchAll(/[\w.+-]+@(?:[\w-]+\.)+[\w]{2,}/g)];
+  const realEmails = emailMatches.filter(m => !/test@|example@|demo@|admin@example|user@example|noreply@|support@|info@|contact@|help@/i.test(m[0]));
+  if (findingDesc.includes('email') || findingDesc.includes('pii')) {
+    if (realEmails.length >= 5) {
+      return {
+        sufficient: true,
+        evidence: `${realEmails.length} real-looking user email addresses found in HTML. Potential PII exposure — could enable spam list building or user enumeration.`,
+        confidence: 0.8,
+        severity: 'medium',
+      };
+    }
+  }
+
+  // Case 3: Public API docs (swagger/openapi) — INSUFFICIENT alone
   // /api/swagger existing doesn't mean it's a leak — many APIs are
   // intentionally public. Need to check if it contains internal
   // endpoints or sensitive schemas.

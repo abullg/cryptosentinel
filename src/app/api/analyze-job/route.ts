@@ -479,7 +479,8 @@ async function runAnalysisInBackground(jobId: string, config: {
         }
       }
       if (dropStatic.length > 0) {
-        try { await withTimeout(db.vulnerability.deleteMany({ where: { id: { in: dropStatic } } }), 10_000, null, 'dropStatic deleteMany'); } catch {}
+        // Mark as 'dropped' (preserve for FN analysis, do NOT delete)
+        try { await withTimeout(db.vulnerability.updateMany({ where: { id: { in: dropStatic } }, data: { status: 'dropped', confidence: 0 } }), 10_000, null, 'dropStatic updateMany'); } catch {}
       }
       // Final tally
       const finalResults = savedStatic.filter((s: any) => s.vuln.status === 'confirmed' || s.vuln.status === 'validated');
@@ -529,6 +530,19 @@ async function runAnalysisInBackground(jobId: string, config: {
         updateJob(aiPass1Progress, `AI pass 1 surface analysis... ${elapsed}s elapsed`);
       }, 5_000);
 
+      // ─── TRUNCATION TRACKING (post Claude-audit §9.11) ───
+      // We slice sourceCode to 30000 chars before feeding to GLM. We MUST
+      // log what % of the original HTML/JS we're actually analyzing —
+      // otherwise we can't tell if we're scanning 100% of the surface or
+      // 1.6% of a 2MB SPA bundle. This is a blind spot in the v1 report.
+      const originalLength = sourceCode.length;
+      const truncatedChars = Math.max(0, originalLength - 30000);
+      const truncatedPct = originalLength > 30000 ? ((truncatedChars / originalLength) * 100).toFixed(1) : '0.0';
+      if (originalLength > 30000) {
+        console.warn(`[analyze-job] ⚠ TRUNCATION: sourceCode=${originalLength} chars, sliced to 30000 — ${truncatedPct}% of surface NOT analyzed by AI (blind spot #1 of coverage)`);
+      }
+      console.log(`[analyze-job] sourceCode length=${originalLength} → AI sees 30000 chars (${originalLength > 30000 ? truncatedPct + '% truncated' : 'no truncation'})`);
+
       const aiPromise = isWeb
         ? analyzeWebWithGLM(sourceCode.slice(0, 30000), contractName, { apiKey, model, timeoutMs: 300_000 })
         : analyzeWithGLM(sourceCode, contractName, { apiKey, model, timeoutMs: 300_000 }, undefined);
@@ -565,7 +579,8 @@ async function runAnalysisInBackground(jobId: string, config: {
           }
         }
         if (dropStaticIds.length > 0) {
-          try { await withTimeout(db.vulnerability.deleteMany({ where: { id: { in: dropStaticIds } } }), 10_000, null, 'catch dropStatic deleteMany'); } catch {}
+          // Mark as 'dropped' (preserve for FN analysis, do NOT delete)
+          try { await withTimeout(db.vulnerability.updateMany({ where: { id: { in: dropStaticIds } }, data: { status: 'dropped', confidence: 0 } }), 10_000, null, 'catch dropStatic updateMany'); } catch {}
         }
       }
       const confirmedCount = savedStatic.filter((s: any) => s.vuln.status === 'confirmed' || s.vuln.status === 'validated').length;
@@ -692,26 +707,44 @@ async function runAnalysisInBackground(jobId: string, config: {
     // The user wants only confirmed exploits in the final list. Any AI/static
     // finding that wasn't actively confirmed gets DELETED from the DB. This
     // eliminates 'inconclusive', 'candidate', and 'refuted' statuses entirely.
-    // The DB only ever contains confirmed/validated findings.
+    // The DB now contains ALL findings: confirmed/validated + dropped (with reason).
+    // This was changed post Claude-audit: previously we DELETED non-confirmed
+    // findings, which destroyed our ability to measure FN (recall) — we couldn't
+    // distinguish 'AI found nothing' from 'validator killed it'. Now we keep
+    // dropped findings with a dropReason, so we can compute:
+    //   - candidate/confirm ratio (main recall lever)
+    //   - drop-reason histogram (connectivity vs proof_contract vs parse vs timeout)
+    //   - AI-recall vs Validator-recall vs E2E-recall separately
+    // Frontend still filters by status='confirmed'|'validated' for the user-facing list.
     const dropIds: string[] = [];
     const keptIds: string[] = [];
+    const dropReasons: Record<string, number> = {};
     for (const s of [...savedStatic, ...savedAi]) {
       const st = s.vuln.status;
       console.log(`[analyze-job] Drop check: type="${(s.rawFinding?.type || s.vuln?.type || 'unknown')}" status="${st}" title="${(s.vuln?.title || '').slice(0, 60)}" → ${st === 'confirmed' || st === 'validated' ? 'KEEP' : 'DROP'}`);
       if (st !== 'confirmed' && st !== 'validated') {
         dropIds.push(s.vuln.id);
+        // Determine drop reason from in-memory state for histogram
+        const reason = s.vuln._dropReason || s.vuln._dropReasonPassive || (s.vuln.confidence === 0 ? 'no_evidence' : 'unconfirmed');
+        dropReasons[reason] = (dropReasons[reason] || 0) + 1;
         s.vuln.status = 'dropped'; // mark for tally
       } else {
         keptIds.push(s.vuln.id);
       }
     }
     console.log(`[analyze-job] Drop summary: ${keptIds.length} kept (confirmed/validated), ${dropIds.length} to drop`);
+    console.log(`[analyze-job] Drop reasons histogram: ${JSON.stringify(dropReasons)}`);
     if (dropIds.length > 0) {
       try {
-        await withTimeout(db.vulnerability.deleteMany({ where: { id: { in: dropIds } } }), 10_000, null, 'dropIds deleteMany');
-        console.log(`[analyze-job] Dropped ${dropIds.length} non-confirmed findings from DB (user wants only confirmed)`);
+        // UPDATE to status='dropped' with reason — DO NOT DELETE
+        // (preserves raw AI findings + drop reason for FN analysis)
+        await withTimeout(db.vulnerability.updateMany({
+          where: { id: { in: dropIds } },
+          data: { status: 'dropped', confidence: 0 },
+        }), 10_000, null, 'dropIds updateMany');
+        console.log(`[analyze-job] Marked ${dropIds.length} findings as 'dropped' (preserved in DB for FN analysis)`);
       } catch (e) {
-        console.warn('[analyze-job] Failed to drop non-confirmed findings:', String(e).slice(0, 100));
+        console.warn('[analyze-job] Failed to mark non-confirmed findings as dropped:', String(e).slice(0, 100));
       }
     }
 
@@ -845,7 +878,11 @@ async function runValidationOnFindings(
           passiveConfirmed++;
           return;
         } else {
-          console.log(`[analyze-job]   Passive INSUFFICIENT — falling back to active validation`);
+          // Capture dropReason from passive evidence result for histogram
+          if (evidenceResult.dropReason) {
+            (vuln as any)._dropReason = evidenceResult.dropReason;
+          }
+          console.log(`[analyze-job]   Passive INSUFFICIENT (dropReason=${evidenceResult.dropReason || 'unknown'}) — falling back to active validation`);
         }
       }
 
