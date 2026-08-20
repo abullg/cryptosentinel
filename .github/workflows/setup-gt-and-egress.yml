@@ -46,7 +46,7 @@ jobs:
           echo "=== GT container status ==="
           docker compose ps
           echo "=== Health check: curl each GT port ==="
-          for port in 3001 3002 3003 3007 3008; do
+          for port in 3001 3002 3007 3008; do
             echo "--- localhost:$port ---"
             curl -sI --max-time 5 http://localhost:$port/ | head -1 || echo "FAIL"
           done

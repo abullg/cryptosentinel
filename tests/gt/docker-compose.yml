@@ -38,8 +38,10 @@ services:
     restart: unless-stopped
 
   wrongsecrets:
-    # OWASP WrongSecrets — secret-in-repo patterns
-    # Used to calibrate api_leak FP rate (target: < 5%)
+    # OWASP WrongSecrets — DISABLED (image `jeroenwillemsen/wrongsecrets` not on Docker Hub)
+    # Juice Shop already has secret-related challenges (Leaked API Key, etc.)
+    # Re-enable when correct image name is found.
+    profiles: ["disabled"]
     image: jeroenwillemsen/wrongsecrets:latest
     container_name: cs-wrongsecrets
     ports:
