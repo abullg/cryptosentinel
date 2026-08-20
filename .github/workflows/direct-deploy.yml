@@ -74,7 +74,7 @@ jobs:
           echo ""
           echo "=== 4. Build ==="
           export NODE_OPTIONS=--max-old-space-size=2048
-          npx next build 2>&1 | tail -20
+          npx next build 2>&1 | tail -100
 
           echo ""
           echo "=== 4.5 Copy static assets to standalone ==="
