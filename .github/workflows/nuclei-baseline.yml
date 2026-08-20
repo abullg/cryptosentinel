@@ -1,0 +1,125 @@
+name: Nuclei Baseline
+
+# Per Claude protocol (§9.5):
+#   "Nuclei/ZAP/Burp baseline delta (value-add LLM)"
+#   Specifically: "прогони nuclei -t http/misconfiguration,secrets на те же
+#   20 URL, сравни. Если overlap ≥ 90% — CryptoSentinel = медленный Nuclei."
+#
+# This workflow runs nuclei on the same targets as benchmark.yml and saves
+# results for overlap comparison.
+
+on:
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: 'JSON array of target URLs (defaults to GT localhost set)'
+        required: false
+        default: '[]'
+
+jobs:
+  nuclei:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p 22 -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Install + run nuclei on VPS
+        run: |
+          HOST="${{ secrets.VPS_HOST }}"
+          USER="${{ secrets.VPS_USER || 'root' }}"
+          TARGETS_INPUT='${{ github.event.inputs.targets }}'
+          ssh -p 22 -o StrictHostKeyChecking=no -o ConnectTimeout=60 -o ServerAliveInterval=30 -i ~/.ssh/id_ed25519 $USER@$HOST "bash -s" <<REMOTE_EOF | tee /tmp/nuclei_output.txt
+          set -e
+          mkdir -p /tmp/cs-nuclei
+          cd /tmp/cs-nuclei
+
+          # Install nuclei if not present
+          if ! command -v nuclei >/dev/null; then
+            echo "=== Installing nuclei ==="
+            # Install Go if missing
+            if ! command -v go >/dev/null; then
+              apt-get update -qq && apt-get install -y -qq golang-go
+            fi
+            go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+            export PATH=\$PATH:\$(go env GOPATH)/bin
+          fi
+          export PATH=\$PATH:\$(go env GOPATH)/bin
+          nuclei -version
+
+          # Update templates
+          echo "=== Updating nuclei templates ==="
+          nuclei -update-templates -silent
+
+          # Target list — GT localhost + production passive
+          cat > /tmp/cs-nuclei/targets.txt <<EOF
+          http://localhost:3001/
+          http://localhost:3002/
+          http://localhost:3003/
+          http://localhost:3004/
+          http://localhost:3005/
+          http://localhost:3007/
+          http://localhost:3008/
+          https://www.bitunix.com/
+          https://app.uniswap.org/
+          https://aave.com/
+          https://metamask.io/
+          https://www.ledger.com/
+          https://example.com/
+          EOF
+
+          echo "=== Running nuclei (http/misconfiguration + secrets + cves) ==="
+          nuclei -l /tmp/cs-nuclei/targets.txt \\
+            -t http/misconfiguration/ \\
+            -t http/exposures/ \\
+            -t http/secrets/ \\
+            -severity low,medium,high,critical \\
+            -json \\
+            -o /tmp/cs-nuclei/nuclei-results.json \\
+            -silent \\
+            -rate-limit 30 \\
+            -timeout 10 \\
+            -retries 1 \\
+            2>&1 | head -200
+
+          echo "=== Nuclei summary ==="
+          if [ -f /tmp/cs-nuclei/nuclei-results.json ]; then
+            echo "Findings count by severity:"
+            python3 -c "
+            import json
+            from collections import Counter
+            with open('/tmp/cs-nuclei/nuclei-results.json') as f:
+                items = [json.loads(l) for l in f if l.strip()]
+            print(f'Total findings: {len(items)}')
+            sev = Counter(i.get('info',{}).get('severity','?') for i in items)
+            print('By severity:', dict(sev))
+            tmpl = Counter(i.get('info',{}).get('name','?')[:50] for i in items)
+            print('By template (top 10):')
+            for n, c in tmpl.most_common(10):
+                print(f'  {c}  {n}')
+            print()
+            print('Per-target findings:')
+            target_count = Counter()
+            for i in items:
+                url = i.get('matched-at') or i.get('url','?')
+                target_count[url] += 1
+            for u, c in sorted(target_count.items()):
+                print(f'  {c}  {u}')
+            "
+          else
+            echo "no findings"
+          fi
+          echo "=== DONE ==="
+          REMOTE_EOF
+
+      - name: Save nuclei JSON results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuclei-baseline
+          path: /tmp/nuclei_output.txt
+          if-no-files-found: ignore

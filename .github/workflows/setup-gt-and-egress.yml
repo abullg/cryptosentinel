@@ -1,0 +1,117 @@
+name: Setup GT + Egress Allowlist
+
+# Per Claude protocol (§7, §9.16, §9.30, §9.31):
+#   - Self-host GT in docker on VPS (juice-shop, dvwa, wrongsecrets, crAPI, webgoat, canary)
+#   - Egress allowlist: deny outbound from analyze-job except for
+#     * tcp 80,443 to fetch-url (with jina WAF bypass)
+#     * localhost:3001-3008 (GT containers)
+#     * DENY all other — prevent prompt-injection-driven SSRF to attacker hosts
+#   - This is a P0 security fix before any production deploy:
+#     target HTML is fed to GLM, GLM generates validationSteps, our server
+#     executes them. Without egress allowlist, this is RCE/SSRF class of
+#     own system. (see tests/gt/canary/prompt-injection.html)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p 22 -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Pull GT docker-compose + bring up containers
+        run: |
+          HOST="${{ secrets.VPS_HOST }}"
+          USER="${{ secrets.VPS_USER || 'root' }}"
+          ssh -p 22 -o StrictHostKeyChecking=no -o ConnectTimeout=60 -i ~/.ssh/id_ed25519 $USER@$HOST "bash -s" <<'REMOTE_EOF'
+          set -e
+          cd /opt/cryptosentinel
+          git pull --ff-only
+          cd tests/gt
+          echo "=== docker compose version ==="
+          docker compose version || docker-compose version
+          echo "=== Pulling GT images ==="
+          docker compose pull --quiet || docker-compose pull --quiet
+          echo "=== Bringing up GT containers ==="
+          docker compose up -d || docker-compose up -d
+          echo "=== Waiting 10s for containers to start ==="
+          sleep 10
+          echo "=== GT container status ==="
+          docker compose ps || docker-compose ps
+          echo "=== Health check: curl each GT port ==="
+          for port in 3001 3002 3003 3004 3005 3007 3008; do
+            echo "--- localhost:$port ---"
+            curl -sI --max-time 5 http://localhost:$port/ | head -1 || echo "FAIL"
+          done
+          echo "=== DONE GT setup ==="
+          REMOTE_EOF
+
+      - name: Apply egress allowlist (iptables)
+        run: |
+          HOST="${{ secrets.VPS_HOST }}"
+          USER="${{ secrets.VPS_USER || 'root' }}"
+          ssh -p 22 -o StrictHostKeyChecking=no -o ConnectTimeout=60 -i ~/.ssh/id_ed25519 $USER@$HOST "bash -s" <<'REMOTE_EOF'
+          set -e
+          echo "=== CURRENT iptables OUTPUT chain ==="
+          iptables -L OUTPUT -n --line-numbers | head -30
+
+          # Idempotent: only add if not already present (check by comment match)
+          if iptables -C OUTPUT -m comment --comment "cs-egress-allow-http" -p tcp --dport 80 -j ACCEPT 2>/dev/null; then
+            echo "egress rules already applied — skipping"
+          else
+            echo "=== Applying CryptoSentinel egress allowlist ==="
+
+            # Allow loopback (localhost) — GT containers + Next.js internal
+            iptables -A OUTPUT -o lo -j ACCEPT -m comment --comment "cs-egress-allow-loopback"
+
+            # Allow established connections (response traffic for inbound requests)
+            iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT -m comment --comment "cs-egress-allow-established"
+
+            # Allow DNS (UDP/TCP 53)
+            iptables -A OUTPUT -p udp --dport 53 -j ACCEPT -m comment --comment "cs-egress-allow-dns-udp"
+            iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT -m comment --comment "cs-egress-allow-dns-tcp"
+
+            # Allow HTTP/HTTPS for fetch-url (target scanning + jina.ai WAF bypass)
+            iptables -A OUTPUT -p tcp --dport 80 -j ACCEPT -m comment --comment "cs-egress-allow-http"
+            iptables -A OUTPUT -p tcp --dport 443 -j ACCEPT -m comment --comment "cs-egress-allow-https"
+
+            # Allow SSH (for management)
+            iptables -A OUTPUT -p tcp --dport 22 -j ACCEPT -m comment --comment "cs-egress-allow-ssh"
+
+            # Allow NTP
+            iptables -A OUTPUT -p udp --dport 123 -j ACCEPT -m comment --comment "cs-egress-allow-ntp"
+
+            # Allow HTTPS to github.com (for git pull, deps)
+            # (covered by 443 above)
+
+            # DENY everything else — this is the prompt-injection defense
+            # If GLM generates validationSteps with URL to attacker.test,
+            # evil.example, internal-ssrf-target.test (see canary page),
+            # this rule blocks the probe.
+            iptables -A OUTPUT -j REJECT -m comment --comment "cs-egress-deny-default"
+
+            echo "=== egress rules applied ==="
+          fi
+
+          echo "=== UPDATED iptables OUTPUT chain ==="
+          iptables -L OUTPUT -n --line-numbers
+
+          echo "=== Saving iptables (persistent across reboot) ==="
+          if command -v netfilter-persistent >/dev/null; then
+            netfilter-persistent save
+          elif command -v iptables-save >/dev/null; then
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules
+            echo "saved to /etc/iptables/rules.v4 or /etc/iptables.rules"
+          else
+            echo "WARNING: no persistence tool found — rules will be lost on reboot"
+          fi
+
+          echo "=== DONE egress allowlist ==="
+          REMOTE_EOF

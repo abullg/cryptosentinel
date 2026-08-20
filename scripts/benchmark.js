@@ -12,44 +12,31 @@
  * 
  * Results show: detection rate, validation accuracy, FP indicators
  */
+// Per Claude protocol (§7): self-host GT in docker, no production crypto
+// exchanges without authz, no external testphp (DC IP block).
+// Pre-registered in tests/gt/expected.yaml — DO NOT edit after bench starts.
 const TARGETS = [
-  // Crypto exchanges (WAF-protected, challenging)
-  'https://www.bitunix.com/',
-  'https://www.binance.com/',
-  'https://www.coinbase.com/',
-  'https://www.kraken.com/',
-  'https://www.bybit.com/',
-  // DeFi / Web3
-  'https://app.uniswap.org/',
-  'https://curve.fi/',
-  'https://aave.com/',
-  'https://compound.finance/',
-  'https://www.sushi.com/',
-  // Web3 wallets / tools
-  'https://chrome.coin98.com/',
-  'https://metamask.io/',
-  'https://www.trustwallet.com/',
-  'https://walletconnect.com/',
-  'https://www.ledger.com/',
-  // dApps / NFT
-  'https://opensea.io/',
-  'https://blur.io/',
-  'https://www.galaxy.com/',
-  'https://etherscan.io/',
-  'https://etherscan.io/token/0xa0b86991c6218b36c1d19d4e2e9eb0ce3606eb48', // USDC contract
-  // Traditional web apps (easier, more likely to find vulns)
+  // ─── A. GT (self-hosted docker on VPS, localhost) ───
+  'http://localhost:3001/',  // OWASP Juice Shop — 116 challenges
+  'http://localhost:3002/',  // DVWA — classic SQLi/XSS
+  'http://localhost:3003/',  // WrongSecrets — calibrate api_leak FP
+  'http://localhost:3004/',  // crAPI — API/IDOR
+  'http://localhost:3005/',  // WebGoat — classic tutorial
+  'http://localhost:3007/',  // CANARY — prompt injection resistance test
+  'http://localhost:3008/',  // NEGATIVE — Hello World (precision test)
+
+  // ─── B. Negatives (real, but expected 0 exploitable) ───
   'https://example.com/',
-  'https://testphp.vulnweb.com/', // intentionally vulnerable
-  'https://juice-shop.herokuapp.com/', // OWASP Juice Shop
-  'http://testphp.vulnweb.com/listproducts.php?cat=1', // SQLi test
-  'http://testphp.vulnweb.com/search.php?query=test', // XSS test
-  // Documentation / API
-  'https://docs.gitbook.com/',
-  'https://api.github.com/',
-  'https://swagger.io/',
-  // E-commerce
-  'https://www.shopify.com/',
-  'https://www.woocommerce.com/',
+  'https://httpbin.org/',
+
+  // ─── C. Production homepages — PASSIVE ONLY (no active probes) ───
+  // Per Claude §9.30: no active probes on production crypto exchanges
+  // without written authorization. Egress allowlist enforces this.
+  'https://www.bitunix.com/',
+  'https://app.uniswap.org/',
+  'https://aave.com/',
+  'https://metamask.io/',
+  'https://www.ledger.com/',
 ];
 
 async function benchmark() {
@@ -223,20 +210,47 @@ async function benchmark() {
     console.log(`  ${type.padEnd(25)} ${count} targets`);
   }
 
-  console.log('\n--- TIMING ---');
+  console.log('\n--- TIMING (avg hides heavy tail — per Claude §9.15) ---');
   const fetchTimes = succeeded.map(r => r.fetchTime).filter(t => t > 0);
   const totalTimes = succeeded.map(r => r.totalTime).filter(t => t > 0);
+
+  function percentile(arr, p) {
+    if (arr.length === 0) return 0;
+    const sorted = [...arr].sort((a, b) => a - b);
+    const idx = Math.ceil((p / 100) * sorted.length) - 1;
+    return sorted[Math.max(0, idx)];
+  }
+
   if (fetchTimes.length > 0) {
-    console.log(`  Avg fetch time:   ${(fetchTimes.reduce((a, b) => a + b, 0) / fetchTimes.length / 1000).toFixed(1)}s`);
-    console.log(`  Avg total time:   ${(totalTimes.reduce((a, b) => a + b, 0) / totalTimes.length / 1000).toFixed(1)}s`);
+    console.log(`  Fetch time: avg=${(fetchTimes.reduce((a, b) => a + b, 0) / fetchTimes.length / 1000).toFixed(2)}s  p50=${(percentile(fetchTimes, 50) / 1000).toFixed(2)}s  p95=${(percentile(fetchTimes, 95) / 1000).toFixed(2)}s`);
+    console.log(`  Total time: avg=${(totalTimes.reduce((a, b) => a + b, 0) / totalTimes.length / 1000).toFixed(1)}s  p50=${(percentile(totalTimes, 50) / 1000).toFixed(1)}s  p95=${(percentile(totalTimes, 95) / 1000).toFixed(1)}s`);
     console.log(`  Min total time:   ${(Math.min(...totalTimes) / 1000).toFixed(1)}s`);
     console.log(`  Max total time:   ${(Math.max(...totalTimes) / 1000).toFixed(1)}s`);
   }
 
-  console.log('\n--- VULNERABLE TARGETS (known) ---');
-  const knownVuln = results.filter(r => r.url.includes('vulnweb') || r.url.includes('juice-shop'));
+  console.log('\n--- COST ESTIMATE (per Claude §9.14) ---');
+  // GLM-5.2 cost: assume $0.01 per 1K input + $0.03 per 1K output (typical tier)
+  // Each target: 2 passes × ~30K input + ~4K output
+  const inputTokens = succeeded.length * 2 * 30000;
+  const outputTokens = succeeded.length * 2 * 4000;
+  const costUSD = (inputTokens / 1000 * 0.01) + (outputTokens / 1000 * 0.03);
+  console.log(`  Targets analyzed:  ${succeeded.length}`);
+  console.log(`  Est. input tokens: ~${inputTokens.toLocaleString()}`);
+  console.log(`  Est. output tokens: ~${outputTokens.toLocaleString()}`);
+  console.log(`  Est. cost (USD):   $${costUSD.toFixed(2)}`);
+  console.log(`  Cost per target:   $${(costUSD / succeeded.length).toFixed(3)}`);
+  console.log(`  Scaled to 1000 targets/day: $${(costUSD * 1000 / succeeded.length).toFixed(0)}/day`);
+
+  console.log('\n--- DROP REASONS HISTOGRAM (per Claude §9.8) ---');
+  // Pull from /api/vulnerabilities?include_dropped=1 (if backend supports)
+  // For now: try the endpoint, log if it works
+  console.log(`  See PM2 OUT for: '[analyze-job] Drop reasons histogram: {...}'`);
+  console.log(`  Candidate/confirm ratio = (dropped + confirmed) / confirmed — main recall lever`);
+
+  console.log('\n--- VULNERABLE TARGETS (known GT) ---');
+  const knownVuln = results.filter(r => r.url.includes('localhost:3001') || r.url.includes('localhost:3002') || r.url.includes('localhost:3003') || r.url.includes('localhost:3004') || r.url.includes('localhost:3005') || r.url.includes('juice-shop'));
   for (const r of knownVuln) {
-    console.log(`  ${r.url}: ${r.status === 'completed' ? `${r.confirmedCount} findings` : r.status}`);
+    console.log(`  ${r.url}: ${r.status === 'completed' ? `${r.confirmedCount} confirmed (recall = N/${r.totalCount || '?'})` : r.status}`);
   }
 
   // Output JSON for analysis

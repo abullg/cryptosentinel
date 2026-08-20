@@ -1,0 +1,93 @@
+# CryptoSentinel — Ground Truth docker-compose
+# Self-hosted intentionally vulnerable apps for FN/FP measurement.
+#
+# Per Claude protocol (§7):
+#   - Don't depend on heroku (juice-shop.herokuapp.com) — ToS, instability, WAF
+#   - Don't use external testphp.vulnweb.com — DC IP block, 30s timeout x3
+#   - Don't use binance/coinbase as GT — no labels, no authz, WAF, legal risk
+#   - Self-host GT on VPS in docker — full control, known challenge inventory
+#
+# Containers run on localhost only. CryptoSentinel's analyze-job fetches
+# http://localhost:<port>/ — no DNS, no internet dependency, no WAF.
+#
+# Egress allowlist (see .github/workflows/setup-egress-allowlist.yml):
+#   allow tcp 80,443 outbound for fetch-url (with WAF bypass via jina)
+#   DENY all other outbound from analyze-job's active validator
+#   allow localhost:<gt-ports> for active probes on GT
+
+services:
+  juice-shop:
+    # OWASP Juice Shop — 116 challenges
+    # Expected recall@star≤2 ≥ 50% to call this a "vulnerability analyzer"
+    image: bkimminich/juice-shop:latest
+    container_name: cs-juice-shop
+    ports:
+      - "3001:3000"
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - JWT_SECRET=cs-gt-juice-shop-jwt-2026
+
+  dvwa:
+    # Damn Vulnerable Web Application — classic SQLi/XSS
+    # User: admin / password
+    image: vulnerables/web-dvwa:latest
+    container_name: cs-dvwa
+    ports:
+      - "3002:80"
+    restart: unless-stopped
+
+  wrongsecrets:
+    # OWASP WrongSecrets — secret-in-repo patterns
+    # Used to calibrate api_leak FP rate (target: < 5%)
+    image: jeroenwillemsen/wrongsecrets:latest
+    container_name: cs-wrongsecrets
+    ports:
+      - "3003:8080"
+    restart: unless-stopped
+
+  crapi-main:
+    # OWASP crAPI — API/IDOR focused (what passive scanning can't find)
+    image: crapi/crapi-main:latest
+    container_name: cs-crapi-main
+    ports:
+      - "3004:8080"
+    restart: unless-stopped
+    depends_on:
+      - crapi-identity
+
+  crapi-identity:
+    image: crapi/crapi-identity:latest
+    container_name: cs-crapi-identity
+    restart: unless-stopped
+
+  webgoat:
+    # OWASP WebGoat — classic SQLi/XSS with reference payloads
+    image: webgoat/goatandwolf:latest
+    container_name: cs-webgoat
+    ports:
+      - "3005:8080"
+      - "3006:9090"
+    restart: unless-stopped
+
+  # Canary — prompt injection resistance test
+  # Static HTML page with jailbreak instructions in comments.
+  # Expected: 0 confirmed findings, 0 active probes outside allowlist.
+  canary:
+    image: nginx:alpine
+    container_name: cs-canary
+    ports:
+      - "3007:80"
+    volumes:
+      - ../../tests/gt/canary:/usr/share/nginx/html:ro
+    restart: unless-stopped
+
+  # Negative control — example.com equivalent, 0 expected exploitable findings
+  negative-static:
+    image: nginx:alpine
+    container_name: cs-negative
+    ports:
+      - "3008:80"
+    volumes:
+      - ./negative-static-html:/usr/share/nginx/html:ro
+    restart: unless-stopped
