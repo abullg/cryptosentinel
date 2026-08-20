@@ -68,14 +68,18 @@ export function isolateEvidence(
   // ─── TYPE-SPECIFIC EVIDENCE SCOPING ──────────────────────────
 
   if (findingType === 'csp_missing') {
-    // CSP: only security headers section
-    const headersMatch = fullSourceCode.match(/== SECURITY HEADERS ==[\s\S]*?(?====|$)/i);
-    scopedSourceCode = headersMatch?.[0] || '';
-    if (scopedSourceCode) evidenceSources.push('security headers section');
-    // If no headers section found, use HTTP response headers
-    if (!scopedSourceCode && httpResponse?.headers) {
-      scopedSourceCode = JSON.stringify(httpResponse.headers, null, 2);
-      evidenceSources.push('HTTP response headers (from provenance)');
+    // CSP: extract ONLY the CSP header line
+    if (httpResponse?.headers) {
+      scopedSourceCode = `Content-Security-Policy: ${httpResponse.headers['content-security-policy'] || 'MISSING'}`;
+      evidenceSources.push('Content-Security-Policy header from HTTP response');
+    }
+    if (!scopedSourceCode) {
+      // Passive check fallback: search for CSP line in security headers section
+      const cspMatch = fullSourceCode.match(/CSP:[^\n]*/i);
+      if (cspMatch) {
+        scopedSourceCode = cspMatch[0];
+        evidenceSources.push('CSP line from security headers section');
+      }
     }
   }
   else if (findingType === 'cors_misconfig') {
@@ -152,19 +156,23 @@ export function isolateEvidence(
   else if (findingType === 'info_exposure') {
     // info_exposure: extract ONLY the specific data mentioned in the finding
     if (findingDesc.includes('__net_track__')) {
-      // Find __net_track__ in HTTP response body (from provenance) ONLY
+      // Find __net_track__ in HTTP response body (from provenance) FIRST
       if (httpResponse?.bodyExcerpt) {
         const idx = httpResponse.bodyExcerpt.indexOf('__net_track__');
         if (idx >= 0) {
           scopedSourceCode = httpResponse.bodyExcerpt.slice(Math.max(0, idx - 50), idx + 500);
           evidenceSources.push('__net_track__ section in HTTP response body');
-        } else {
-          // Try HTML content section of sourceCode (not the FULL sourceCode)
-          const htmlMatch = fullSourceCode.match(/== HTML CONTENT[\s\S]*?__net_track__[\s\S]*?(?====|$)/i);
-          if (htmlMatch) {
-            scopedSourceCode = htmlMatch[0].slice(0, 1000);
-            evidenceSources.push('HTML content section with __net_track__');
-          }
+        }
+      }
+      // If not in HTTP response (passive check has no HTTP response),
+      // search full sourceCode for __net_track__ and extract a WINDOW around it
+      // This is safe because we're extracting ONLY the __net_track__ context,
+      // not the entire sourceCode with other findings' data.
+      if (!scopedSourceCode) {
+        const idx = fullSourceCode.indexOf('__net_track__');
+        if (idx >= 0) {
+          scopedSourceCode = fullSourceCode.slice(Math.max(0, idx - 100), idx + 500);
+          evidenceSources.push('__net_track__ context window from sourceCode');
         }
       }
     } else if (findingDesc.includes('stack trace') || findingDesc.includes('error message')) {
