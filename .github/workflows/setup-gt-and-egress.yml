@@ -36,17 +36,17 @@ jobs:
           git pull --ff-only
           cd tests/gt
           echo "=== docker compose version ==="
-          docker compose version || docker-compose version
-          echo "=== Pulling GT images ==="
-          docker compose pull --quiet || docker-compose pull --quiet
+          docker compose version
+          echo "=== Pulling GT images (skipping disabled services) ==="
+          docker compose pull --quiet --ignore-pull-failures || docker compose pull --quiet
           echo "=== Bringing up GT containers ==="
-          docker compose up -d || docker-compose up -d
-          echo "=== Waiting 10s for containers to start ==="
-          sleep 10
+          docker compose up -d --no-deps
+          echo "=== Waiting 20s for containers to start ==="
+          sleep 20
           echo "=== GT container status ==="
-          docker compose ps || docker-compose ps
+          docker compose ps
           echo "=== Health check: curl each GT port ==="
-          for port in 3001 3002 3003 3004 3005 3007 3008; do
+          for port in 3001 3002 3003 3007 3008; do
             echo "--- localhost:$port ---"
             curl -sI --max-time 5 http://localhost:$port/ | head -1 || echo "FAIL"
           done

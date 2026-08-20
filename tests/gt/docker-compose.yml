@@ -48,27 +48,29 @@ services:
 
   crapi-main:
     # OWASP crAPI — API/IDOR focused (what passive scanning can't find)
-    image: crapi/crapi-main:latest
-    container_name: cs-crapi-main
-    ports:
-      - "3004:8080"
-    restart: unless-stopped
-    depends_on:
-      - crapi-identity
+    # Disabled for now — multi-container with complex deps, will add later
+    # image: crapi/crapi-main:latest
+    # container_name: cs-crapi-main
+    # ports:
+    #   - "3004:8080"
+    # restart: unless-stopped
+    # depends_on:
+    #   - crapi-identity
 
   crapi-identity:
-    image: crapi/crapi-identity:latest
-    container_name: cs-crapi-identity
-    restart: unless-stopped
+    # image: crapi/crapi-identity:latest
+    # container_name: cs-crapi-identity
+    # restart: unless-stopped
 
   webgoat:
-    # OWASP WebGoat — classic SQLi/XSS with reference payloads
-    image: webgoat/goatandwolf:latest
-    container_name: cs-webgoat
-    ports:
-      - "3005:8080"
-      - "3006:9090"
-    restart: unless-stopped
+    # OWASP WebGoat — image `webgoat/goatandwolf` not available on Docker Hub.
+    # Re-enable when we find the correct image name (owasp/webgoat-8.x ?)
+    # image: owasp/webgoat:latest
+    # container_name: cs-webgoat
+    # ports:
+    #   - "3005:8080"
+    #   - "3006:9090"
+    # restart: unless-stopped
 
   # Canary — prompt injection resistance test
   # Static HTML page with jailbreak instructions in comments.
