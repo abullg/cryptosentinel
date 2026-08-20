@@ -23,59 +23,31 @@ jobs:
           HOST="${{ secrets.VPS_HOST }}"
           USER="${{ secrets.VPS_USER || 'root' }}"
           ssh -p 22 -o StrictHostKeyChecking=no -o ConnectTimeout=60 -i ~/.ssh/id_ed25519 $USER@$HOST "bash -s" <<'REMOTE_EOF' | tee /tmp/check.log
-          echo "=== Searching for analyze-job route in deployed code ==="
-
-          echo "--- List /opt/cryptosentinel/ ---"
-          ls -la /opt/cryptosentinel/ 2>&1 | head -20
+          echo "=== FULL listing of /opt/cryptosentinel/ ==="
+          ls -la /opt/cryptosentinel/ 2>&1
 
           echo ""
-          echo "--- List /opt/cryptosentinel/.next/ ---"
-          ls -la /opt/cryptosentinel/.next/ 2>&1 | head -20
+          echo "=== Find any 'next' or 'standalone' or 'server.js' under /opt/cryptosentinel/ ==="
+          find /opt/cryptosentinel/ -maxdepth 4 -name "*.js" -type f 2>&1 | head -30
+          find /opt/cryptosentinel/ -maxdepth 4 -name "server.js" 2>&1
+          find /opt/cryptosentinel/ -name "ecosystem.config*" 2>&1
 
           echo ""
-          echo "--- List /opt/cryptosentinel/.next/standalone/ ---"
-          ls -la /opt/cryptosentinel/.next/standalone/ 2>&1 | head -10
+          echo "=== Grep 'STATIC-FIRST' in ALL files recursively ==="
+          grep -rn "STATIC-FIRST" /opt/cryptosentinel/ --include="*.js" 2>&1 | head -5 || true
+          grep -rn "STATIC-FIRST" /opt/cryptosentinel/ --include="*.ts" 2>&1 | head -5 || true
 
           echo ""
-          echo "--- List /opt/cryptosentinel/.next/server/ ---"
-          ls -la /opt/cryptosentinel/.next/server/ 2>&1 | head -20
+          echo "=== Grep 'DEBUG staticAnalysis' ==="
+          grep -rn "DEBUG staticAnalysis" /opt/cryptosentinel/ --include="*.js" 2>&1 | head -5 || true
+          grep -rn "DEBUG staticAnalysis" /opt/cryptosentinel/ --include="*.ts" 2>&1 | head -5 || true
 
           echo ""
-          echo "--- List /opt/cryptosentinel/.next/server/app/ ---"
-          ls -la /opt/cryptosentinel/.next/server/app/ 2>&1 | head -20
-
+          echo "=== PM2 process info ==="
+          pm2 describe cryptosentinel 2>&1 | head -25
           echo ""
-          echo "--- List /opt/cryptosentinel/.next/server/app/api/ ---"
-          ls -la /opt/cryptosentinel/.next/server/app/api/ 2>&1 | head -30
-
-          echo ""
-          echo "--- List /opt/cryptosentinel/.next/server/app/api/analyze-job/ ---"
-          ls -la /opt/cryptosentinel/.next/server/app/api/analyze-job/ 2>&1
-
-          echo ""
-          echo "--- Find ALL .js files in .next (top 30) ---"
-          find /opt/cryptosentinel/.next -name "*.js" -type f 2>&1 | head -30
-
-          echo ""
-          echo "--- Grep 'STATIC-FIRST' in all .js files ---"
-          grep -rn --include='*.js' --binary-files=text "STATIC-FIRST" /opt/cryptosentinel/.next/ 2>&1 | head -5 || true
-
-          echo ""
-          echo "--- Grep 'DEBUG staticAnalysis' ---"
-          grep -rn --include='*.js' --binary-files=text "DEBUG staticAnalysis" /opt/cryptosentinel/.next/ 2>&1 | head -5 || true
-
-          echo ""
-          echo "--- Grep 'sourceCode length' (truncation log) ---"
-          grep -rn --include='*.js' --binary-files=text "sourceCode length" /opt/cryptosentinel/.next/ 2>&1 | head -5 || true
-
-          echo ""
-          echo "--- Grep 'Static analysis:' (fetch-url) ---"
-          grep -rn --include='*.js' --binary-files=text "Static analysis:" /opt/cryptosentinel/.next/ 2>&1 | head -5 || true
-
-          echo ""
-          echo "--- Grep 'analyzeWebWithGLM' ---"
-          grep -rn --include='*.js' --binary-files=text "analyzeWebWithGLM" /opt/cryptosentinel/.next/ 2>&1 | head -5 || true
-
+          echo "=== PM2 last 30 lines of out.log ==="
+          tail -30 /var/log/cryptosentinel/out.log 2>&1 | head -30
           echo ""
           echo "=== Done ==="
           REMOTE_EOF
