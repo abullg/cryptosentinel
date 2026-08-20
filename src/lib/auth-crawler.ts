@@ -150,15 +150,40 @@ async function loginDvwa(baseUrl: string): Promise<string | null> {
       console.log('[auth-crawler] ✓ Database created — retrying login...');
     }
 
-    // Retry login with same session
+    // After DB setup, need fresh session + fresh CSRF token
+    // Re-do entire login flow: GET /login.php → extract new token → POST
+    console.log('[auth-crawler] Getting fresh session for login retry...');
+    const loginPageRes2 = await fetch(`${base}/login.php`, {
+      headers: { 'User-Agent': 'CryptoSentinel-AuthCrawler/1.0' },
+      signal: AbortSignal.timeout(10_000),
+      redirect: 'manual',
+    });
+    const setCookie2 = loginPageRes2.headers.get('set-cookie') || '';
+    const phpsessid2 = setCookie2.match(/PHPSESSID=([^;]+)/)?.[1] || phpsessid;
+    const loginHtml2 = await loginPageRes2.text();
+    const userToken2 = loginHtml2.match(/user_token'\s*value\s*=\s*'([^']+)'/i)?.[1]
+      || loginHtml2.match(/name="user_token"\s+value="([^"]+)"/i)?.[1]
+      || loginHtml2.match(/value='([^']+)'\s+name="user_token"/i)?.[1]
+      || loginHtml2.match(/value="([^"]+)"\s+name="user_token"/i)?.[1]
+      || '';
+    console.log(`[auth-crawler] Fresh token: ${userToken2 ? userToken2.slice(0, 8) + '...' : '(none)'}`);
+
+    // POST login with fresh session + token
+    const loginBody2 = new URLSearchParams({
+      username: 'admin',
+      password: 'password',
+      Login: 'Login',
+      ...(userToken2 ? { user_token: userToken2 } : {}),
+    }).toString();
+
     const loginRes2 = await fetch(`${base}/login.php`, {
       method: 'POST',
       headers: {
         'User-Agent': 'CryptoSentinel-AuthCrawler/1.0',
         'Content-Type': 'application/x-www-form-urlencoded',
-        'Cookie': `PHPSESSID=${phpsessid}; security=low`,
+        'Cookie': `PHPSESSID=${phpsessid2}; security=low`,
       },
-      body: loginBody,
+      body: loginBody2,
       redirect: 'manual',
       signal: AbortSignal.timeout(10_000),
     });
@@ -166,8 +191,15 @@ async function loginDvwa(baseUrl: string): Promise<string | null> {
     console.log(`[auth-crawler] Retry login: status=${loginRes2.status}, location=${location2 || '(none)'}`);
     if (loginRes2.status === 302 && location2.includes('index.php')) {
       console.log('[auth-crawler] ✓ Login successful after DB setup!');
-      return `PHPSESSID=${phpsessid}; security=low`;
+      return `PHPSESSID=${phpsessid2}; security=low`;
     }
+    // Also check body for logout link
+    const retryBody = await loginRes2.text();
+    if (retryBody.includes('logout.php')) {
+      console.log('[auth-crawler] ✓ Login successful (logout link in body)');
+      return `PHPSESSID=${phpsessid2}; security=low`;
+    }
+    console.warn(`[auth-crawler] Retry login also failed — status ${loginRes2.status}`);
   }
 
   // Check response body for "Welcome" or "login_failed"
