@@ -137,6 +137,26 @@ jobs:
               iptables -A OUTPUT -p tcp --dport $gt_port -j ACCEPT -m comment --comment "cs-egress-allow-gt-port-$gt_port"
             done
 
+            # ─── ALLOW TRAFFIC TO DOCKER BRIDGE SUBNET (CRITICAL FIX) ───
+            # When docker-proxy forwards host:3001 → container:3000, the
+            # docker-proxy process makes a NEW outbound TCP connection to
+            # the container's internal IP (e.g., 172.16.1.3:3000). This
+            # connection goes through the OUTPUT chain. WITHOUT this rule,
+            # the default REJECT rule blocks it because container internal
+            # ports (3000, 5000, 8080) aren't in the GT port allowlist.
+            # Symptom: curl localhost:3001 → HTTP=000 (connection reset)
+            # while curl localhost:3002 (DVWA → container port 80) works.
+            # Fix: allow all traffic destined to the docker bridge subnets.
+            # 172.16.0.0/16 covers default docker0 (172.16.0.0/24) and
+            # gt_default (172.16.1.0/24) and any other docker networks.
+            iptables -A OUTPUT -d 172.16.0.0/16 -j ACCEPT -m comment --comment "cs-egress-allow-docker-bridge-subnet"
+            # Also allow traffic going OUT to docker bridge interfaces
+            # (covers cases where docker creates additional bridges)
+            iptables -A OUTPUT -o docker0 -j ACCEPT -m comment --comment "cs-egress-allow-docker0-iface"
+            for br_iface in br-0 br-1 br-2 br-3 br-4 br-5 br-6 br-7 br-8 br-9; do
+              iptables -A OUTPUT -o "$br_iface"+ -j ACCEPT -m comment --comment "cs-egress-allow-$br_iface-iface" 2>/dev/null || true
+            done
+
             # Allow HTTPS to github.com (for git pull, deps)
             # (covered by 443 above)
 
@@ -153,13 +173,35 @@ jobs:
           # These MUST be added BEFORE the REJECT rule. Since the main block
           # above might be skipped (idempotency check), we add GT port rules
           # separately with their own idempotency check.
-          for gt_port in 3001 3002 3003 3004 3005 3007 3008 3009; do
+          for gt_port in 3001 3002 3003 3004 3005 3006 3007 3008 3009; do
             if ! iptables -C OUTPUT -p tcp --dport $gt_port -j ACCEPT -m comment --comment "cs-egress-allow-gt-port-$gt_port" 2>/dev/null; then
               echo "Adding GT port $gt_port to allowlist"
               iptables -I OUTPUT 1 -p tcp --dport $gt_port -j ACCEPT -m comment --comment "cs-egress-allow-gt-port-$gt_port"
             fi
           done
-          echo "=== GT port rules ensured ==="
+
+          # ─── DOCKER BRIDGE SUBNET (always applied — CRITICAL FIX) ───
+          # docker-proxy makes NEW outbound TCP connections to container
+          # internal IPs (e.g., 172.16.1.3:3000 for juice-shop). Without
+          # this rule, those connections are REJECTed by the default deny
+          # rule, causing curl localhost:3001 → HTTP=000 for all containers
+          # whose internal port isn't 80 (only DVWA/canary/negative worked).
+          # Must be INSERTed at position 1 (before REJECT rule).
+          if ! iptables -C OUTPUT -d 172.16.0.0/16 -j ACCEPT -m comment --comment "cs-egress-allow-docker-bridge-subnet" 2>/dev/null; then
+            echo "Adding docker bridge subnet allowlist rule"
+            iptables -I OUTPUT 1 -d 172.16.0.0/16 -j ACCEPT -m comment --comment "cs-egress-allow-docker-bridge-subnet"
+          fi
+          # Also allow via docker0 interface
+          if ! iptables -C OUTPUT -o docker0 -j ACCEPT -m comment --comment "cs-egress-allow-docker0-iface" 2>/dev/null; then
+            iptables -I OUTPUT 1 -o docker0 -j ACCEPT -m comment --comment "cs-egress-allow-docker0-iface"
+          fi
+          # And via any br-* interface (custom docker networks)
+          for br_iface in br-0 br-1 br-2 br-3 br-4 br-5 br-6 br-7 br-8 br-9; do
+            if ! iptables -C OUTPUT -o "$br_iface"+ -j ACCEPT -m comment --comment "cs-egress-allow-$br_iface-iface" 2>/dev/null; then
+              iptables -I OUTPUT 1 -o "$br_iface"+ -j ACCEPT -m comment --comment "cs-egress-allow-$br_iface-iface" 2>/dev/null || true
+            fi
+          done
+          echo "=== GT port + docker bridge rules ensured ==="
 
           echo "=== UPDATED iptables OUTPUT chain ==="
           iptables -L OUTPUT -n --line-numbers
