@@ -69,7 +69,7 @@ jobs:
             # Check ALL GT ports
             ALL_OK=true
             for port in 3001 3002 3005 3007 3008 3009; do
-              CODE=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" http://localhost:$port/ 2>/dev/null || echo "000")
+              CODE=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" http://127.0.0.1:$port/ 2>/dev/null || echo "000")
               if ! echo "$CODE" | grep -qE '^[23][0-9][0-9]$'; then
                 ALL_OK=false
                 echo "    port $port: $CODE (not ready yet)"
@@ -85,7 +85,7 @@ jobs:
           echo "=== Health check: curl each GT port ==="
           for port in 3001 3002 3005 3007 3008 3009; do
             echo "--- localhost:$port ---"
-            curl -sI --max-time 10 http://localhost:$port/ | head -1 || echo "FAIL"
+            curl -sI --max-time 10 http://127.0.0.1:$port/ | head -1 || echo "FAIL"
           done
           echo "=== DONE GT setup ==="
           REMOTE_EOF

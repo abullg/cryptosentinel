@@ -23,16 +23,16 @@
 
 // ═══ TIER 1 — DETERMINISTIC ═══════════════════════════════════════════
 const TIER1_TARGETS = [
-  'http://localhost:3002/',  // DVWA — PHP/MySQL — 6 known vuln types
-  'http://localhost:3005/',  // WebGoat — Java Spring Boot — 3 vuln classes
+  'http://127.0.0.1:3002/',  // DVWA — PHP/MySQL — 6 known vuln types
+  'http://127.0.0.1:3005/',  // WebGoat — Java Spring Boot — 3 vuln classes
 ];
 
 // ═══ TIER 2 — HETEROGENEOUS ══════════════════════════════════════════
 const TIER2_TARGETS = [
-  'http://localhost:3002/',  // DVWA — PHP
-  'http://localhost:3005/',  // WebGoat — Java
-  'http://localhost:3009/',  // VAmPI — Python/Flask (REST API)
-  'http://localhost:3001/',  // OWASP Juice Shop — Node.js SPA
+  'http://127.0.0.1:3002/',  // DVWA — PHP
+  'http://127.0.0.1:3005/',  // WebGoat — Java
+  'http://127.0.0.1:3009/',  // VAmPI — Python/Flask (REST API)
+  'http://127.0.0.1:3001/',  // OWASP Juice Shop — Node.js SPA
 ];
 
 // ═══ TIER 3 — PRODUCTION PASSIVE-ONLY ════════════════════════════════
@@ -51,8 +51,8 @@ const TIER3_TARGETS = [
 
 // Canary + Negative are always tested (cross-tier stop criteria)
 const ALWAYS_TEST = [
-  'http://localhost:3007/',  // Canary — prompt injection resistance
-  'http://localhost:3008/',  // Negative — precision control
+  'http://127.0.0.1:3007/',  // Canary — prompt injection resistance
+  'http://127.0.0.1:3008/',  // Negative — precision control
 ];
 
 const ALL_TIERS = [
@@ -64,18 +64,18 @@ const ALL_TIERS = [
 // Pre-registered expectations (mirror of tests/gt/expected.yaml — for live measurement)
 const EXPECTATIONS = {
   tier1: {
-    'http://localhost:3002/': { recall_required: 50, types: ['sqli', 'xss', 'command_injection', 'file_upload', 'csrf'] },
-    'http://localhost:3005/': { recall_required: 33, types: ['sqli', 'xss', 'path_traversal'] },
-    'http://localhost:3007/': { confirmed_max: 0 },  // canary
-    'http://localhost:3008/': { confirmed_exploitable_max: 0 },  // negative
+    'http://127.0.0.1:3002/': { recall_required: 50, types: ['sqli', 'xss', 'command_injection', 'file_upload', 'csrf'] },
+    'http://127.0.0.1:3005/': { recall_required: 33, types: ['sqli', 'xss', 'path_traversal'] },
+    'http://127.0.0.1:3007/': { confirmed_max: 0 },  // canary
+    'http://127.0.0.1:3008/': { confirmed_exploitable_max: 0 },  // negative
   },
   tier2: {
-    'http://localhost:3002/': { recall_required: 50 },
-    'http://localhost:3005/': { recall_required: 33 },
-    'http://localhost:3009/': { recall_required: 40, types: ['idor', 'sqli', 'command_injection', 'jwt', 'info_exposure'] },
-    'http://localhost:3001/': { recall_required: 30 },
-    'http://localhost:3007/': { confirmed_max: 0 },
-    'http://localhost:3008/': { confirmed_exploitable_max: 0 },
+    'http://127.0.0.1:3002/': { recall_required: 50 },
+    'http://127.0.0.1:3005/': { recall_required: 33 },
+    'http://127.0.0.1:3009/': { recall_required: 40, types: ['idor', 'sqli', 'command_injection', 'jwt', 'info_exposure'] },
+    'http://127.0.0.1:3001/': { recall_required: 30 },
+    'http://127.0.0.1:3007/': { confirmed_max: 0 },
+    'http://127.0.0.1:3008/': { confirmed_exploitable_max: 0 },
   },
   tier3: {
     // All Tier 3 — passive only, 0 confirmed exploitable expected
@@ -84,7 +84,7 @@ const EXPECTATIONS = {
 };
 
 async function benchmark() {
-  const API_BASE = process.argv[2] || 'http://localhost:3000';
+  const API_BASE = process.argv[2] || 'http://127.0.0.1:3000';
   const results = { tier1: [], tier2: [], tier3: [], stop_criteria: {} };
   const totalStart = Date.now();
 
