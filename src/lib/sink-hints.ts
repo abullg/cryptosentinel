@@ -295,7 +295,7 @@ const SINK_PATTERNS: SinkPattern[] = [
     type: 'secret_pattern',
     regex: /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g,
     severity: 'high',
-    description: 'JWT token detected (verify if it's a session token vs public API token)',
+    description: 'JWT token detected (verify if session token vs public API token)',
     redactMatch: true,
   },
 ];
