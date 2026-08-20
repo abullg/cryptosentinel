@@ -711,32 +711,20 @@ export async function fuzzCsrf(
     return [];
   }
 
-  console.log('[active-fuzzer]   csrf: Step 1 — verify current login (admin/password)...');
-  // Step 1: Verify current state — login should work with admin/password
-  const loginCheckBody = new URLSearchParams({
-    username: 'admin', password: 'password', Login: 'Login',
-  }).toString();
-  const loginCheck = await fetch(`${base.replace('/vulnerabilities/csrf', '')}/login.php`, {
-    method: 'POST',
-    headers: { 'User-Agent': 'CryptoSentinel-Active-Fuzzer/1.0', 'Content-Type': 'application/x-www-form-urlencoded', Cookie: cookies },
-    body: loginCheckBody,
+  console.log('[active-fuzzer]   csrf: Step 1 — verify auth session (GET /index.php)...');
+  // Step 1: Verify we're authenticated via existing session (not creating new login)
+  const baseUrl = targetUrl.replace(/\/vulnerabilities\/csrf\/?$/, '');
+  const authCheck = await fetch(`${baseUrl}/index.php`, {
+    headers: { 'User-Agent': 'CryptoSentinel-Active-Fuzzer/1.0', Cookie: cookies },
     redirect: 'manual',
     signal: AbortSignal.timeout(config.perProbeTimeoutMs),
   });
-  const loginOk = loginCheck.status === 302 && (loginCheck.headers.get('location') || '').includes('index.php');
-  if (!loginOk) {
-    console.log('[active-fuzzer]   csrf: login with admin/password failed — cannot test CSRF (state already changed?)');
-    // Try to restore password first
-    const restoreBody = new URLSearchParams({
-      password_new: 'password', password_conf: 'password', Change: 'Change',
-    }).toString();
-    await fetch(`${targetUrl}?password_new=password&password_conf=password&Change=Change`, {
-      headers: { 'User-Agent': 'CryptoSentinel-Active-Fuzzer/1.0', Cookie: cookies },
-      signal: AbortSignal.timeout(config.perProbeTimeoutMs),
-    });
+  const authOk = authCheck.status === 200;
+  console.log(`[active-fuzzer]   csrf: auth check → ${authCheck.status} ${authOk ? '✓ authenticated' : '✗ not authenticated'}`);
+  if (!authOk) {
+    console.log('[active-fuzzer]   csrf: session not authenticated — skipping');
     return [];
   }
-  console.log('[active-fuzzer]   csrf: ✓ admin/password works');
 
   // Step 2: Send CSRF attack — change password to 'hacked' (only cookie, no CSRF token needed in low security)
   console.log('[active-fuzzer]   csrf: Step 2 — send password change to "hacked"...');
@@ -749,12 +737,12 @@ export async function fuzzCsrf(
     signal: AbortSignal.timeout(config.perProbeTimeoutMs),
   });
 
-  // Step 3: Verify — login with old password should FAIL, new should SUCCEED
-  console.log('[active-fuzzer]   csrf: Step 3 — verify password changed...');
+  // Step 3: Verify — login with old password should FAIL (state changed)
+  console.log('[active-fuzzer]   csrf: Step 3 — verify password changed (try login admin/password)...');
   const oldPassBody = new URLSearchParams({
     username: 'admin', password: 'password', Login: 'Login',
   }).toString();
-  const oldPassRes = await fetch(`${base.replace('/vulnerabilities/csrf', '')}/login.php`, {
+  const oldPassRes = await fetch(`${baseUrl}/login.php`, {
     method: 'POST',
     headers: { 'User-Agent': 'CryptoSentinel-Active-Fuzzer/1.0', 'Content-Type': 'application/x-www-form-urlencoded', Cookie: cookies },
     body: oldPassBody,
@@ -764,7 +752,7 @@ export async function fuzzCsrf(
   const oldPassFails = oldPassRes.status !== 302 || !(oldPassRes.headers.get('location') || '').includes('index.php');
   console.log(`[active-fuzzer]   csrf: old password (password) ${oldPassFails ? 'FAILS ✓' : 'still works ✗'}`);
 
-  // Step 4: RESTORE password to 'password'
+  // Step 4: RESTORE password to 'password' (mandatory cleanup)
   console.log('[active-fuzzer]   csrf: Step 4 — RESTORE password to "password"...');
   const restoreBody = new URLSearchParams({
     password_new: 'password', password_conf: 'password', Change: 'Change',
