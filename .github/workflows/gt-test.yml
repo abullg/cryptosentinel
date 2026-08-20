@@ -1,0 +1,69 @@
+name: Force Restart GT + Test DVWA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p 22 -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Force restart GT containers + run DVWA test
+        run: |
+          HOST="${{ secrets.VPS_HOST }}"
+          USER="${{ secrets.VPS_USER || 'root' }}"
+          ssh -p 22 -o StrictHostKeyChecking=no -o ConnectTimeout=60 -o ServerAliveInterval=30 -i ~/.ssh/id_ed25519 $USER@$HOST "bash -s" <<'REMOTE_EOF' | tee /tmp/gt_test.log
+          set -e
+          echo "=== 1. Force remove ALL GT containers ==="
+          docker rm -f cs-juice-shop cs-dvwa cs-canary cs-negative cs-wrongsecrets cs-crapi-main cs-webgoat 2>&1 || true
+
+          echo ""
+          echo "=== 2. docker compose up (fresh) ==="
+          cd /opt/cryptosentinel/tests/gt
+          docker compose up -d --no-deps 2>&1 | tail -10
+
+          echo "=== Waiting 30s for DVWA to start ==="
+          sleep 30
+
+          echo ""
+          echo "=== 3. Health check ==="
+          for port in 3002 3007 3008; do
+            echo "--- localhost:$port ---"
+            curl -sI --max-time 10 http://localhost:$port/ | head -1 || echo "FAIL"
+          done
+
+          echo ""
+          echo "=== 4. GT_ALLOWLIST + PM2 restart ==="
+          cd /opt/cryptosentinel
+          for ECOSYSTEM_FILE in ecosystem.config.js ecosystem.config.cjs; do
+            if [ -f "$ECOSYSTEM_FILE" ]; then
+              grep -q "GT_ALLOWLIST_ENABLED" "$ECOSYSTEM_FILE" || sed -i 's/env: {/env: {\n        GT_ALLOWLIST_ENABLED: "true",/' "$ECOSYSTEM_FILE"
+              grep "GT_ALLOWLIST_ENABLED" "$ECOSYSTEM_FILE"
+              break
+            fi
+          done
+          pm2 restart cryptosentinel --update-env 2>&1 | tail -3
+          sleep 3
+          curl -s --max-time 5 http://localhost:3000/api/health 2>&1 | head -3
+
+          echo ""
+          echo "=== 5. Run benchmark.js (DVWA only) ==="
+          GT_ALLOWLIST_ENABLED=true node scripts/benchmark.js http://localhost:3000 2>&1
+
+          echo "=== DONE ==="
+          REMOTE_EOF
+
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gt-test-results
+          path: /tmp/gt_test.log
+          if-no-files-found: ignore
