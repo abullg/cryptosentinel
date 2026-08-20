@@ -109,41 +109,30 @@ jobs:
           # at the END of OUTPUT chain (after the REJECT rule). The docker
           # bridge subnet rule was at position 180, AFTER REJECT at position 10,
           # so packets were rejected before reaching it.
-          # Fix: use iptables-save + grep filter + iptables-restore to
+          # Fix: use iptables-save + python3 filter + iptables-restore to
           # remove ALL cs-egress-* rules from OUTPUT chain in one shot.
-          # (Per-rule iptables -D didn't work because rules had extra params
-          # like -o lo, -p tcp that the delete command didn't specify.)
           echo "=== Flushing all cs-egress-* rules from OUTPUT chain ==="
           iptables-save > /tmp/iptables-before-flush.bak
-          # Filter: keep all lines EXCEPT those in OUTPUT chain with cs-egress- comment
+          # Filter: skip any '-A OUTPUT ...' rule line that contains 'cs-egress-'
           python3 << 'PYEOF' > /tmp/iptables-filtered.txt
-          import sys
           lines = open('/tmp/iptables-before-flush.bak').read().split('\n')
-          in_output = False
           out = []
+          skipped = 0
           for line in lines:
-              if line.startswith('*'):
-                  in_output = False
-                  out.append(line)
-                  continue
-              if line.startswith(':OUTPUT'):
-                  in_output = True
-                  out.append(line)
-                  continue
-              if line.startswith('COMMIT') or (line.startswith(':') and not line.startswith(':OUTPUT')):
-                  in_output = False
-                  out.append(line)
-                  continue
-              # Skip rules in OUTPUT chain that have cs-egress- comment
-              if in_output and '--comment "cs-egress-' in line:
-                  continue
-              if in_output and "--comment cs-egress-" in line:
+              # Only filter RULE lines (start with -A), not chain policy lines (:)
+              if line.startswith('-A OUTPUT ') and 'cs-egress-' in line:
+                  skipped += 1
                   continue
               out.append(line)
-          print('\n'.join(out))
+          print(f"# filtered: {skipped} cs-egress rules removed from OUTPUT chain")
+          for line in out:
+              print(line)
           PYEOF
-          # Restore filtered rules
-          iptables-restore < /tmp/iptables-filtered.txt 2>&1 | head -5 || true
+          echo "  Filtered ruleset:"
+          head -3 /tmp/iptables-filtered.txt
+          echo "  ..."
+          # Restore filtered rules (replaces entire ruleset)
+          iptables-restore < /tmp/iptables-filtered.txt 2>&1 | head -5
           echo "=== Flush complete ==="
 
           echo "=== Applying CryptoSentinel egress allowlist (fresh) ==="
