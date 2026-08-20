@@ -78,7 +78,7 @@ jobs:
             -t http/exposures/ \\
             -t http/secrets/ \\
             -severity low,medium,high,critical \\
-            -json \\
+            -j \\
             -o /tmp/cs-nuclei/nuclei-results.json \\
             -silent \\
             -rate-limit 30 \\

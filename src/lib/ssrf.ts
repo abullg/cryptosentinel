@@ -8,11 +8,24 @@
  * PostgreSQL, Redis, etc.
  *
  * This module blocks:
- *   - Loopback (127.0.0.0/8, ::1)
+ *   - Loopback (127.0.0.0/8, ::1) — UNLESS GT_ALLOWLIST_ENABLED=true
  *   - Link-local (169.254.0.0/16 — includes AWS metadata)
  *   - Private ranges (10/8, 172.16/12, 192.168/16, fc00::/7)
  *   - Multicast / broadcast
  *   - Common sensitive ports (Docker API, DBs, etc.)
+ *
+ * GT allowlist (post Claude audit): for benchmark on self-hosted GT
+ * docker containers (juice-shop, dvwa, canary, negative — see
+ * tests/gt/docker-compose.yml), we need to allow localhost fetches.
+ * This is safe BECAUSE:
+ *   1. Egress iptables allowlist (see setup-gt-and-egress.yml) blocks
+ *      ALL outbound except 53/80/443/22/123 + loopback. Even if
+ *      prompt injection tells GLM to fetch attacker.test, the kernel
+ *      rejects the connection.
+ *   2. GT containers run on localhost only — no DNS, no external
+ *      network dependency.
+ *   3. Only enabled when GT_ALLOWLIST_ENABLED=true env is set —
+ *      production deploy should NOT set this.
  *
  * Usage:
  *   const blocked = isSsrfBlocked(url);
@@ -59,6 +72,45 @@ const BLOCKED_HOSTNAMES = new Set([
   'metadata',
   'host.docker.internal',
 ]);
+
+// GT (Ground Truth) allowlist — for self-hosted benchmark docker containers.
+// Enable via GT_ALLOWLIST_ENABLED=true env. NEVER enable in production.
+const GT_ALLOWLIST_HOSTNAMES = new Set([
+  'localhost',
+  '127.0.0.1',
+  '::1',
+  // GT docker container names (if accessed via docker network)
+  'cs-juice-shop',
+  'cs-dvwa',
+  'cs-canary',
+  'cs-negative',
+  'cs-wrongsecrets',
+  'cs-crapi-main',
+  'cs-webgoat',
+]);
+
+// GT allowlist ports (matches tests/gt/docker-compose.yml port mappings)
+const GT_ALLOWLIST_PORTS = new Set([
+  3001, // juice-shop
+  3002, // dvwa
+  3003, // wrongsecrets (disabled but listed)
+  3004, // crapi (disabled)
+  3005, // webgoat (disabled)
+  3007, // canary
+  3008, // negative
+]);
+
+function isGtAllowlistEnabled(): boolean {
+  return process.env.GT_ALLOWLIST_ENABLED === 'true';
+}
+
+function isGtAllowedTarget(hostname: string, port: number): boolean {
+  if (!isGtAllowlistEnabled()) return false;
+  // Only allow specific GT hostnames + ports — defense in depth
+  if (!GT_ALLOWLIST_HOSTNAMES.has(hostname)) return false;
+  if (!GT_ALLOWLIST_PORTS.has(port)) return false;
+  return true;
+}
 
 function isPrivateV4(ip: string): boolean {
   // Expected format: a.b.c.d, validated by net.isIP
@@ -128,8 +180,13 @@ export function isSsrfBlocked(rawUrl: string): SsrfCheckResult {
     };
   }
 
-  // Port — block sensitive ports
+  // Port — block sensitive ports (unless GT-allowed target)
   const port = parsed.port ? parseInt(parsed.port, 10) : parsed.protocol === 'https:' ? 443 : 80;
+  const hostnameForGt = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (isGtAllowedTarget(hostnameForGt, port)) {
+    // GT allowlist bypasses sensitive port check (defense: iptables egress)
+    return { blocked: false };
+  }
   if (SENSITIVE_PORTS.has(port)) {
     return {
       blocked: true,
@@ -137,8 +194,12 @@ export function isSsrfBlocked(rawUrl: string): SsrfCheckResult {
     };
   }
 
-  // Hostname — block obvious internal hostnames
-  const hostname = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, ''); // strip IPv6 brackets
+  // Hostname — block obvious internal hostnames (unless GT-allowed)
+  const hostname = hostnameForGt;
+
+  if (isGtAllowedTarget(hostname, port)) {
+    return { blocked: false };
+  }
 
   if (BLOCKED_HOSTNAMES.has(hostname)) {
     return {
@@ -147,9 +208,10 @@ export function isSsrfBlocked(rawUrl: string): SsrfCheckResult {
     };
   }
 
-  // IP literal — check if private
+  // IP literal — check if private (GT allowlist already returned above)
   const ipVersion = isIP(hostname);
   if (ipVersion === 4 && isPrivateV4(hostname)) {
+    // GT allowlist already returned for 127.0.0.1, so this is a different private IP
     return {
       blocked: true,
       reason: `IP ${hostname} is a private/reserved address.`,

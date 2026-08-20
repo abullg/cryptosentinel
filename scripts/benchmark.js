@@ -136,24 +136,41 @@ async function benchmark() {
         continue;
       }
 
-      // Step 4: Get vulnerabilities
+      // Step 4: Get vulnerabilities FOR THIS JOB ONLY (filter by contractId)
+      // Previous version fetched ALL findings in DB (cumulative across benches)
+      // — that's why "confirmedCount" was 2 for every target even when per-job
+      // message said "0 confirmed exploits". Now we filter by contractId.
       let vulns = [];
       try {
-        const vulnsRes = await fetch(`${API_BASE}/api/vulnerabilities?t=${Date.now()}`, {
+        const contractId = job?.contractId;
+        const vulnsRes = await fetch(`${API_BASE}/api/vulnerabilities?t=${Date.now()}${contractId ? `&contractId=${contractId}` : ''}`, {
           signal: AbortSignal.timeout(10_000),
         });
         if (vulnsRes.ok) {
-          vulns = await vulnsRes.json();
+          const allVulns = await vulnsRes.json();
+          // Filter client-side by contractId (in case API doesn't support query param)
+          vulns = contractId
+            ? allVulns.filter(v => v.contractId === contractId)
+            : allVulns;
         }
       } catch {}
 
       const confirmed = vulns.filter(v => v.status === 'confirmed' || v.status === 'validated');
+      const dropped = vulns.filter(v => v.status === 'dropped');
+      const candidates = vulns.filter(v => v.status === 'candidate');
       const types = [...new Set(confirmed.map(v => v.type))];
       const severities = confirmed.map(v => v.severity);
+      const dropReasons = dropped.map(v => v.dropReason || 'unknown');
 
-      console.log(`  COMPLETE: ${confirmed.length} confirmed (${vulns.length} total in DB) (${totalTime}ms)`);
+      console.log(`  COMPLETE: ${confirmed.length} confirmed / ${candidates.length} candidate / ${dropped.length} dropped (${vulns.length} total for THIS jobId) (${totalTime}ms)`);
       console.log(`  Types: ${types.join(', ') || 'none'}`);
       console.log(`  Severities: ${severities.join(', ') || 'none'}`);
+      if (dropped.length > 0) {
+        const reasonHist = {};
+        for (const r of dropReasons) reasonHist[r] = (reasonHist[r] || 0) + 1;
+        console.log(`  Drop reasons: ${JSON.stringify(reasonHist)}`);
+        console.log(`  Candidate/confirm ratio: ${(dropped.length + candidates.length)}/${confirmed.length} = ${confirmed.length > 0 ? ((dropped.length + candidates.length) / confirmed.length).toFixed(1) : '∞'}`);
+      }
 
       results.push({
         url,
@@ -162,9 +179,12 @@ async function benchmark() {
         analyzeTime,
         totalTime,
         confirmedCount: confirmed.length,
+        candidateCount: candidates.length,
+        droppedCount: dropped.length,
         totalCount: vulns.length,
         types,
         severities,
+        dropReasons,
         jobMessage: job?.message || '',
       });
 
@@ -186,9 +206,19 @@ async function benchmark() {
 
   console.log(`Total targets:     ${results.length}`);
   console.log(`Succeeded:         ${succeeded.length}`);
-  console.log(`Failed:            ${failed.length}`);
+  console.log(`Failed:           ${failed.length}`);
   console.log(`With findings:     ${withFindings.length}`);
-  console.log(`Detection rate:    ${succeeded.length > 0 ? (withFindings.length / succeeded.length * 100).toFixed(1) : 0}%`);
+  console.log(`Detection rate:    ${succeeded.length > 0 ? (withFindings.length / succeeded.length * 100).toFixed(1) : 0}% (PER-JOB, filtered by contractId — not cumulative DB count)`);
+
+  // Per-job totals (NOT cumulative DB)
+  const totalConfirmedPerJob = succeeded.reduce((sum, r) => sum + (r.confirmedCount || 0), 0);
+  const totalDroppedPerJob = succeeded.reduce((sum, r) => sum + (r.droppedCount || 0), 0);
+  const totalCandidatesPerJob = succeeded.reduce((sum, r) => sum + (r.candidateCount || 0), 0);
+  console.log(`\nPer-job totals (post Claude audit — HONEST numbers):`);
+  console.log(`  Total confirmed (per-job sum):  ${totalConfirmedPerJob}`);
+  console.log(`  Total dropped (per-job sum):     ${totalDroppedPerJob} ← now preserved for FN analysis`);
+  console.log(`  Total candidates (per-job sum):  ${totalCandidatesPerJob}`);
+  console.log(`  Candidate+dropped / confirmed:    ${totalConfirmedPerJob > 0 ? ((totalCandidatesPerJob + totalDroppedPerJob) / totalConfirmedPerJob).toFixed(1) : '∞'} ← recall lever (Claude §9.8)`);
 
   console.log('\n--- PER-TARGET RESULTS ---');
   for (const r of results) {
