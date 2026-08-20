@@ -666,7 +666,14 @@ async function runAnalysisInBackground(jobId: string, config: {
           for (const f of fuzzFindings) {
             try {
               const hashSig = makeVulnHash(contractId, f.type, `Active fuzzer confirmed: ${f.target}`);
-              const existing = await withTimeout(db.vulnerability.findFirst({ where: { hashSignature: hashSig } }), 10_000, null, 'fuzzer findFirst');
+              // IMPORTANT: dedupe ONLY within this contract — not across all
+              // previous benches. Previously: findFirst({ where: { hashSignature } })
+              // would find an old finding from a PREVIOUS job (different
+              // contractId) and silently skip the new save. Result: active
+              // fuzzer confirmed CSRF but it wasn't saved → "0 confirmed"
+              // reported to user even though the fuzzer found 1 real vuln.
+              // Now: dedupe within current contract only.
+              const existing = await withTimeout(db.vulnerability.findFirst({ where: { hashSignature: hashSig, contractId } }), 10_000, null, 'fuzzer findFirst');
               if (existing) continue;
               const fuzzVuln = await withTimeout(db.vulnerability.create({
                 data: {

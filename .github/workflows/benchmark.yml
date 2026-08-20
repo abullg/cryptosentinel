@@ -29,6 +29,16 @@ jobs:
           # previous benches. "2 confirmed" reflected v1 leftovers, not this
           # bench's per-job count. Now we clear DB before each bench.
           echo "=== Clearing DB (Vulnerability table) ==="
+          # Install sqlite3 if not already installed (was missing on VPS!)
+          # Caused DB clear to silently fail → previous bench's findings
+          # polluted new bench → active fuzzer's hashSig collisions caused
+          # new findings to be silently skipped → "0 confirmed" reported
+          if ! command -v sqlite3 >/dev/null 2>&1; then
+            echo "Installing sqlite3..."
+            apt-get install -y sqlite3 2>&1 | tail -3 || echo "apt install failed — trying alternative"
+          fi
+          command -v sqlite3 && echo "✓ sqlite3 available" || echo "⚠ sqlite3 still not available"
+
           # Search common DB locations — may be at /opt/cryptosentinel, /data,
           # or in prisma dev sqlite. Use broader search.
           DB_FILE=$(find /opt/cryptosentinel /data /var/lib/cryptosentinel -name "*.db" -type f 2>/dev/null | head -1)
@@ -43,12 +53,31 @@ jobs:
           fi
           if [ -n "$DB_FILE" ] && [ -f "$DB_FILE" ]; then
             echo "DB file: $DB_FILE"
-            sqlite3 "$DB_FILE" "DELETE FROM Vulnerability;" 2>&1 || echo "Vulnerability table clear failed (might not exist yet)"
-            sqlite3 "$DB_FILE" "DELETE FROM AnalysisJob;" 2>&1 || true
-            sqlite3 "$DB_FILE" "DELETE FROM Audit;" 2>&1 || true
-            sqlite3 "$DB_FILE" "DELETE FROM Contract;" 2>&1 || true
-            sqlite3 "$DB_FILE" "DELETE FROM Project;" 2>&1 || true
-            echo "DB cleared"
+            # Use sqlite3 if available, otherwise use node + prisma
+            if command -v sqlite3 >/dev/null 2>&1; then
+              sqlite3 "$DB_FILE" "DELETE FROM Vulnerability;" 2>&1 || echo "Vulnerability table clear failed"
+              sqlite3 "$DB_FILE" "DELETE FROM AnalysisJob;" 2>&1 || true
+              sqlite3 "$DB_FILE" "DELETE FROM Audit;" 2>&1 || true
+              sqlite3 "$DB_FILE" "DELETE FROM Contract;" 2>&1 || true
+              sqlite3 "$DB_FILE" "DELETE FROM Project;" 2>&1 || true
+              echo "DB cleared via sqlite3"
+            else
+              # Fallback: use node + prisma to clear DB
+              echo "sqlite3 unavailable — using node + prisma to clear DB"
+              cd /opt/cryptosentinel
+              node -e "
+                const { PrismaClient } = require('@prisma/client');
+                const p = new PrismaClient();
+                Promise.all([
+                  p.vulnerability.deleteMany(),
+                  p.analysisJob.deleteMany(),
+                  p.audit.deleteMany(),
+                  p.contract.deleteMany(),
+                  p.project.deleteMany(),
+                ]).then(() => { console.log('DB cleared via prisma'); return p.\$disconnect(); })
+                  .catch(e => { console.error('prisma clear failed:', e.message); process.exit(1); });
+              " 2>&1 || echo "node prisma clear failed"
+            fi
           else
             echo "WARNING: No .db file found — skipping clear"
             echo "  Looked in: /opt/cryptosentinel, /data, /var/lib/cryptosentinel"
