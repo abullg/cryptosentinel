@@ -37,25 +37,53 @@ jobs:
           cd tests/gt
           echo "=== docker compose version ==="
           docker compose version
-          echo "=== Pulling GT images (skipping disabled services) ==="
-          docker compose pull --quiet --ignore-pull-failures || docker compose pull --quiet
+
+          # ─── EXPLICIT IMAGE PULL (per service) ───
+          # Previously: docker compose pull --ignore-pull-failures silently skipped
+          # failures. WebGoat (350MB) and Juice Shop got skipped, containers never
+          # started. Now: pull each image individually with explicit error reporting.
+          echo "=== Pulling GT images individually ==="
+          for img in \
+            "bkimminich/juice-shop:v18.0.0" \
+            "vulnerables/web-dvwa:latest" \
+            "webgoat/webgoat:latest" \
+            "nginx:alpine"; do
+            echo "--- Pulling $img ---"
+            if ! docker pull "$img"; then
+              echo "⚠ FAILED to pull $img — continuing (container may fail to start)"
+            fi
+          done
+
+          # VAmPI is built from local Dockerfile — needs docker compose build
+          echo "=== Building VAmPI image from local Dockerfile ==="
+          docker compose build vampi || echo "⚠ VAmPI build failed — continuing"
+
           echo "=== Bringing up GT containers ==="
-          docker compose up -d --no-deps
-          echo "=== Waiting for GT containers to be READY (healthcheck loop) ==="
-          # Juice-shop Node.js needs ~60s to start. Loop up to 120s.
-          for i in $(seq 1 24); do
-            echo "  attempt $i/24 ($(date +%H:%M:%S))..."
+          docker compose up -d --no-deps --build
+          echo "=== Waiting for GT containers to be READY (extended healthcheck loop) ==="
+          # WebGoat Spring Boot needs ~90s startup. Juice Shop Node.js ~60s.
+          # Loop up to 5 min (60 attempts × 5s).
+          for i in $(seq 1 60); do
+            echo "  attempt $i/60 ($(date +%H:%M:%S))..."
             sleep 5
-            # Check if juice-shop responds
-            if curl -s --max-time 5 -o /dev/null -w "%{http_code}" http://localhost:3001/ | grep -qE '^[23][0-9][0-9]$'; then
-              echo "  ✓ juice-shop is ready!"
+            # Check ALL GT ports
+            ALL_OK=true
+            for port in 3001 3002 3005 3007 3008 3009; do
+              CODE=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" http://localhost:$port/ 2>/dev/null || echo "000")
+              if ! echo "$CODE" | grep -qE '^[23][0-9][0-9]$'; then
+                ALL_OK=false
+                echo "    port $port: $CODE (not ready yet)"
+              fi
+            done
+            if [ "$ALL_OK" = "true" ]; then
+              echo "  ✓ All GT containers are ready!"
               break
             fi
           done
           echo "=== GT container status ==="
           docker compose ps
           echo "=== Health check: curl each GT port ==="
-          for port in 3001 3002 3007 3008; do
+          for port in 3001 3002 3005 3007 3008 3009; do
             echo "--- localhost:$port ---"
             curl -sI --max-time 10 http://localhost:$port/ | head -1 || echo "FAIL"
           done
@@ -100,7 +128,7 @@ jobs:
             # Allow GT docker ports (3001-3008) — Docker port-forwarded traffic
             # goes through docker0 after DNAT, not lo. Without this, the REJECT
             # rule blocks all GT container access (juice-shop, dvwa, canary, negative).
-            for gt_port in 3001 3002 3003 3004 3005 3007 3008; do
+            for gt_port in 3001 3002 3003 3004 3005 3006 3007 3008 3009; do
               iptables -A OUTPUT -p tcp --dport $gt_port -j ACCEPT -m comment --comment "cs-egress-allow-gt-port-$gt_port"
             done
 

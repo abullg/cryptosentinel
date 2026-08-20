@@ -29,8 +29,19 @@ jobs:
           # previous benches. "2 confirmed" reflected v1 leftovers, not this
           # bench's per-job count. Now we clear DB before each bench.
           echo "=== Clearing DB (Vulnerability table) ==="
-          DB_FILE=$(find /opt/cryptosentinel -name "*.db" -type f 2>/dev/null | head -1)
-          if [ -n "$DB_FILE" ]; then
+          # Search common DB locations — may be at /opt/cryptosentinel, /data,
+          # or in prisma dev sqlite. Use broader search.
+          DB_FILE=$(find /opt/cryptosentinel /data /var/lib/cryptosentinel -name "*.db" -type f 2>/dev/null | head -1)
+          # Also try prisma default location
+          if [ -z "$DB_FILE" ]; then
+            DB_FILE=$(find /opt/cryptosentinel -name "dev.db" -o -name "cryptosentinel.db" -o -name "app.db" 2>/dev/null | head -1)
+          fi
+          # Also check DATABASE_URL env from PM2
+          if [ -z "$DB_FILE" ]; then
+            DB_URL=$(pm2 env 2>/dev/null | grep -i DATABASE_URL | head -1 | sed -E 's/.*=file://?([^"]+).*/\1/' || true)
+            DB_FILE="${DB_URL#file:}"
+          fi
+          if [ -n "$DB_FILE" ] && [ -f "$DB_FILE" ]; then
             echo "DB file: $DB_FILE"
             sqlite3 "$DB_FILE" "DELETE FROM Vulnerability;" 2>&1 || echo "Vulnerability table clear failed (might not exist yet)"
             sqlite3 "$DB_FILE" "DELETE FROM AnalysisJob;" 2>&1 || true
@@ -40,6 +51,11 @@ jobs:
             echo "DB cleared"
           else
             echo "WARNING: No .db file found — skipping clear"
+            echo "  Looked in: /opt/cryptosentinel, /data, /var/lib/cryptosentinel"
+            echo "  Also tried: dev.db, cryptosentinel.db, app.db"
+            # Try pm2 logs for DATABASE_URL
+            echo "  PM2 process env:"
+            pm2 env 2>/dev/null | grep -i "DATABASE_URL\|DB_PATH" | head -3 || echo "  (no DATABASE_URL in pm2 env)"
           fi
 
           # ─── ENABLE GT_ALLOWLIST (for localhost GT docker containers) ───

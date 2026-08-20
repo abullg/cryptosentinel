@@ -87,6 +87,7 @@ const GT_ALLOWLIST_HOSTNAMES = new Set([
   'cs-wrongsecrets',
   'cs-crapi-main',
   'cs-webgoat',
+  'cs-vampi',  // VAmPI Python/Flask — added 2026-08-21
 ]);
 
 // GT allowlist ports (matches tests/gt/docker-compose.yml port mappings)
@@ -95,9 +96,11 @@ const GT_ALLOWLIST_PORTS = new Set([
   3002, // dvwa
   3003, // wrongsecrets (disabled but listed)
   3004, // crapi (disabled)
-  3005, // webgoat (disabled)
+  3005, // webgoat (was disabled — now enabled)
+  3006, // webgoat H2 console
   3007, // canary
   3008, // negative
+  3009, // vampi — added 2026-08-21
 ]);
 
 function isGtAllowlistEnabled(): boolean {
