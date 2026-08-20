@@ -616,6 +616,7 @@ async function runAnalysisInBackground(jobId: string, config: {
         fireAndForget(db.audit.update({ where: { id: auditId }, data: { status: 'completed', findings: confirmedCount, completedAt: new Date() } }), 'catch audit.update static');
         fireAndForget(db.analysisJob.update({ where: { id: jobId }, data: { status: 'completed', resultCount: confirmedCount } }), 'catch analysisJob.update static');
         writeProgressFile(jobId, { progress: 100, message: `Analysis complete (static-only): ${confirmedCount} confirmed`, status: 'completed' });
+        if (progressInterval) clearInterval(progressInterval);  // ← was missing, caused job to "stay running" with progressInterval overwriting completed status
         clearInterval(flushTimer); clearInterval(heartbeatTimer);
         clearTimeout(globalTimeout);
         clearTimeout(panicTimer);
