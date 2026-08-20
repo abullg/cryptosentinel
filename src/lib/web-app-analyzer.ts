@@ -1570,10 +1570,13 @@ Construct detailed exploit procedures for each vulnerability.`,
 // ═══════════════════════════════════════════════════
 
 function parseAiVulnResponse(content: string): AiVulnFinding[] {
+  const jsonStr = stripMarkdownAndExtractArray(content);
+  if (!jsonStr) {
+    console.error('[WebAppAnalyzer] Failed to parse AI vuln response: no array found');
+    console.error('Content preview:', content.slice(0, 500));
+    return [];
+  }
   try {
-    let jsonStr = content.trim();
-    const jsonMatch = jsonStr.match(/\[[\s\S]*\]/);
-    if (jsonMatch) jsonStr = jsonMatch[0];
     const parsed = JSON.parse(jsonStr);
     if (!Array.isArray(parsed)) return [];
     return parsed.map(v => ({
@@ -1588,15 +1591,19 @@ function parseAiVulnResponse(content: string): AiVulnFinding[] {
     }));
   } catch (e) {
     console.error('[WebAppAnalyzer] Failed to parse AI vuln response:', e);
+    console.error('Content preview:', content.slice(0, 500));
     return [];
   }
 }
 
 function parseAiExploitResponse(content: string): AiExploitFinding[] {
+  const jsonStr = stripMarkdownAndExtractArray(content);
+  if (!jsonStr) {
+    console.error('[WebAppAnalyzer] Failed to parse AI exploit response: no array found');
+    console.error('Content preview:', content.slice(0, 500));
+    return [];
+  }
   try {
-    let jsonStr = content.trim();
-    const jsonMatch = jsonStr.match(/\[[\s\S]*\]/);
-    if (jsonMatch) jsonStr = jsonMatch[0];
     const parsed = JSON.parse(jsonStr);
     if (!Array.isArray(parsed)) return [];
     return parsed.map(e => ({
@@ -1607,8 +1614,45 @@ function parseAiExploitResponse(content: string): AiExploitFinding[] {
     }));
   } catch (e) {
     console.error('[WebAppAnalyzer] Failed to parse AI exploit response:', e);
+    console.error('Content preview:', content.slice(0, 500));
     return [];
   }
+}
+
+/**
+ * Strip leading/trailing markdown code fences and extract the outermost
+ * JSON array using bracket-aware parsing (respects string literals + escapes).
+ *
+ * The simple /\[[\s\S]*\]/ regex is greedy and over-captures when string
+ * values contain `]`. It also breaks when AI wraps the JSON in ```json ... ```
+ * AND embeds nested ```javascript ... ``` blocks inside string values
+ * (which is exactly what happens with the bitunix analysis).
+ */
+function stripMarkdownAndExtractArray(content: string): string | null {
+  let s = content.trim();
+  // Strip LEADING markdown fence
+  s = s.replace(/^```(?:json|javascript)?\s*/, '');
+  // Strip TRAILING markdown fence
+  s = s.replace(/\s*```\s*$/, '');
+  // Bracket-aware array extraction
+  const arrStart = s.indexOf('[');
+  if (arrStart === -1) return null;
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = arrStart; i < s.length; i++) {
+    const c = s[i];
+    if (escape) { escape = false; continue; }
+    if (c === '\\') { escape = true; continue; }
+    if (c === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (c === '[') depth++;
+    else if (c === ']') {
+      depth--;
+      if (depth === 0) return s.slice(arrStart, i + 1);
+    }
+  }
+  return null;
 }
 
 // ═══════════════════════════════════════════════════

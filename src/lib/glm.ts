@@ -1726,14 +1726,47 @@ export async function analyzeWebWithGLM(
   try {
     let jsonStr = response.content.trim();
 
-    // Strip markdown code fences (```json ... ``` or ``` ... ```)
-    const markdownMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
-    if (markdownMatch) {
-      jsonStr = markdownMatch[1].trim();
-    }
+    // Strip LEADING markdown code fence (```json or ```)
+    // We only strip the outer fence — content may contain NESTED fences
+    // inside JSON string values (e.g. AI embeds ```javascript ... ``` inside
+    // a description field), so non-greedy regex would stop too early.
+    jsonStr = jsonStr.replace(/^```(?:json|javascript)?\s*/, '');
 
-    const jsonMatch = jsonStr.match(/\[[\s\S]*\]/);
-    if (jsonMatch) jsonStr = jsonMatch[0];
+    // Strip TRAILING markdown code fence (with optional whitespace before)
+    jsonStr = jsonStr.replace(/\s*```\s*$/, '');
+
+    // Extract JSON array using bracket-aware parsing.
+    // The simple /\[[\s\S]*\]/ regex is greedy and will over-capture if
+    // string values contain "]" characters. Walk through the string,
+    // respecting string literals and escape sequences.
+    const arrStart = jsonStr.indexOf('[');
+    if (arrStart === -1) {
+      console.error('Failed to parse web analysis response: no JSON array found');
+      console.error('Content preview:', response.content.slice(0, 500));
+      return [];
+    }
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    let arrEnd = -1;
+    for (let i = arrStart; i < jsonStr.length; i++) {
+      const c = jsonStr[i];
+      if (escape) { escape = false; continue; }
+      if (c === '\\') { escape = true; continue; }
+      if (c === '"') { inString = !inString; continue; }
+      if (inString) continue;
+      if (c === '[') depth++;
+      else if (c === ']') {
+        depth--;
+        if (depth === 0) { arrEnd = i; break; }
+      }
+    }
+    if (arrEnd === -1) {
+      console.error('Failed to parse web analysis response: unbalanced brackets');
+      console.error('Content preview:', response.content.slice(0, 500));
+      return [];
+    }
+    jsonStr = jsonStr.slice(arrStart, arrEnd + 1);
 
     const parsed = JSON.parse(jsonStr);
     if (Array.isArray(parsed)) {
