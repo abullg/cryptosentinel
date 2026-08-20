@@ -104,104 +104,92 @@ jobs:
           echo "=== CURRENT iptables OUTPUT chain ==="
           iptables -L OUTPUT -n --line-numbers | head -30
 
-          # Idempotent: only add if not already present (check by comment match)
-          if iptables -C OUTPUT -m comment --comment "cs-egress-allow-http" -p tcp --dport 80 -j ACCEPT 2>/dev/null; then
-            echo "egress rules already applied — skipping"
-          else
-            echo "=== Applying CryptoSentinel egress allowlist ==="
-
-            # Allow loopback (localhost) — GT containers + Next.js internal
-            iptables -A OUTPUT -o lo -j ACCEPT -m comment --comment "cs-egress-allow-loopback"
-
-            # Allow established connections (response traffic for inbound requests)
-            iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT -m comment --comment "cs-egress-allow-established"
-
-            # Allow DNS (UDP/TCP 53)
-            iptables -A OUTPUT -p udp --dport 53 -j ACCEPT -m comment --comment "cs-egress-allow-dns-udp"
-            iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT -m comment --comment "cs-egress-allow-dns-tcp"
-
-            # Allow HTTP/HTTPS for fetch-url (target scanning + jina.ai WAF bypass)
-            iptables -A OUTPUT -p tcp --dport 80 -j ACCEPT -m comment --comment "cs-egress-allow-http"
-            iptables -A OUTPUT -p tcp --dport 443 -j ACCEPT -m comment --comment "cs-egress-allow-https"
-
-            # Allow SSH (for management)
-            iptables -A OUTPUT -p tcp --dport 22 -j ACCEPT -m comment --comment "cs-egress-allow-ssh"
-
-            # Allow NTP
-            iptables -A OUTPUT -p udp --dport 123 -j ACCEPT -m comment --comment "cs-egress-allow-ntp"
-
-            # Allow GT docker ports (3001-3008) — Docker port-forwarded traffic
-            # goes through docker0 after DNAT, not lo. Without this, the REJECT
-            # rule blocks all GT container access (juice-shop, dvwa, canary, negative).
-            for gt_port in 3001 3002 3003 3004 3005 3006 3007 3008 3009; do
-              iptables -A OUTPUT -p tcp --dport $gt_port -j ACCEPT -m comment --comment "cs-egress-allow-gt-port-$gt_port"
+          # ─── FLUSH ALL cs-egress-* RULES BEFORE RE-ADDING ───
+          # Previous issue: multiple workflow runs accumulated DUPLICATE rules
+          # at the END of OUTPUT chain (after the REJECT rule). The docker
+          # bridge subnet rule was at position 180, AFTER REJECT at position 10,
+          # so packets were rejected before reaching it.
+          # Fix: delete all cs-egress-* rules, then re-add them in correct order.
+          echo "=== Flushing all cs-egress-* rules from OUTPUT chain ==="
+          # Loop deletion — iptables -D removes one instance at a time
+          for comment_match in \
+            "cs-egress-allow-loopback" \
+            "cs-egress-allow-established" \
+            "cs-egress-allow-dns-udp" \
+            "cs-egress-allow-dns-tcp" \
+            "cs-egress-allow-http" \
+            "cs-egress-allow-https" \
+            "cs-egress-allow-ssh" \
+            "cs-egress-allow-ntp" \
+            "cs-egress-allow-docker-bridge-subnet" \
+            "cs-egress-allow-docker0-iface" \
+            "cs-egress-deny-default"; do
+            while iptables -D OUTPUT -m comment --comment "$comment_match" 2>/dev/null; do
+              echo "  deleted $comment_match"
             done
-
-            # ─── ALLOW TRAFFIC TO DOCKER BRIDGE SUBNET (CRITICAL FIX) ───
-            # When docker-proxy forwards host:3001 → container:3000, the
-            # docker-proxy process makes a NEW outbound TCP connection to
-            # the container's internal IP (e.g., 172.16.1.3:3000). This
-            # connection goes through the OUTPUT chain. WITHOUT this rule,
-            # the default REJECT rule blocks it because container internal
-            # ports (3000, 5000, 8080) aren't in the GT port allowlist.
-            # Symptom: curl localhost:3001 → HTTP=000 (connection reset)
-            # while curl localhost:3002 (DVWA → container port 80) works.
-            # Fix: allow all traffic destined to the docker bridge subnets.
-            # 172.16.0.0/16 covers default docker0 (172.16.0.0/24) and
-            # gt_default (172.16.1.0/24) and any other docker networks.
-            iptables -A OUTPUT -d 172.16.0.0/16 -j ACCEPT -m comment --comment "cs-egress-allow-docker-bridge-subnet"
-            # Also allow traffic going OUT to docker bridge interfaces
-            # (covers cases where docker creates additional bridges)
-            iptables -A OUTPUT -o docker0 -j ACCEPT -m comment --comment "cs-egress-allow-docker0-iface"
-            for br_iface in br-0 br-1 br-2 br-3 br-4 br-5 br-6 br-7 br-8 br-9; do
-              iptables -A OUTPUT -o "$br_iface"+ -j ACCEPT -m comment --comment "cs-egress-allow-$br_iface-iface" 2>/dev/null || true
-            done
-
-            # Allow HTTPS to github.com (for git pull, deps)
-            # (covered by 443 above)
-
-            # DENY everything else — this is the prompt-injection defense
-            # If GLM generates validationSteps with URL to attacker.test,
-            # evil.example, internal-ssrf-target.test (see canary page),
-            # this rule blocks the probe.
-            iptables -A OUTPUT -j REJECT -m comment --comment "cs-egress-deny-default"
-
-            echo "=== egress rules applied ==="
-          fi
-
-          # ─── GT PORT RULES (always applied — separate from main block) ───
-          # These MUST be added BEFORE the REJECT rule. Since the main block
-          # above might be skipped (idempotency check), we add GT port rules
-          # separately with their own idempotency check.
+          done
+          # Delete GT port rules
           for gt_port in 3001 3002 3003 3004 3005 3006 3007 3008 3009; do
-            if ! iptables -C OUTPUT -p tcp --dport $gt_port -j ACCEPT -m comment --comment "cs-egress-allow-gt-port-$gt_port" 2>/dev/null; then
-              echo "Adding GT port $gt_port to allowlist"
-              iptables -I OUTPUT 1 -p tcp --dport $gt_port -j ACCEPT -m comment --comment "cs-egress-allow-gt-port-$gt_port"
-            fi
+            while iptables -D OUTPUT -p tcp --dport $gt_port -m comment --comment "cs-egress-allow-gt-port-$gt_port" 2>/dev/null; do
+              echo "  deleted gt-port-$gt_port"
+            done
+          done
+          # Delete br-* interface rules
+          for br_iface in br-0 br-1 br-2 br-3 br-4 br-5 br-6 br-7 br-8 br-9; do
+            while iptables -D OUTPUT -o "$br_iface"+ -m comment --comment "cs-egress-allow-$br_iface-iface" 2>/dev/null; do :; done
+          done
+          echo "=== Flush complete ==="
+
+          echo "=== Applying CryptoSentinel egress allowlist (fresh) ==="
+
+          # Allow loopback (localhost) — GT containers + Next.js internal
+          iptables -A OUTPUT -o lo -j ACCEPT -m comment --comment "cs-egress-allow-loopback"
+
+          # Allow established connections (response traffic for inbound requests)
+          iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT -m comment --comment "cs-egress-allow-established"
+
+          # Allow DNS (UDP/TCP 53)
+          iptables -A OUTPUT -p udp --dport 53 -j ACCEPT -m comment --comment "cs-egress-allow-dns-udp"
+          iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT -m comment --comment "cs-egress-allow-dns-tcp"
+
+          # Allow HTTP/HTTPS for fetch-url (target scanning + jina.ai WAF bypass)
+          iptables -A OUTPUT -p tcp --dport 80 -j ACCEPT -m comment --comment "cs-egress-allow-http"
+          iptables -A OUTPUT -p tcp --dport 443 -j ACCEPT -m comment --comment "cs-egress-allow-https"
+
+          # Allow SSH (for management)
+          iptables -A OUTPUT -p tcp --dport 22 -j ACCEPT -m comment --comment "cs-egress-allow-ssh"
+
+          # Allow NTP
+          iptables -A OUTPUT -p udp --dport 123 -j ACCEPT -m comment --comment "cs-egress-allow-ntp"
+
+          # Allow GT docker ports (3001-3009) — host port for curl from fetch-url
+          for gt_port in 3001 3002 3003 3004 3005 3006 3007 3008 3009; do
+            iptables -A OUTPUT -p tcp --dport $gt_port -j ACCEPT -m comment --comment "cs-egress-allow-gt-port-$gt_port"
           done
 
-          # ─── DOCKER BRIDGE SUBNET (always applied — CRITICAL FIX) ───
-          # docker-proxy makes NEW outbound TCP connections to container
-          # internal IPs (e.g., 172.16.1.3:3000 for juice-shop). Without
-          # this rule, those connections are REJECTed by the default deny
-          # rule, causing curl localhost:3001 → HTTP=000 for all containers
-          # whose internal port isn't 80 (only DVWA/canary/negative worked).
-          # Must be INSERTed at position 1 (before REJECT rule).
-          if ! iptables -C OUTPUT -d 172.16.0.0/16 -j ACCEPT -m comment --comment "cs-egress-allow-docker-bridge-subnet" 2>/dev/null; then
-            echo "Adding docker bridge subnet allowlist rule"
-            iptables -I OUTPUT 1 -d 172.16.0.0/16 -j ACCEPT -m comment --comment "cs-egress-allow-docker-bridge-subnet"
-          fi
-          # Also allow via docker0 interface
-          if ! iptables -C OUTPUT -o docker0 -j ACCEPT -m comment --comment "cs-egress-allow-docker0-iface" 2>/dev/null; then
-            iptables -I OUTPUT 1 -o docker0 -j ACCEPT -m comment --comment "cs-egress-allow-docker0-iface"
-          fi
-          # And via any br-* interface (custom docker networks)
+          # ─── ALLOW TRAFFIC TO DOCKER BRIDGE SUBNET (CRITICAL FIX) ───
+          # When docker-proxy forwards host:3001 → container:3000, the
+          # docker-proxy process makes a NEW outbound TCP connection to
+          # the container's internal IP (e.g., 172.16.1.3:3000). This
+          # connection goes through the OUTPUT chain. WITHOUT this rule,
+          # the default REJECT rule blocks it because container internal
+          # ports (3000, 5000, 8080) aren't in the GT port allowlist.
+          # Symptom: curl localhost:3001 → HTTP=000 (connection reset)
+          # while curl localhost:3002 (DVWA → container port 80) works.
+          iptables -A OUTPUT -d 172.16.0.0/16 -j ACCEPT -m comment --comment "cs-egress-allow-docker-bridge-subnet"
+          # Also allow traffic going OUT to docker bridge interfaces
+          iptables -A OUTPUT -o docker0 -j ACCEPT -m comment --comment "cs-egress-allow-docker0-iface"
           for br_iface in br-0 br-1 br-2 br-3 br-4 br-5 br-6 br-7 br-8 br-9; do
-            if ! iptables -C OUTPUT -o "$br_iface"+ -j ACCEPT -m comment --comment "cs-egress-allow-$br_iface-iface" 2>/dev/null; then
-              iptables -I OUTPUT 1 -o "$br_iface"+ -j ACCEPT -m comment --comment "cs-egress-allow-$br_iface-iface" 2>/dev/null || true
-            fi
+            iptables -A OUTPUT -o "$br_iface"+ -j ACCEPT -m comment --comment "cs-egress-allow-$br_iface-iface" 2>/dev/null || true
           done
-          echo "=== GT port + docker bridge rules ensured ==="
+
+          # DENY everything else — this is the prompt-injection defense
+          # If GLM generates validationSteps with URL to attacker.test,
+          # evil.example, internal-ssrf-target.test (see canary page),
+          # this rule blocks the probe.
+          iptables -A OUTPUT -j REJECT -m comment --comment "cs-egress-deny-default"
+
+          echo "=== egress rules applied ==="
 
           echo "=== UPDATED iptables OUTPUT chain ==="
           iptables -L OUTPUT -n --line-numbers
