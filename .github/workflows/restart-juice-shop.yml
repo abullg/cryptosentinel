@@ -1,0 +1,63 @@
+name: Restart Juice Shop
+
+on:
+  workflow_dispatch:
+
+jobs:
+  restart:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p 22 -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Restart juice-shop + check logs
+        run: |
+          HOST="${{ secrets.VPS_HOST }}"
+          USER="${{ secrets.VPS_USER || 'root' }}"
+          ssh -p 22 -o StrictHostKeyChecking=no -o ConnectTimeout=60 -i ~/.ssh/id_ed25519 $USER@$HOST "bash -s" <<'REMOTE_EOF' | tee /tmp/restart.log
+          echo "=== Current docker ps ==="
+          docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" 2>&1
+
+          echo ""
+          echo "=== Restart juice-shop container ==="
+          docker restart cs-juice-shop 2>&1
+          echo "Restarted — waiting 60s for Node.js to start..."
+          sleep 60
+
+          echo ""
+          echo "=== Check if juice-shop is listening ==="
+          ss -tlnp | grep 3001 2>&1 || echo "port 3001 not found"
+          ss -tlnp | grep 3000 2>&1 || echo "port 3000 not found"
+
+          echo ""
+          echo "=== Check juice-shop container logs (last 30 lines) ==="
+          docker logs cs-juice-shop --tail 30 2>&1
+
+          echo ""
+          echo "=== Try curl localhost:3001 ==="
+          curl -sI --max-time 10 http://localhost:3001/ 2>&1 | head -5
+
+          echo ""
+          echo "=== Try curl 127.0.0.1:3001 ==="
+          curl -sI --max-time 10 http://127.0.0.1:3001/ 2>&1 | head -5
+
+          echo ""
+          echo "=== iptables OUTPUT chain (check if blocking 3001) ==="
+          iptables -L OUTPUT -n --line-numbers 2>&1 | head -15
+
+          echo ""
+          echo "=== DONE ==="
+          REMOTE_EOF
+
+      - name: Upload restart log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: restart-juice-shop
+          path: /tmp/restart.log
+          if-no-files-found: ignore
