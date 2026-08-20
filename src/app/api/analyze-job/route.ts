@@ -104,6 +104,8 @@ export async function POST(req: NextRequest) {
       discoveredEndpoints: Array.isArray(discoveredEndpoints) ? discoveredEndpoints : [],
       discoveredForms: Array.isArray(discoveredForms) ? discoveredForms : [],
       discoveredParams: Array.isArray(discoveredParams) ? discoveredParams : [],
+      // Static analysis layer (Claude §8) — from /api/fetch-url
+      staticAnalysis: staticAnalysis || null,
     }).catch(async (err) => {
       // Fire-and-forget on error path — don't block on DB
       fireAndForget(
@@ -137,9 +139,11 @@ async function runAnalysisInBackground(jobId: string, config: {
   discoveredEndpoints: string[];
   discoveredForms: { action: string; method: string; fields: string[] }[];
   discoveredParams: string[];
+  // Static analysis layer (Claude §8) — gitleaks + sink-hints from /api/fetch-url
+  staticAnalysis?: any;
 }) {
   const { sourceCode, contractName, targetType, targetUrl, apiKey, model, contractId, auditId,
-          discoveredEndpoints, discoveredForms, discoveredParams } = config;
+          discoveredEndpoints, discoveredForms, discoveredParams, staticAnalysis: sa } = config;
   const isWeb = targetType === 'exchange' || contractName.endsWith('.html');
 
   // ─── IN-MEMORY PROGRESS STATE + FILE-BASED FLUSH ───
@@ -561,11 +565,10 @@ async function runAnalysisInBackground(jobId: string, config: {
       // The static analysis is passed via the analyze-job POST body as
       // `staticAnalysis` field (modified by benchmark.js + frontend).
 
-      // V3 of analyze-job: read staticAnalysis from POST body
-      // (was: re-run static analysis here. But fetch-url already did it.)
-      let sa: any = null;
+      // V3 of analyze-job: read staticAnalysis from config (passed in from POST body)
+      // sa is destructured from config at top of runAnalysisInBackground
+      // Post Claude-audit §8: static-first pipeline
       try {
-        sa = (reqBody as any)?.staticAnalysis;
         console.log(`[analyze-job] DEBUG staticAnalysis: sa=${sa ? 'object' : 'null/undefined'}, keys=${sa ? Object.keys(sa).join(',') : 'N/A'}, skipLLM=${sa?.skipLLM}, sinkHints.len=${sa?.sinkHints?.length || 0}`);
       } catch (e: any) {
         console.error(`[analyze-job] DEBUG log threw: ${String(e).slice(0, 200)}`);
