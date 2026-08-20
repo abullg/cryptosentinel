@@ -901,10 +901,20 @@ export async function fuzzAllOracles(
   allFindings.push(...await fuzzStoredXss(targetUrl, config));
 
   console.log(`[active-fuzzer] 7/8: CSRF (state-change) oracle...`);
-  allFindings.push(...await fuzzCsrf(targetUrl, config));
+  // CSRF oracle only runs on /csrf/ endpoint — not every endpoint
+  if (targetUrl.includes('/csrf/')) {
+    allFindings.push(...await fuzzCsrf(targetUrl, config));
+  } else {
+    console.log('[active-fuzzer]   csrf: skipping (not a CSRF endpoint)');
+  }
 
   console.log(`[active-fuzzer] 8/8: File upload oracle...`);
-  allFindings.push(...await fuzzFileUpload(targetUrl, config));
+  // Upload oracle only runs on /upload/ endpoint
+  if (targetUrl.includes('/upload/')) {
+    allFindings.push(...await fuzzFileUpload(targetUrl, config));
+  } else {
+    console.log('[active-fuzzer]   upload: skipping (not an upload endpoint)');
+  }
 
   const confirmedCount = allFindings.filter(f => f.confirmed).length;
   console.log(`[active-fuzzer] Done. ${confirmedCount}/${allFindings.length} confirmed.`);
