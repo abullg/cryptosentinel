@@ -221,13 +221,24 @@ async function loginDvwa(baseUrl: string): Promise<string | null> {
 async function setSecurityLow(baseUrl: string, cookies: string): Promise<void> {
   const base = baseUrl.replace(/\/+$/, '');
   try {
-    await fetch(`${base}/security.php`, {
+    // POST to security.php to SET security level to 'low' in DVWA's database
+    // GET alone doesn't change it — DVWA stores security level in DB, not just cookie
+    const secBody = new URLSearchParams({
+      security: 'low',
+      seclev_submit: 'Submit',
+    }).toString();
+    const secRes = await fetch(`${base}/security.php`, {
+      method: 'POST',
       headers: {
         'User-Agent': 'CryptoSentinel-AuthCrawler/1.0',
+        'Content-Type': 'application/x-www-form-urlencoded',
         'Cookie': cookies,
       },
+      body: secBody,
       signal: AbortSignal.timeout(10_000),
     });
+    const secHtml = await secRes.text();
+    console.log(`[auth-crawler] Security level set to low (status ${secRes.status}, ${(secHtml.match(/security.*?impossible|security.*?low/i) || ['(unknown)'])[0]})`);
   } catch {
     // Non-critical — DVWA might accept security=low from cookie alone
   }
@@ -266,11 +277,14 @@ export async function crawlDvwa(baseUrl: string): Promise<AuthCrawlResult> {
           'Cookie': cookies,
         },
         signal: AbortSignal.timeout(10_000),
+        redirect: 'manual',  // Don't follow redirects — we want to see if auth works
       });
       const html = await res.text();
+      const hasForm = html.includes('<form');
+      console.log(`[auth-crawler]   ${ep.path} → status=${res.status}, body=${html.length}, form=${hasForm}`);
 
-      // Check if endpoint exists (200 + has form)
-      if (res.status === 200 && html.includes('<form')) {
+      // Check if endpoint exists (200 + has form) — or 302 redirect to login means auth failed
+      if (res.status === 200 && hasForm) {
         endpoints.push({
           url,
           method: ep.method,
