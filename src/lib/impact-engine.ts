@@ -100,10 +100,36 @@ function analyzeInfoExposureBoundary(
       dataSubject: 'requesting user (self)',
       dataSensitivity: 'internal',
       isOwnerData: true, // it's the USER'S OWN IP
-      isPublicByDesign: true, // CDN edge metadata is exposed to the requesting client by design
-      authorizationBoundary: 'CDN edge → browser (same user)',
+      isPublicByDesign: true, // CDN edge metadata reflected to requesting client
+      authorizationBoundary: 'CDN edge → same user\'s browser (not cross-user)',
       boundaryViolated: false,
-      boundaryReasoning: 'The clientIp in window.__net_track__ is the REQUESTING USER\'S OWN IP address, reflected from the CDN edge. This is the user\'s own data — not another user\'s data. No authorization boundary is crossed. The CDN (Cloudflare) provides this metadata to the page for analytics/troubleshooting purposes. This is EXPECTED behavior for CDN-fronted applications.',
+      boundaryReasoning: `PROVEN: User A requests page → HTML contains IP A (User A's own IP).
+NOT PROVEN: User B requests page → HTML contains IP A (cross-user leak).
+
+The clientIp in window.__net_track__ is the REQUESTING USER'S OWN IP, reflected from CDN edge.
+This is User A seeing User A's own IP — NOT User B seeing User A's IP.
+
+The finding description claims 'any visitor can read the client IP' — this is MISLEADING.
+What's proven: each visitor sees THEIR OWN IP. What's NOT proven: visitor sees ANOTHER user's IP.
+
+isEdgeCache: true suggests a HYPOTHESIS: if edge cache serves User A's cached HTML to User B,
+then User B would see User A's IP. But this hypothesis was NOT tested.
+To prove: send Request A (marker IP) → get cached response → send Request B (different IP)
+→ check if Response B contains __net_track__ from Request A. If yes → cross-user disclosure.
+If no → edge cache is per-user, no cross-user leak.
+
+PII classification (GDPR/CCPA): clientIp IS PII. But PII ≠ vulnerability.
+PII is a DATA CLASSIFICATION. Security violation requires PROOF that data is accessible
+to a SUBJECT WHO SHOULDN'T HAVE IT. Currently, only the data owner (requesting user)
+can see their own IP — no unauthorized disclosure proven.
+
+requestId: classified as CORRELATION IDENTIFIER only. NOT proven to be:
+- linked to session
+- used in authentication
+- used in authorization
+- predictable
+- usable to obtain data
+Without these proofs, requestId is just an opaque tracking ID.`,
     };
   }
 
@@ -182,17 +208,31 @@ function assessCspMissingImpact(): ImpactAssessment {
 
 function assessClientIpExposureImpact(): ImpactAssessment {
   return {
-    attackerCapability: 'Can read own IP address from page source. This is information the user\'s browser already has access to via WebRTC, navigator, etc.',
-    attackPrerequisites: 'Must be running JavaScript on the same page origin (e.g., via a separate XSS, or as a third-party script loaded by the page)',
+    attackerCapability: 'None proven. User A can read User A\'s own IP from page source — this is self-referential, not an attacker capability. To obtain ANOTHER user\'s IP, would need cache poisoning (NOT tested).',
+    attackPrerequisites: 'For cross-user disclosure: edge cache must serve User A\'s HTML to User B (NOT PROVEN — hypothesis only). For same-user data theft: requires separate XSS (if attacker has XSS, they can get IP via WebRTC anyway).',
     impactChain: [
-      'window.__net_track__ contains clientIp → JavaScript can read it',
-      'clientIp is the REQUESTING USER\'S OWN IP → not other users\' data',
-      'Attacker (if they have XSS) can read the victim\'s IP → fingerprinting/tracking',
-      'But: if attacker already has XSS, they can get IP via WebRTC anyway',
-      'Net additional impact: minimal — IP is obtainable through other means',
+      'PROVEN: User A → request → HTML contains IP A (own IP)',
+      'NOT PROVEN: User B → request → HTML contains IP A (cross-user leak)',
+      'HYPOTHESIS: isEdgeCache=true suggests cache might serve stale HTML — but NOT tested',
+      'To test: Request A (marker IP) → Request B (different IP) → compare __net_track__ in responses',
+      'If B gets A\'s IP → cross-user disclosure (real vulnerability)',
+      'If B gets B\'s IP → edge cache is per-user (expected behavior, no vuln)',
+      'PII classification: clientIp IS PII under GDPR/CCPA — but PII ≠ vulnerability',
+      'PII is data classification, not security violation',
+      'Security violation requires: unauthorized subject accessing data — NOT proven here',
     ],
     realImpact: 'informational',
-    impactReasoning: 'Exposing the requesting user\'s own IP in JavaScript is common in CDN-fronted applications. The data belongs to the user themselves, not to other users. Real impact requires a separate XSS vulnerability to read it — but if the attacker has XSS, they can obtain the IP through WebRTC or other means anyway. Net impact: informational.',
+    impactReasoning: `What's PROVEN: Each user sees their OWN IP in page source. This is CDN edge metadata reflected to the requesting client — expected behavior for Cloudflare-fronted sites.
+
+What's NOT PROVEN: Cross-user IP disclosure (User B seeing User A's IP). The finding's claim 'any visitor can read the client IP' is misleading — each visitor reads THEIR OWN IP, not other users' IPs.
+
+isEdgeCache=true is a HYPOTHESIS about potential cache poisoning, not a proven exploit. The system identified this as a potential attack vector but did not test it. Testing would require: send Request A with unique marker → send Request B from different IP → check if Response B contains Request A's __net_track__ data.
+
+PII ≠ vulnerability: clientIp IS PII under GDPR/CCPA. But PII is a DATA CLASSIFICATION. Security violation requires proof that data is accessible to a subject who shouldn't have it. Currently, only the data owner (requesting user) can see their own IP. No unauthorized disclosure proven.
+
+requestId: classified as correlation identifier only. NOT proven to be linked to session, authentication, authorization, or predictable. 'Could be used for session correlation' is speculative — not proven.
+
+Net impact: informational. The finding correctly identifies that __net_track__ contains client IP, but overestimates impact by implying cross-user disclosure which was not tested/proven.`,
   };
 }
 
