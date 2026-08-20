@@ -295,26 +295,41 @@ async function runAnalysisInBackground(jobId: string, config: {
       // job still completes — never hangs forever.
       const PHASE0_BUDGET_MS = 300_000; // 5 min hard cap for Phase 0
       const phase0Start = Date.now();
-      await updateJob(10, `Active probing: ${discoveredEndpoints.length} endpoints, ${discoveredForms.length} forms, ${discoveredParams.length} params...`);
-      try {
-        const probeInputs = buildProbeInputsFromCrawl({
-          discoveredEndpoints, discoveredForms, discoveredParams,
-          targetUrl,
-        });
-        console.log(`[analyze-job] Active probes: ${probeInputs.length} inputs built from crawl data`);
-        // Wrap probes in a timeout — if they take >3 min, abort
-        const probeTimeout = new Promise<PreConfirmedFinding[]>((resolve) =>
-          setTimeout(() => {
-            console.warn('[analyze-job] Active probes hit 3-min timeout — using partial results');
-            resolve([]);
-          }, 180_000));
-        preConfirmed = await Promise.race([
-          runActiveProbes(probeInputs),
-          probeTimeout,
-        ]);
-        console.log(`[analyze-job] Active probes confirmed ${preConfirmed.length} findings with HARD HTTP evidence`);
-      } catch (probeErr) {
-        console.warn('[analyze-job] Active probes failed:', String(probeErr).slice(0, 150));
+
+      // ─── PRODUCTION PASSIVE-ONLY MODE (per Claude §9.30) ───
+      // Active probes are NEVER run on production URLs without written authz.
+      // Active probes only run on localhost GT docker containers.
+      // For production targets: rely on static analysis + LLM only.
+      // This is a HARD SAFETY GUARD — cannot be bypassed by config.
+      const isProductionTarget = !isGtTarget;
+      if (isProductionTarget) {
+        console.log(`[analyze-job] PASSIVE-ONLY MODE (production target): skipping active probes entirely per Claude §9.30`);
+        console.log(`[analyze-job]   Target: ${targetUrl}`);
+        console.log(`[analyze-job]   Reason: production URLs require explicit authorization for active probing`);
+        console.log(`[analyze-job]   Path: static-analysis → LLM (if sink-hints) → save findings → done`);
+        await updateJob(10, `Passive-only mode (production target): skipping active probes per Claude §9.30. Static analysis + LLM only.`);
+      } else {
+        await updateJob(10, `Active probing: ${discoveredEndpoints.length} endpoints, ${discoveredForms.length} forms, ${discoveredParams.length} params...`);
+        try {
+          const probeInputs = buildProbeInputsFromCrawl({
+            discoveredEndpoints, discoveredForms, discoveredParams,
+            targetUrl,
+          });
+          console.log(`[analyze-job] Active probes: ${probeInputs.length} inputs built from crawl data`);
+          // Wrap probes in a timeout — if they take >3 min, abort
+          const probeTimeout = new Promise<PreConfirmedFinding[]>((resolve) =>
+            setTimeout(() => {
+              console.warn('[analyze-job] Active probes hit 3-min timeout — using partial results');
+              resolve([]);
+            }, 180_000));
+          preConfirmed = await Promise.race([
+            runActiveProbes(probeInputs),
+            probeTimeout,
+          ]);
+          console.log(`[analyze-job] Active probes confirmed ${preConfirmed.length} findings with HARD HTTP evidence`);
+        } catch (probeErr) {
+          console.warn('[analyze-job] Active probes failed:', String(probeErr).slice(0, 150));
+        }
       }
 
       // Check Phase 0 budget before rigor verification
