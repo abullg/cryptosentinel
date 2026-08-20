@@ -1,0 +1,95 @@
+name: Debug GT Network Deep
+
+on:
+  workflow_dispatch:
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p 22 -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Deep network debug
+        run: |
+          HOST="${{ secrets.VPS_HOST }}"
+          USER="${{ secrets.VPS_USER || 'root' }}"
+          ssh -p 22 -o StrictHostKeyChecking=no -o ConnectTimeout=60 -i ~/.ssh/id_ed25519 $USER@$HOST "bash -s" <<'REMOTE_EOF'
+          echo "=== 1. Container IPs (docker inspect) ==="
+          for c in cs-juice-shop cs-webgoat cs-vampi cs-dvwa cs-canary cs-negative; do
+            IP=$(docker inspect $c --format '{{range $k, $v := .NetworkSettings.Networks}}{{$v.IPAddress}}{{end}}' 2>/dev/null)
+            PORT=$(docker inspect $c --format '{{json .HostConfig.PortBindings}}' 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(list(d.keys())[0] if d else '?')" 2>/dev/null)
+            echo "  $c: IP=$IP containerPort=$PORT"
+          done
+
+          echo ""
+          echo "=== 2. curl DIRECTLY to container IP (bypass docker-proxy) ==="
+          # Juice Shop on 172.16.1.6:3000
+          echo "--- 172.16.1.6:3000 (Juice Shop internal port) ---"
+          timeout 5 curl -s -o /dev/null -w "HTTP=%{http_code} time=%{time_total}s\n" http://172.16.1.6:3000/ 2>&1 || echo "FAIL"
+
+          # WebGoat on 172.16.1.X:8080
+          WG_IP=$(docker inspect cs-webgoat --format '{{range $k, $v := .NetworkSettings.Networks}}{{$v.IPAddress}}{{end}}')
+          echo "--- $WG_IP:8080 (WebGoat internal port) ---"
+          timeout 5 curl -s -o /dev/null -w "HTTP=%{http_code} time=%{time_total}s\n" http://$WG_IP:8080/WebGoat/ 2>&1 || echo "FAIL"
+
+          # VAmPI on 172.16.1.7:5000
+          echo "--- 172.16.1.7:5000 (VAmPI internal port) ---"
+          timeout 5 curl -s -o /dev/null -w "HTTP=%{http_code} time=%{time_total}s\n" http://172.16.1.7:5000/ 2>&1 || echo "FAIL"
+
+          # DVWA on (working reference)
+          DVWA_IP=$(docker inspect cs-dvwa --format '{{range $k, $v := .NetworkSettings.Networks}}{{$v.IPAddress}}{{end}}')
+          echo "--- $DVWA_IP:80 (DVWA working ref) ---"
+          timeout 5 curl -s -o /dev/null -w "HTTP=%{http_code} time=%{time_total}s\n" http://$DVWA_IP:80/login.php 2>&1 || echo "FAIL"
+
+          echo ""
+          echo "=== 3. curl through docker-proxy (host localhost) ==="
+          for port in 3001 3005 3009 3002; do
+            echo -n "  localhost:$port → "
+            timeout 5 curl -s -o /dev/null -w "HTTP=%{http_code} time=%{time_total}s\n" http://127.0.0.1:$port/ 2>&1 || echo "FAIL"
+          done
+
+          echo ""
+          echo "=== 4. Listening sockets INSIDE containers ==="
+          for c in cs-juice-shop cs-webgoat cs-vampi; do
+            echo "--- $c (ss/netstat via docker exec) ---"
+            # Try ss first, then netstat, then /proc/net/tcp
+            docker exec $c sh -c "ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null || cat /proc/net/tcp" 2>&1 | head -10
+          done
+
+          echo ""
+          echo "=== 5. Test app from inside container (no curl, use app's own runtime) ==="
+          echo "--- cs-juice-shop: node -e fetch localhost:3000 ---"
+          docker exec cs-juice-shop sh -c 'node -e "fetch(\"http://localhost:3000/\").then(r=>console.log(\"status=\"+r.status)).catch(e=>console.log(\"err=\"+e.message))" 2>&1' 2>&1 | head -10 || echo "exec failed"
+
+          echo "--- cs-vampi: python3 urllib localhost:5000 ---"
+          docker exec cs-vampi sh -c 'python3 -c "import urllib.request; r=urllib.request.urlopen(\"http://localhost:5000/\"); print(\"status=\"+str(r.status))" 2>&1' 2>&1 | head -10 || echo "exec failed"
+
+          echo "--- cs-webgoat: try wget or python (probably no python, has java) ---"
+          docker exec cs-webgoat sh -c 'which wget python3 curl 2>/dev/null' 2>&1
+          docker exec cs-webgoat sh -c 'ls /usr/bin/ 2>/dev/null | grep -E "curl|wget|python"' 2>&1
+
+          echo ""
+          echo "=== 6. iptables -L FORWARD -n -v (full) ==="
+          iptables -L FORWARD -n -v --line-numbers 2>&1
+          echo ""
+          echo "=== 7. iptables -L DOCKER-USER -n -v ==="
+          iptables -L DOCKER-USER -n -v --line-numbers 2>&1
+          echo ""
+          echo "=== 8. iptables -L DOCKER-FORWARD -n -v ==="
+          iptables -L DOCKER-FORWARD -n -v --line-numbers 2>&1
+          echo ""
+          echo "=== 9. iptables -L DOCKER -n -v ==="
+          iptables -L DOCKER -n -v --line-numbers 2>&1 | head -30
+          echo ""
+          echo "=== 10. iptables -t nat -L PREROUTING -n -v (DNAT rules) ==="
+          iptables -t nat -L PREROUTING -n -v --line-numbers 2>&1 | head -20
+          echo ""
+          echo "=== 11. iptables -t nat -L DOCKER -n -v (port mappings) ==="
+          iptables -t nat -L DOCKER -n -v --line-numbers 2>&1 | head -30
+          REMOTE_EOF
