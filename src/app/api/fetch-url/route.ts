@@ -160,8 +160,30 @@ async function simpleFetchUrlHandler(parsedUrl: URL) {
     }, { status: 408 });
   }
 
-  // Success — return crawl data for AI analysis
+  // Success — run static analysis (gitleaks + sink-hints)
+  // Per Claude §8: static-first pipeline. Deterministic findings saved
+  // directly as 'confirmed', LLM only invoked if sink-hints found.
   console.log(`[fetch-url] Success via ${result.method}, ${result.sourceCode.length} chars`);
+
+  let staticAnalysis: any = null;
+  try {
+    // Lazy import to avoid TypeScript circular import issues at module load
+    const { runStaticAnalysis } = await import('../../../lib/static-analysis');
+    staticAnalysis = await runStaticAnalysis(result.sourceCode, urlStr);
+    console.log(`[fetch-url] Static analysis: ${staticAnalysis.findings.length} findings, ${staticAnalysis.sinkHints.length} sink-hints, ${staticAnalysis.stats.totalMs}ms, skipLLM=${staticAnalysis.skipLLM}`);
+    if (staticAnalysis.findings.length > 0) {
+      for (const f of staticAnalysis.findings) {
+        console.log(`  - [${f.severity}] ${f.type}: ${f.title.slice(0, 80)} (via ${f.source})`);
+      }
+    }
+    if (staticAnalysis.stats.truncatedPct > 0) {
+      console.warn(`[fetch-url] ⚠ TRUNCATION: sourceCode=${staticAnalysis.stats.sourceCodeChars} chars, ${staticAnalysis.stats.truncatedPct.toFixed(1)}% beyond 30K cap (not analyzed by LLM)`);
+    }
+  } catch (e) {
+    console.error('[fetch-url] Static analysis failed:', String(e).slice(0, 200));
+    // Continue without static analysis — fetch still succeeds
+  }
+
   return NextResponse.json({
     sourceCode: result.sourceCode,
     contractName: result.contractName,
@@ -178,6 +200,13 @@ async function simpleFetchUrlHandler(parsedUrl: URL) {
     discoveredEndpoints: [],
     discoveredForms: [],
     discoveredParams: [],
+    // ─── STATIC ANALYSIS LAYER (Claude §8 static-first) ───
+    staticAnalysis: staticAnalysis ? {
+      findings: staticAnalysis.findings,
+      sinkHints: staticAnalysis.sinkHints,
+      skipLLM: staticAnalysis.skipLLM,
+      stats: staticAnalysis.stats,
+    } : null,
   });
 }
 

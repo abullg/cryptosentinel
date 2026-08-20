@@ -39,7 +39,12 @@ export async function POST(req: NextRequest) {
     const { sourceCode, contractName, targetType, targetUrl, hackenproofContext,
             // New crawl fields — populated by /api/fetch-url deep-crawler
             discoveredEndpoints, discoveredForms, discoveredParams,
+            // Static analysis layer (Claude §8) — populated by /api/fetch-url
+            // Contains gitleaks findings + sink-hints + skipLLM flag.
+            // If skipLLM=true, LLM is not invoked at all.
+            staticAnalysis,
     } = body;
+    const reqBody = body;  // alias for later access (e.g. sa = reqBody?.staticAnalysis)
 
     if (!sourceCode && !targetUrl) {
       return NextResponse.json({ error: 'Missing sourceCode or targetUrl' }, { status: 400 });
@@ -543,8 +548,92 @@ async function runAnalysisInBackground(jobId: string, config: {
       }
       console.log(`[analyze-job] sourceCode length=${originalLength} → AI sees 30000 chars (${originalLength > 30000 ? truncatedPct + '% truncated' : 'no truncation'})`);
 
+      // ─── STATIC-FIRST GATING (Claude §8) ───
+      // Per the static-first redesign: if /api/fetch-url already ran
+      // static analysis (gitleaks + sink-hints), use that result.
+      //   - If skipLLM=true (no sink-hints found) → SKIP LLM entirely,
+      //     save static findings as 'confirmed' and complete the job.
+      //     This saves $0.84/target and 250s avg.
+      //   - If sink-hints found → use buildLLMContextFromHints() output
+      //     (≤4K chars) instead of full sourceCode.slice(0, 30000).
+      //     8x cheaper, 8x faster, focused context.
+      //
+      // The static analysis is passed via the analyze-job POST body as
+      // `staticAnalysis` field (modified by benchmark.js + frontend).
+
+      // V3 of analyze-job: read staticAnalysis from POST body
+      // (was: re-run static analysis here. But fetch-url already did it.)
+      const sa = (reqBody as any)?.staticAnalysis;
+      if (sa && sa.skipLLM) {
+        console.log(`[analyze-job] STATIC-FIRST: skipping LLM (no sink-hints found in static analysis)`);
+        console.log(`[analyze-job]   Static findings: ${sa.findings?.length || 0}, sink-hints: ${sa.sinkHints?.length || 0}, total static time: ${sa.stats?.totalMs || 'N/A'}ms`);
+
+        // Save static findings as 'confirmed' (deterministic, high confidence)
+        for (const f of (sa.findings || [])) {
+          try {
+            const hashSig = makeVulnHash(contractId, f.type, f.title);
+            const existing = await withTimeout(db.vulnerability.findFirst({ where: { hashSignature: hashSig } }), 10_000, null, 'static first findFirst');
+            if (existing) continue;
+            const staticVuln = await withTimeout(db.vulnerability.create({
+              data: {
+                id: `vuln_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+                contractId,
+                type: f.type,
+                severity: f.severity,
+                status: 'confirmed',  // Static findings are deterministic — high confidence
+                title: f.title,
+                description: f.description,
+                location: f.location,
+                codeSnippet: f.evidence,
+                confidence: f.confidence,
+                validationScope: 'static',
+                hashSignature: hashSig,
+                cwe: '',
+                pocOutline: '',
+              } as any,
+            }), 10_000, null, 'static vuln.create');
+            if (staticVuln) {
+              savedStatic.push({ vuln: staticVuln, rawFinding: f });
+              console.log(`[analyze-job]   Saved static finding: [${f.severity}] ${f.type}: ${f.title.slice(0, 60)}`);
+            }
+          } catch (e) {
+            console.warn(`[analyze-job]   Failed to save static finding: ${String(e).slice(0, 100)}`);
+          }
+        }
+
+        // Complete the job — no LLM, no active validation needed
+        const confirmedCount = savedStatic.length;
+        await updateJob(100, `Analysis complete (static-only, no LLM): ${confirmedCount} confirmed from static findings (gitleaks + sink-hints). No sink-hints found → LLM skipped per Claude §8 static-first redesign.`);
+        fireAndForget(db.audit.update({ where: { id: auditId }, data: { status: 'completed', findings: confirmedCount, completedAt: new Date() } }), 'catch audit.update static');
+        fireAndForget(db.analysisJob.update({ where: { id: jobId }, data: { status: 'completed', resultCount: confirmedCount } }), 'catch analysisJob.update static');
+        writeProgressFile(jobId, { progress: 100, message: `Analysis complete (static-only): ${confirmedCount} confirmed`, status: 'completed' });
+        clearInterval(flushTimer); clearInterval(heartbeatTimer);
+        clearTimeout(globalTimeout);
+        clearTimeout(panicTimer);
+        await flushJobNow();
+        console.log(`[analyze-job] ✓ Static-only completion — saved ${confirmedCount} findings, no LLM call, total time ~${Date.now() - globalStartTime}ms`);
+        return;
+      }
+
+      // ─── SINK-HINT-DRIVEN LLM (Claude §8) ───
+      // If sink-hints were found, use the pre-built LLM context (≤4K)
+      // instead of full sourceCode.slice(0, 30000). 8x cheaper.
+      let llmInput: string;
+      let llmInputLabel: string;
+      if (sa && sa.sinkHints && sa.sinkHints.length > 0 && sa.llmContext) {
+        llmInput = sa.llmContext;
+        llmInputLabel = `sink-hint context (${llmInput.length} chars, ${sa.sinkHints.length} hints)`;
+        console.log(`[analyze-job] SINK-DRIVEN LLM: using focused context instead of full sourceCode`);
+        console.log(`[analyze-job]   LLM input: ${llmInput.length} chars (vs 30000 full) — 8x smaller, 8x cheaper`);
+        console.log(`[analyze-job]   Sink hint types: ${[...new Set(sa.sinkHints.map((h: any) => h.type))].join(', ')}`);
+      } else {
+        llmInput = sourceCode.slice(0, 30000);
+        llmInputLabel = `full sourceCode slice (30000 chars)`;
+        console.log(`[analyze-job] No static analysis data — using full sourceCode.slice(0, 30000) as fallback`);
+      }
+
       const aiPromise = isWeb
-        ? analyzeWebWithGLM(sourceCode.slice(0, 30000), contractName, { apiKey, model, timeoutMs: 300_000 })
+        ? analyzeWebWithGLM(llmInput, contractName, { apiKey, model, timeoutMs: 300_000 })
         : analyzeWithGLM(sourceCode, contractName, { apiKey, model, timeoutMs: 300_000 }, undefined);
       // 5 MINUTES per pass — generous, no rushing. GLM-5.2 with 32K tokens
       // needs 3-5 min for deep reasoning. Previous 120s/180s were too tight.

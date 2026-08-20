@@ -77,8 +77,17 @@ async function benchmark() {
       }
 
       console.log(`  FETCH OK: ${data.sourceCode?.length || 0} chars (${fetchTime}ms) via ${data.reconType || 'unknown'}`);
+      if (data.staticAnalysis) {
+        const sa = data.staticAnalysis;
+        console.log(`  STATIC: ${sa.findings?.length || 0} findings, ${sa.sinkHints?.length || 0} sink-hints, ${sa.stats?.totalMs || 'N/A'}ms, skipLLM=${sa.skipLLM}`);
+        if (sa.findings && sa.findings.length > 0) {
+          for (const f of sa.findings.slice(0, 3)) {
+            console.log(`    - [${f.severity}] ${f.type}: ${f.title.slice(0, 70)}`);
+          }
+        }
+      }
 
-      // Step 2: Start analysis
+      // Step 2: Start analysis (pass staticAnalysis from fetch-url per Claude §8)
       const analyzeStart = Date.now();
       const analyzeRes = await fetch(`${API_BASE}/api/analyze-job`, {
         method: 'POST',
@@ -91,6 +100,9 @@ async function benchmark() {
           discoveredEndpoints: data.discoveredEndpoints || [],
           discoveredForms: data.discoveredForms || [],
           discoveredParams: data.discoveredParams || [],
+          // Pass static analysis results from /api/fetch-url
+          // If skipLLM=true, LLM is not invoked — saves ~$0.84/target + 250s
+          staticAnalysis: data.staticAnalysis || null,
         }),
         signal: AbortSignal.timeout(15_000),
       });
@@ -185,6 +197,10 @@ async function benchmark() {
         types,
         severities,
         dropReasons,
+        staticFindingsCount: data.staticAnalysis?.findings?.length || 0,
+        staticSinkHintsCount: data.staticAnalysis?.sinkHints?.length || 0,
+        staticSkipLLM: data.staticAnalysis?.skipLLM || false,
+        staticTimeMs: data.staticAnalysis?.stats?.totalMs || 0,
         jobMessage: job?.message || '',
       });
 
@@ -219,6 +235,31 @@ async function benchmark() {
   console.log(`  Total dropped (per-job sum):     ${totalDroppedPerJob} ← now preserved for FN analysis`);
   console.log(`  Total candidates (per-job sum):  ${totalCandidatesPerJob}`);
   console.log(`  Candidate+dropped / confirmed:    ${totalConfirmedPerJob > 0 ? ((totalCandidatesPerJob + totalDroppedPerJob) / totalConfirmedPerJob).toFixed(1) : '∞'} ← recall lever (Claude §9.8)`);
+
+  // Static analysis layer stats (Claude §8)
+  const staticStats = succeeded.map(r => ({
+    url: r.url,
+    findings: r.staticFindingsCount || 0,
+    sinkHints: r.staticSinkHintsCount || 0,
+    skipLLM: r.staticSkipLLM,
+    timeMs: r.staticTimeMs || 0,
+    analyzeTime: r.analyzeTime || 0,
+  }));
+  console.log(`\n--- STATIC-FIRST PIPELINE (Claude §8) ---`);
+  const totalStaticFindings = staticStats.reduce((s, r) => s + r.findings, 0);
+  const totalSinkHints = staticStats.reduce((s, r) => s + r.sinkHints, 0);
+  const skipLLMCount = staticStats.filter(r => r.skipLLM).length;
+  const avgStaticTime = staticStats.length > 0 ? staticStats.reduce((s, r) => s + r.timeMs, 0) / staticStats.length : 0;
+  console.log(`  Static findings (gitleaks + sink-hints secrets): ${totalStaticFindings}`);
+  console.log(`  Sink-hints found:                                ${totalSinkHints}`);
+  console.log(`  LLM SKIPPED on:                                  ${skipLLMCount}/${staticStats.length} targets (no sink-hints)`);
+  console.log(`  Avg static analysis time:                        ${avgStaticTime.toFixed(0)}ms (vs LLM ~250s)`);
+  if (skipLLMCount > 0) {
+    const savedCost = skipLLMCount * 0.84;
+    const savedTime = skipLLMCount * 250;
+    console.log(`  Cost saved by skipping LLM:                      $${savedCost.toFixed(2)}`);
+    console.log(`  Time saved by skipping LLM:                      ${savedTime}s`);
+  }
 
   console.log('\n--- PER-TARGET RESULTS ---');
   for (const r of results) {

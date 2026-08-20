@@ -1,0 +1,110 @@
+name: Install Static Analysis Tools
+
+# Per Claude §8: "Вынести hygiene+secrets из LLM. 15/18 finding'ов + api_leak regex
+# делаются без GLM. Цель: p50 static pass < 2s/host."
+#
+# This workflow installs on VPS:
+#   - nuclei (HTTP misconfig, exposures, secrets templates)
+#   - gitleaks (secret regex with entropy check)
+#   - curl + jq (for processing)
+#
+# Idempotent — safe to re-run.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  install:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p 22 -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Install nuclei + gitleaks + jq on VPS
+        run: |
+          HOST="${{ secrets.VPS_HOST }}"
+          USER="${{ secrets.VPS_USER || 'root' }}"
+          ssh -p 22 -o StrictHostKeyChecking=no -o ConnectTimeout=60 -o ServerAliveInterval=30 -i ~/.ssh/id_ed25519 $USER@$HOST "bash -s" <<'REMOTE_EOF' | tee /tmp/install.log
+          set -e
+          echo "=== Pre-flight: existing tools ==="
+          for tool in nuclei gitleaks jq curl go; do
+            if command -v "$tool" >/dev/null 2>&1; then
+              echo "  $tool: $(command -v $tool) ($($tool --version 2>&1 | head -1))"
+            else
+              echo "  $tool: NOT installed"
+            fi
+          done
+
+          # ─── Install Go (needed for nuclei) ───
+          if ! command -v go >/dev/null 2>&1; then
+            echo "=== Installing Go ==="
+            apt-get update -qq
+            apt-get install -y -qq golang-go
+          fi
+          export PATH=$PATH:$(go env GOPATH 2>/dev/null || echo /root/go)/bin
+          echo "Go version: $(go version)"
+
+          # ─── Install nuclei ───
+          if ! command -v nuclei >/dev/null 2>&1; then
+            echo "=== Installing nuclei ==="
+            go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          fi
+          # Make sure it's in PATH for next runs
+          NUCLEI_BIN=$(go env GOPATH)/bin/nuclei
+          if [ -x "$NUCLEI_BIN" ]; then
+            ln -sf "$NUCLEI_BIN" /usr/local/bin/nuclei
+          fi
+          echo "nuclei version: $(nuclei -version 2>&1 | head -1)"
+
+          # Update nuclei templates (idempotent — only downloads if newer)
+          echo "=== Updating nuclei templates ==="
+          nuclei -update-templates -silent 2>&1 | tail -3 || true
+
+          # ─── Install gitleaks ───
+          if ! command -v gitleaks >/dev/null 2>&1; then
+            echo "=== Installing gitleaks ==="
+            # Latest release URL — direct binary install (faster than building from source)
+            GITLEAKS_VERSION=8.21.2
+            curl -sL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o /tmp/gitleaks.tar.gz
+            tar -xzf /tmp/gitleaks.tar.gz -C /tmp/ gitleaks
+            mv /tmp/gitleaks /usr/local/bin/gitleaks
+            chmod +x /usr/local/bin/gitleaks
+            rm /tmp/gitleaks.tar.gz
+          fi
+          echo "gitleaks version: $(gitleaks version 2>&1 | head -1)"
+
+          # ─── Install jq (for processing JSON) ───
+          if ! command -v jq >/dev/null 2>&1; then
+            apt-get install -y -qq jq
+          fi
+          echo "jq version: $(jq --version)"
+
+          # ─── Make a test scan to verify ───
+          echo "=== Verification: nuclei + gitleaks test scan ==="
+          mkdir -p /tmp/cs-static-test
+          echo '<html><body><script>window.__test__="abc123";</script></body></html>' > /tmp/cs-static-test/test.html
+
+          echo "--- gitleaks on test HTML ---"
+          gitleaks detect --no-git --source /tmp/cs-static-test/ --report-format json --report-path /tmp/cs-static-test/gitleaks.json 2>&1 | tail -3
+          cat /tmp/cs-static-test/gitleaks.json 2>/dev/null | jq -r '.[]?.Description // "no findings"' | head -3
+
+          echo "--- nuclei on test HTTP target (localhost:3001) ---"
+          # Quick nuclei scan to verify it works
+          timeout 5 nuclei -u http://localhost:3001/ -t http/misconfiguration/ -severity low,medium,high,critical -silent -j -o /tmp/cs-static-test/nuclei.json 2>&1 | tail -5
+          cat /tmp/cs-static-test/nuclei.json 2>/dev/null | jq -r '.[]? | "\(.info.severity): \(.info.name)"' | head -5 || echo "no nuclei findings"
+
+          echo "=== DONE installation ==="
+          REMOTE_EOF
+
+      - name: Upload install log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: install-tools-log
+          path: /tmp/install.log
+          if-no-files-found: ignore
