@@ -58,8 +58,13 @@ jobs:
           echo "=== Building VAmPI image from local Dockerfile ==="
           docker compose build vampi || echo "⚠ VAmPI build failed — continuing"
 
-          echo "=== Bringing up GT containers ==="
-          docker compose up -d --no-deps --build
+          echo "=== Bringing up GT containers (force-recreate to clear stale docker-proxy state) ==="
+          # Force-recreate: stop + remove old containers, create new ones
+          # Previous issue: docker-proxy was in a bad state — listening on host
+          # ports but not forwarding to containers properly. Force recreate
+          # rebuilds the docker-proxy mapping from scratch.
+          docker compose down --remove-orphans 2>&1 | tail -5
+          docker compose up -d --build --force-recreate 2>&1 | tail -10
           echo "=== Waiting for GT containers to be READY (extended healthcheck loop) ==="
           # WebGoat Spring Boot needs ~90s startup. Juice Shop Node.js ~60s.
           # Loop up to 5 min (60 attempts × 5s).
