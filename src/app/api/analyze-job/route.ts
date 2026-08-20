@@ -18,6 +18,9 @@ import { withTimeout, fireAndForget } from '@/lib/with-timeout';
 import { checkPassiveEvidence } from '@/lib/passive-evidence';
 import { runProvenanceChain } from '@/lib/provenance-chain';
 import { fullVerify } from '@/lib/impact-engine';
+import { fuzzAllOracles } from '@/lib/active-fuzzer';
+import { crawlForEndpoints } from '@/lib/endpoint-crawler';
+import { crawlAuthenticated } from '@/lib/auth-crawler';
 import { isolateEvidence, verifyEvidenceIsolation } from '@/lib/evidence-isolation';
 import { createHash } from 'crypto';
 
@@ -591,10 +594,6 @@ async function runAnalysisInBackground(jobId: string, config: {
       if (targetUrl && (targetUrl.startsWith('http://localhost') || targetUrl.startsWith('http://127.0.0.1'))) {
         console.log(`[analyze-job] ACTIVE FUZZER: target is GT localhost — running fuzzers`);
         try {
-          const { fuzzAllOracles } = await import('../../../lib/active-fuzzer');
-          const { crawlForEndpoints } = await import('../../../lib/endpoint-crawler');
-          const { crawlAuthenticated } = await import('../../../lib/auth-crawler');
-
           // 1. Authenticated crawl (login to DVWA/juice-shop → discover endpoints)
           console.log(`[analyze-job]   Step 1: Authenticated crawl...`);
           const authResult = await crawlAuthenticated(targetUrl);
