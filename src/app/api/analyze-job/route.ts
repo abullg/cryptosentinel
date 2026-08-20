@@ -593,21 +593,56 @@ async function runAnalysisInBackground(jobId: string, config: {
         try {
           const { fuzzAllOracles } = await import('../../../lib/active-fuzzer');
           const { crawlForEndpoints } = await import('../../../lib/endpoint-crawler');
+          const { crawlAuthenticated } = await import('../../../lib/auth-crawler');
 
-          // 1. Crawl for endpoints
-          const endpoints = crawlForEndpoints(sourceCode, targetUrl);
-          console.log(`[analyze-job]   Crawler found ${endpoints.length} endpoints`);
-          // Probe the main URL + first 5 endpoints
-          const urlsToProbe = [targetUrl, ...endpoints.slice(0, 5).map(e => e.url)];
+          // 1. Authenticated crawl (login to DVWA/juice-shop → discover endpoints)
+          console.log(`[analyze-job]   Step 1: Authenticated crawl...`);
+          const authResult = await crawlAuthenticated(targetUrl);
+          console.log(`[analyze-job]     Auth: loggedIn=${authResult.loggedIn}, endpoints=${authResult.endpoints.length}`);
 
-          // 2. Run active fuzzers on each URL
+          // 2. Static crawl (parse HTML/JS for endpoints — supplement auth crawl)
+          const staticEndpoints = crawlForEndpoints(sourceCode, targetUrl);
+          console.log(`[analyze-job]   Step 2: Static crawl found ${staticEndpoints.length} endpoints`);
+
+          // 3. Combine endpoints: auth-discovered + static-discovered
+          // De-duplicate by URL
+          const seenUrls = new Set<string>();
+          const allEndpoints = [];
+          for (const ep of authResult.endpoints) {
+            if (!seenUrls.has(ep.url)) {
+              seenUrls.add(ep.url);
+              allEndpoints.push({ url: ep.url, cookies: ep.cookies, params: ep.parameters.map(p => p.name) });
+            }
+          }
+          for (const ep of staticEndpoints.slice(0, 5)) {
+            if (!seenUrls.has(ep.url)) {
+              seenUrls.add(ep.url);
+              allEndpoints.push({ url: ep.url, cookies: '', params: [] });
+            }
+          }
+          console.log(`[analyze-job]   Total endpoints to probe: ${allEndpoints.length}`);
+
+          // 4. Run active fuzzers on each endpoint
+          //    Use auth cookies if available (for DVWA authenticated pages)
           const fuzzFindings: any[] = [];
-          for (const probeUrl of urlsToProbe) {
-            console.log(`[analyze-job]   Fuzzing: ${probeUrl}`);
-            const findings = await fuzzAllOracles(probeUrl);
+          for (const ep of allEndpoints.slice(0, 10)) {  // cap at 10 endpoints
+            console.log(`[analyze-job]   Fuzzing: ${ep.url} ${ep.cookies ? '(auth)' : '(no-auth)'}`);
+            const findings = await fuzzAllOracles(ep.url, ep.params?.[0], {
+              allowlistPatterns: [
+                'http://localhost:',
+                'http://127.0.0.1:',
+                'http://cs-juice-shop:',
+                'http://cs-dvwa:',
+                'http://cs-canary:',
+                'http://cs-negative:',
+              ],
+              perProbeTimeoutMs: 15_000,
+              sqliTimeDeltaMs: 4_500,
+              cookies: ep.cookies || undefined,
+            });
             for (const f of findings) {
               if (f.confirmed) {
-                fuzzFindings.push(f);
+                fuzzFindings.push({ ...f, endpoint: ep.url, cookies: ep.cookies });
                 console.log(`[analyze-job]     ✅ CONFIRMED ${f.type} via ${f.oracle}: ${f.evidence.slice(0, 80)}`);
               }
             }

@@ -1,0 +1,83 @@
+name: Debug Juice Shop Docker
+
+on:
+  workflow_dispatch:
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p 22 -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Debug juice-shop networking
+        run: |
+          HOST="${{ secrets.VPS_HOST }}"
+          USER="${{ secrets.VPS_USER || 'root' }}"
+          ssh -p 22 -o StrictHostKeyChecking=no -o ConnectTimeout=60 -i ~/.ssh/id_ed25519 $USER@$HOST "bash -s" <<'REMOTE_EOF' | tee /tmp/debug.log
+          echo "=== 1. Check if juice-shop responds INSIDE container ==="
+          docker exec cs-juice-shop curl -s --max-time 10 http://localhost:3000/ 2>&1 | head -5
+          echo "Exit: $?"
+
+          echo ""
+          echo "=== 2. Get container IP ==="
+          docker inspect cs-juice-shop --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>&1
+          CONTAINER_IP=$(docker inspect cs-juice-shop --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null)
+          echo "Container IP: $CONTAINER_IP"
+
+          echo ""
+          echo "=== 3. Try curl direct to container IP (bypasses docker-proxy) ==="
+          if [ -n "$CONTAINER_IP" ]; then
+            curl -s --max-time 10 "http://$CONTAINER_IP:3000/" 2>&1 | head -5
+            echo "Exit: $?"
+          fi
+
+          echo ""
+          echo "=== 4. Try curl from host to localhost:3001 ==="
+          curl -v --max-time 10 http://localhost:3001/ 2>&1 | head -20
+
+          echo ""
+          echo "=== 5. iptables FORWARD chain (Docker uses this) ==="
+          iptables -L FORWARD -n --line-numbers 2>&1 | head -20
+
+          echo ""
+          echo "=== 6. iptables DOCKER chain ==="
+          iptables -L DOCKER -n --line-numbers 2>&1 | head -20
+
+          echo ""
+          echo "=== 7. Docker network inspect ==="
+          docker network inspect bridge 2>&1 | head -30
+
+          echo ""
+          echo "=== 8. Try full recreate of juice-shop ==="
+          echo "Stopping + removing juice-shop..."
+          docker stop cs-juice-shop 2>&1
+          docker rm cs-juice-shop 2>&1
+          echo "Starting fresh..."
+          docker run -d --name cs-juice-shop -p 3001:3000 --restart unless-stopped bkimminich/juice-shop:latest 2>&1
+          echo "Waiting 90s for startup..."
+          sleep 90
+          echo "=== 9. After recreate: curl localhost:3001 ==="
+          curl -s --max-time 30 http://localhost:3001/ 2>&1 | head -10
+          echo "Exit: $?"
+
+          echo ""
+          echo "=== 10. docker logs after recreate (last 20) ==="
+          docker logs cs-juice-shop --tail 20 2>&1
+
+          echo ""
+          echo "=== DONE ==="
+          REMOTE_EOF
+
+      - name: Upload debug log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-juice-shop
+          path: /tmp/debug.log
+          if-no-files-found: ignore

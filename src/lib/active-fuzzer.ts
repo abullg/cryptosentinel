@@ -61,6 +61,8 @@ export interface FuzzerConfig {
   perProbeTimeoutMs: number;
   // Time delay threshold for SQLi oracle (default 4500ms = 4.5s)
   sqliTimeDeltaMs: number;
+  // Auth cookies for authenticated endpoints (e.g. DVWA PHPSESSID)
+  cookies?: string;
 }
 
 const DEFAULT_CONFIG: FuzzerConfig = {
@@ -159,15 +161,22 @@ async function sendProbe(
   try {
     // Append payload to URL for GET, or to body for POST
     const sep = url.includes('?') ? '&' : '?';
-    const probeUrl = method === 'GET' ? `${url}${sep}q=${encodeURIComponent(payload)}` : url;
+    const probeUrl = method === 'GET' ? `${url}${sep}id=${encodeURIComponent(payload)}&Submit=Submit` : url;
+    const headers: Record<string, string> = {
+      'User-Agent': 'CryptoSentinel-Active-Fuzzer/1.0',
+    };
+    if (method === 'POST') {
+      headers['Content-Type'] = 'application/x-www-form-urlencoded';
+    }
+    // Add auth cookies if provided (for DVWA authenticated endpoints)
+    if (config.cookies) {
+      headers['Cookie'] = config.cookies;
+    }
     const res = await fetch(probeUrl, {
       method,
-      headers: {
-        'User-Agent': 'CryptoSentinel-Active-Fuzzer/1.0',
-        'Content-Type': method === 'POST' ? 'application/x-www-form-urlencoded' : 'text/html',
-      },
+      headers,
       body: method === 'POST' && body
-        ? new URLSearchParams({ ...body, q: payload }).toString()
+        ? new URLSearchParams({ ...body, id: payload }).toString()
         : undefined,
       signal: AbortSignal.timeout(config.perProbeTimeoutMs),
       redirect: 'follow',
@@ -175,8 +184,6 @@ async function sendProbe(
     const text = await res.text();
     return { responseTime: Date.now() - t0, body: text, status: res.status };
   } catch (e: any) {
-    // Timeout itself can be a signal (SLEEP(5) made request hang) — but we
-    // don't trust timeout alone because the site could be slow for other reasons.
     return null;
   }
 }
