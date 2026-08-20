@@ -179,8 +179,17 @@ function isValidXssContext(body: string, contentType: string, marker: string): {
 async function measureBaseline(url: string, config: FuzzerConfig): Promise<number | null> {
   const t0 = Date.now();
   try {
+    // Send with cookies (if provided) — DVWA authenticated endpoints need
+    // cookies or response is a 302 redirect to /login.php (fast, but not
+    // representative of normal processing time).
+    const headers: Record<string, string> = {
+      'User-Agent': 'CryptoSentinel-Active-Fuzzer/1.0',
+    };
+    if (config.cookies) {
+      headers['Cookie'] = config.cookies;
+    }
     await fetch(url, {
-      headers: { 'User-Agent': 'CryptoSentinel-Active-Fuzzer/1.0' },
+      headers,
       signal: AbortSignal.timeout(config.perProbeTimeoutMs),
       redirect: 'follow',
     });
@@ -200,12 +209,16 @@ async function sendProbe(
   config: FuzzerConfig,
   method: 'GET' | 'POST' = 'GET',
   body?: Record<string, string>,
+  parameter: string = 'id',  // ← default to 'id' (DVWA sqli), but accept any param name
 ): Promise<{ responseTime: number; body: string; status: number; contentType: string } | null> {
   const t0 = Date.now();
   try {
-    // Append payload to URL for GET, or to body for POST
+    // Append payload to URL for GET using the ACTUAL parameter name.
+    // Previously: hardcoded 'id=' — only worked for DVWA sqli endpoint,
+    // failed silently on xss_r (uses 'name='), exec (uses 'ip='),
+    // fi (uses 'page='), etc.
     const sep = url.includes('?') ? '&' : '?';
-    const probeUrl = method === 'GET' ? `${url}${sep}id=${encodeURIComponent(payload)}&Submit=Submit` : url;
+    const probeUrl = method === 'GET' ? `${url}${sep}${parameter}=${encodeURIComponent(payload)}&Submit=Submit` : url;
     const headers: Record<string, string> = {
       'User-Agent': 'CryptoSentinel-Active-Fuzzer/1.0',
     };
@@ -220,7 +233,7 @@ async function sendProbe(
       method,
       headers,
       body: method === 'POST' && body
-        ? new URLSearchParams({ ...body, id: payload }).toString()
+        ? new URLSearchParams({ ...body, [parameter]: payload }).toString()
         : undefined,
       signal: AbortSignal.timeout(config.perProbeTimeoutMs),
       redirect: 'follow',
@@ -284,8 +297,9 @@ export async function fuzzSqliTimeDelay(
 
   // 2. Send each payload
   const findings: FuzzerFinding[] = [];
+  const sqliParam = parameter || 'id';  // default to 'id' (DVWA sqli endpoint)
   for (const payload of SQLI_TIME_PAYLOADS) {
-    const result = await sendProbe(targetUrl, payload, config);
+    const result = await sendProbe(targetUrl, payload, config, 'GET', undefined, sqliParam);
     if (!result) {
       // Request itself failed (timeout or network) — could be SLEEP(5) + baseline
       // Let's check if request took close to timeout. If yes, suspicious.
@@ -359,8 +373,9 @@ export async function fuzzReflectedXss(
   }
 
   const findings: FuzzerFinding[] = [];
+  const xssParam = parameter || 'name';  // default to 'name' (DVWA xss_r endpoint)
   for (const payload of XSS_PAYLOADS) {
-    const result = await sendProbe(targetUrl, payload, config);
+    const result = await sendProbe(targetUrl, payload, config, 'GET', undefined, xssParam);
     if (!result) continue;
 
     // Check if marker appears in response body
@@ -425,7 +440,8 @@ export async function fuzzErrorSqli(
 
   // Single quote should trigger SQL syntax error if input goes to query
   const payload = "'";
-  const result = await sendProbe(targetUrl, payload, config);
+  const errSqliParam = parameter || 'id';  // default to 'id' (DVWA sqli endpoint)
+  const result = await sendProbe(targetUrl, payload, config, 'GET', undefined, errSqliParam);
   if (!result) {
     return [{
       type: 'error_sqli',
