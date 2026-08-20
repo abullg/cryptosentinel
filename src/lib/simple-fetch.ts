@@ -360,7 +360,7 @@ because direct HTTP requests to the target will be WAF-blocked.
     title: hostname,
     fetched: false,
     method: 'failed',
-    error: `Could not fetch ${urlStr} within 20s.
+    error: `Could not fetch ${urlStr} — all strategies failed (direct + googlebot + jina).
 
 Tried:
 1. Direct fetch (Chrome UA + Googlebot UA) — failed (WAF-blocked or unreachable)

@@ -41,14 +41,23 @@ jobs:
           docker compose pull --quiet --ignore-pull-failures || docker compose pull --quiet
           echo "=== Bringing up GT containers ==="
           docker compose up -d --no-deps
-          echo "=== Waiting 20s for containers to start ==="
-          sleep 20
+          echo "=== Waiting for GT containers to be READY (healthcheck loop) ==="
+          # Juice-shop Node.js needs ~60s to start. Loop up to 120s.
+          for i in $(seq 1 24); do
+            echo "  attempt $i/24 ($(date +%H:%M:%S))..."
+            sleep 5
+            # Check if juice-shop responds
+            if curl -s --max-time 5 -o /dev/null -w "%{http_code}" http://localhost:3001/ | grep -qE '^[23][0-9][0-9]$'; then
+              echo "  ✓ juice-shop is ready!"
+              break
+            fi
+          done
           echo "=== GT container status ==="
           docker compose ps
           echo "=== Health check: curl each GT port ==="
           for port in 3001 3002 3007 3008; do
             echo "--- localhost:$port ---"
-            curl -sI --max-time 5 http://localhost:$port/ | head -1 || echo "FAIL"
+            curl -sI --max-time 10 http://localhost:$port/ | head -1 || echo "FAIL"
           done
           echo "=== DONE GT setup ==="
           REMOTE_EOF
