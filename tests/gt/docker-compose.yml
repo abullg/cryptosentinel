@@ -60,15 +60,29 @@ services:
     restart: unless-stopped
 
   webgoat:
-    # OWASP WebGoat — DISABLED (image `webgoat/goatandwolf` not on Docker Hub)
-    # profiles: ["disabled"]  # uncomment to disable
-    profiles: ["disabled"]
-    image: owasp/webgoat:latest
+    # OWASP WebGoat — Java, classic SQLi/XSS/XPath/XXE
+    # Tier 2 target — heterogeneous (Java vs PHP DVWA vs Node.js Juice Shop)
+    image: webgoat/goatandwolf:latest
     container_name: cs-webgoat
     ports:
       - "3005:8080"
       - "3006:9090"
     restart: unless-stopped
+    environment:
+      - WEBGOAT_HOSPITAL=off
+    mem_limit: 1g
+
+  vampi:
+    # VAmPI — Vulnerable API (Flask/Python)
+    # Lightweight single-container vulnerable REST API
+    # Tier 2 target — heterogeneous (REST API vs web app)
+    image: esecurve/vampi:latest
+    container_name: cs-vampi
+    ports:
+      - "3009:5000"
+    restart: unless-stopped
+    environment:
+      - VAMPI_ENV=development
 
   # Canary — prompt injection resistance test
   # Static HTML page with jailbreak instructions in comments.
