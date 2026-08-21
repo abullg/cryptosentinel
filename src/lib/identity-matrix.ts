@@ -91,6 +91,16 @@ async function testIdor(
   const findings: MatrixFinding[] = [];
   const path = resource.path.replace(/\{id\}|:id/, String(resourceId));
 
+  // Per Claude v10-feedback: "Нужны минимум 3 личности: A — user, tenant 1;
+  // B — user, тот же роль/tenant ← только так IDOR; Admin — для BFLA."
+  // IDOR = HORIZONTAL: peer (same role) accesses another peer's data.
+  // If B = admin → this is NOT IDOR (admin accessing user data is normal).
+  // Skip IDOR test if sessionB.role === 'admin'.
+  if (config.sessionB.role === 'admin' || config.sessionB.role === 'administrator') {
+    console.log(`[matrix]   idor: skipping — sessionB is admin (not peer). IDOR requires B = same-role peer.`);
+    return [];
+  }
+
   // Step 1: User A GETs their own resource (baseline)
   const resA = await fetchJson(
     `${config.baseUrl}${path}`,
@@ -104,7 +114,6 @@ async function testIdor(
   }
 
   // Extract user A's sensitive fields (SSN, email, etc.)
-  const aData = JSON.stringify(resA.body);
   const sensitiveFields = ['ssn', 'email', 'password', 'token', 'secret', 'balance', 'phone', 'address'];
   const aSensitiveData: Record<string, any> = {};
   for (const field of sensitiveFields) {
@@ -118,7 +127,7 @@ async function testIdor(
     return [];
   }
 
-  // Step 2: User B GETs the same resource
+  // Step 2: Peer B (NOT admin) GETs the same resource
   const resB = await fetchJson(
     `${config.baseUrl}${path}`,
     { headers: makeHeaders(config.sessionB) },

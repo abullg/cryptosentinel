@@ -39,6 +39,7 @@ BOOKS = [
 
 USERS = {
     "user": {"password": "user", "role": "user"},
+    "alice": {"password": "alice", "role": "user"},  # peer user for horizontal IDOR testing
     "admin": {"password": "admin", "role": "admin"},
 }
 

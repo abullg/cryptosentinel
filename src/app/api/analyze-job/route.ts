@@ -684,7 +684,7 @@ async function runAnalysisInBackground(jobId: string, config: {
           if (targetUrl.includes(':3009') || targetUrl.includes(':3010') || targetUrl.includes(':3011') || targetUrl.includes('/api/')) {
             console.log(`[analyze-job]   Generic crawler: discovering API surface without hardcoded paths...`);
 
-            // Login as user A
+            // Login as user A (low-priv user)
             const crawlResultA = await crawlForApi({
               baseUrl: targetUrl,
               auth: { username: 'user', password: 'user' },
@@ -693,28 +693,46 @@ async function runAnalysisInBackground(jobId: string, config: {
               maxEndpoints: 20,
             });
 
-            // Login as user B (admin)
+            // Login as PEER B (same role as A, NOT admin)
+            // Per Claude v10-feedback: "B — user, тот же роль/tenant ← только так IDOR"
+            // IDOR = horizontal: peer accesses another peer's data.
+            // Admin accessing user data is NORMAL behavior, not a bug.
             const crawlResultB = await crawlForApi({
               baseUrl: targetUrl,
-              auth: { username: 'admin', password: 'admin' },
+              auth: { username: 'alice', password: 'alice' },  // peer user (Express-GT has alice/alice)
               timeoutMs: 15_000,
               maxPages: 5,
               maxEndpoints: 10,
             });
 
-            if (crawlResultA.loggedIn && crawlResultB.loggedIn && crawlResultA.resources.length > 0) {
-              console.log(`[analyze-job]   Crawler found ${crawlResultA.resources.length} resources, targetClass=${crawlResultA.targetClass}`);
-              matrixTelemetry = `crawler: auth.A=ok auth.B=ok openapi=${crawlResultA.crawlStats.openApiFound} resources_found=${crawlResultA.resources.length} paths=[${crawlResultA.resources.map(r => r.path).join(',')}]`;
+            // Login as Admin (separate, for BFLA baseline only)
+            const crawlResultAdmin = await crawlForApi({
+              baseUrl: targetUrl,
+              auth: { username: 'admin', password: 'admin' },
+              timeoutMs: 15_000,
+              maxPages: 3,
+              maxEndpoints: 5,
+            });
 
-              // Run identity matrix on discovered resources
-              // Per Claude: "Нашёл ресурс GET /api/users/{id} → обязан прогнать
-              // GET/PUT/PATCH/DELETE от A и от B"
-              console.log(`[analyze-job]   Running identity matrix (IDOR + mass assignment + BFLA + missing authn)...`);
+            const authA = crawlResultA.loggedIn;
+            const authB = crawlResultB.loggedIn;
+            const authAdmin = crawlResultAdmin.loggedIn;
+
+            if (authA && crawlResultA.resources.length > 0) {
+              console.log(`[analyze-job]   Crawler found ${crawlResultA.resources.length} resources, targetClass=${crawlResultA.targetClass}`);
+              matrixTelemetry = `crawler: auth.A=${authA?'ok':'fail'} auth.B(peer)=${authB?'ok':'fail'} auth.Admin=${authAdmin?'ok':'fail'} openapi=${crawlResultA.crawlStats.openApiFound} resources_found=${crawlResultA.resources.length} paths=[${crawlResultA.resources.map(r => r.path).join(',')}]`;
+
+              // Run identity matrix with 3 personalities:
+              // - sessionA = user (low, creates/owns resources)
+              // - sessionB = alice (peer, same role — for horizontal IDOR)
+              // - sessionAdmin = admin (for BFLA baseline only)
+              // Per Claude: "IDOR только A↔B. BFLA только low vs admin."
+              console.log(`[analyze-job]   Running identity matrix (IDOR peer-A↔B + mass assignment + BFLA low-vs-admin + missing authn)...`);
               const matrixResult = await runIdentityMatrix({
                 baseUrl: targetUrl.replace(/\/+$/, ''),
                 sessionA: crawlResultA.session!,
-                sessionB: crawlResultB.session!,
-                sessionAdmin: crawlResultB.session,
+                sessionB: crawlResultB.session || crawlResultA.session!,  // fallback to A if B login failed
+                sessionAdmin: crawlResultAdmin.session,
                 resources: crawlResultA.resources,
                 timeoutMs: 15_000,
               });

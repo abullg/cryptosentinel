@@ -320,13 +320,12 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
   // And: "Короткий универсальный API-словарь (/api, /api/v1, /me, /users,
   // /admin, /transfer, /profile) — не список вашего Express"
   const visited = new Set<string>();
-  // Universal API dictionary — common paths ANY REST API might have
-  // (NOT hardcoded to VAmPI/Express-GT — these are standard REST conventions)
+  // Universal API dictionary — per Claude v10-feedback:
+  // "Оставьте /api, /api/v1, /me, /users, /openapi.json.
+  //  Не держите GT-специфичные имена как «универсальные»."
   const universalApiPaths = [
-    '/api', '/api/v1', '/api/users', '/api/me', '/api/profile',
-    '/api/login', '/api/auth/login', '/api/books', '/api/orders',
-    '/api/transfer', '/api/admin', '/api/admin/users',
-    '/api/resources', '/api/items', '/api/accounts',
+    '/api', '/api/v1', '/api/me', '/api/users',
+    '/openapi.json', '/swagger.json', '/v3/api-docs', '/api-docs',
   ];
   const toVisit: string[] = [
     baseUrl, `${baseUrl}/`, ...universalApiPaths.map(p => `${baseUrl}${p}`),
