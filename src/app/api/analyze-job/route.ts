@@ -681,7 +681,7 @@ async function runAnalysisInBackground(jobId: string, config: {
 
           // Run generic crawler on REST API targets (not DVWA — it has its own auth-crawler)
           // Per Claude: "без хардкоженных путей"
-          if (targetUrl.includes(':3009') || targetUrl.includes(':3010') || targetUrl.includes('/api/')) {
+          if (targetUrl.includes(':3009') || targetUrl.includes(':3010') || targetUrl.includes(':3011') || targetUrl.includes('/api/')) {
             console.log(`[analyze-job]   Generic crawler: discovering API surface without hardcoded paths...`);
 
             // Login as user A
@@ -791,7 +791,7 @@ async function runAnalysisInBackground(jobId: string, config: {
                   // (prisma schema doesn't have cwe/pocOutline as separate
                   // fields — was causing 'Invalid prisma.vulnerability.create()'
                   // errors, so all confirmed findings were lost!)
-                  validationSteps: `[CWE ${f.type === 'sqli' ? '89' : f.type === 'reflected_xss' || f.type === 'stored_xss' ? '79' : f.type === 'command_injection' ? '78' : f.type === 'file_inclusion' || f.type === 'file_upload' ? '434' : f.type === 'csrf' ? '352' : '?'}] Active probe: ${f.payload} → ${f.oracle} oracle confirmed`,
+                  validationSteps: `[CWE ${f.type === 'sqli' ? '89' : f.type === 'reflected_xss' || f.type === 'stored_xss' ? '79' : f.type === 'command_injection' ? '78' : f.type === 'file_inclusion' || f.type === 'file_upload' ? '434' : f.type === 'csrf' ? '352' : f.type === 'idor' ? '639' : f.type === 'jwt_bypass' ? '347' : f.type === 'mass_assignment' ? '915' : f.type === 'bfla' ? '285' : f.type === 'missing_authn' ? '306' : '?'}] Active probe: ${f.payload} → ${f.oracle} oracle confirmed`,
                 } as any,
               }), 10_000, null, 'fuzzer vuln.create');
               if (fuzzVuln) {

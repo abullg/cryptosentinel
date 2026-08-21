@@ -251,10 +251,17 @@ async function testBfla(
   if (!resource.path.includes('/admin') && !resource.path.includes('/manage')) return [];
 
   // Step 1: Admin calls the endpoint (baseline)
+  // POST/PUT/PATCH need Content-Type + body to avoid crash on req.body destructuring
   if (!config.sessionAdmin) return [];
+  const adminHeaders = makeHeaders(config.sessionAdmin);
+  const adminOpts: RequestInit = { method: resource.method, headers: adminHeaders };
+  if (['POST', 'PUT', 'PATCH'].includes(resource.method.toUpperCase())) {
+    adminHeaders['Content-Type'] = 'application/json';
+    adminOpts.body = JSON.stringify({});  // empty body — server uses defaults
+  }
   const resAdmin = await fetchJson(
     `${config.baseUrl}${resource.path}`,
-    { method: resource.method, headers: makeHeaders(config.sessionAdmin) },
+    adminOpts,
     config.timeoutMs,
   );
 
@@ -264,9 +271,15 @@ async function testBfla(
   }
 
   // Step 2: Low-priv user calls the same endpoint
+  const userHeaders = makeHeaders(config.sessionA);
+  const userOpts: RequestInit = { method: resource.method, headers: userHeaders };
+  if (['POST', 'PUT', 'PATCH'].includes(resource.method.toUpperCase())) {
+    userHeaders['Content-Type'] = 'application/json';
+    userOpts.body = JSON.stringify({});
+  }
   const resUser = await fetchJson(
     `${config.baseUrl}${resource.path}`,
-    { method: resource.method, headers: makeHeaders(config.sessionA) },
+    userOpts,
     config.timeoutMs,
   );
 

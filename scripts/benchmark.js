@@ -47,8 +47,16 @@ const TIER2_TARGETS = [
     name: 'Express-GT',
     targetClass: 'http-server',  // Node.js/Express — proves oracle transfer to JS stack
     recall_required: 30,
-    types: ['idor', 'jwt_bypass'],
+    types: ['idor', 'jwt_bypass', 'mass_assignment'],
     notes: 'Per Claude v9: proves IDOR/JWT oracles transfer from Flask (VAmPI) to Node.js (Express).',
+  },
+  {
+    url: 'http://127.0.0.1:3011/',
+    name: 'vAPI',
+    targetClass: 'http-server',  // PHP/Laravel — THIRD-PARTY GT (not our code!)
+    recall_required: 20,  // lower bar — unknown API, crawler must discover surface
+    types: [],  // unknown — we don't know vAPI's vuln types
+    notes: 'Per Claude v10 Q4: "vAPI (roottusk/vapi) — чужой GT". Tests crawler on unknown API.',
   },
   {
     url: 'http://127.0.0.1:3005/',
