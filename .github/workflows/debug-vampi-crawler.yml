@@ -1,0 +1,71 @@
+name: Debug VAmPI Crawler
+
+on:
+  workflow_dispatch:
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p 22 -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Debug VAmPI + Express-GT with --no-fallback + PM2 logs
+        run: |
+          HOST="${{ secrets.VPS_HOST }}"
+          USER="${{ secrets.VPS_USER || 'root' }}"
+          ssh -p 22 -o StrictHostKeyChecking=no -o ConnectTimeout=60 -i ~/.ssh/id_ed25519 $USER@$HOST "bash -s" <<'REMOTE_EOF'
+          set -e
+          echo "=== PM2 flush ==="
+          pm2 flush cryptosentinel 2>&1 | tail -2
+
+          echo "=== Test VAmPI with noFallback=true ==="
+          # Fetch VAmPI
+          FETCH_RESP=$(curl -s --max-time 30 -X POST -H "Content-Type: application/json" \
+            -d '{"url":"http://127.0.0.1:3009/","type":"exchange"}' \
+            http://127.0.0.1:3000/api/fetch-url 2>&1)
+          echo "  fetch OK: $(echo "$FETCH_RESP" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('sourceCode','')[:80])" 2>/dev/null || echo 'FAIL')"
+
+          # Analyze VAmPI with noFallback=true
+          ANALYZE_RESP=$(curl -s --max-time 10 -X POST -H "Content-Type: application/json" \
+            -d '{"sourceCode":"placeholder","targetUrl":"http://127.0.0.1:3009/","targetType":"exchange","contractName":"vampi-debug","noFallback":true}' \
+            http://127.0.0.1:3000/api/analyze-job 2>&1)
+          echo "  analyze response: $(echo "$ANALYZE_RESP" | head -c 200)"
+          JOB_ID=$(echo "$ANALYZE_RESP" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('jobId',''))" 2>/dev/null || echo "")
+          echo "  Job ID: $JOB_ID"
+
+          if [ -n "$JOB_ID" ]; then
+            echo "  Waiting 30s for analysis..."
+            sleep 30
+            # Get job status
+            curl -s http://127.0.0.1:3000/api/job-status/$JOB_ID 2>&1 | python3 -c "import json,sys; d=json.load(sys.stdin); print(f'  status={d.get(\"status\")} progress={d.get(\"progress\")} message={d.get(\"message\",\"\")[:200]}')" 2>/dev/null || true
+          fi
+
+          echo ""
+          echo "=== PM2 logs (last 100 lines) — VAmPI crawler output ==="
+          pm2 logs cryptosentinel --lines 100 --nostream 2>&1 | grep -E "crawler|matrix|Generic|fallback|noFallback|ACTIVE|FUZZER|3009|idor|mass|BFLA|auth-diff|error|Error" | head -40
+
+          echo ""
+          echo "=== Test Express-GT with noFallback=true ==="
+          FETCH_RESP2=$(curl -s --max-time 30 -X POST -H "Content-Type: application/json" \
+            -d '{"url":"http://127.0.0.1:3010/","type":"exchange"}' \
+            http://127.0.0.1:3000/api/fetch-url 2>&1)
+          ANALYZE_RESP2=$(curl -s --max-time 10 -X POST -H "Content-Type: application/json" \
+            -d '{"sourceCode":"placeholder","targetUrl":"http://127.0.0.1:3010/","targetType":"exchange","contractName":"express-debug","noFallback":true}' \
+            http://127.0.0.1:3000/api/analyze-job 2>&1)
+          JOB_ID2=$(echo "$ANALYZE_RESP2" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('jobId',''))" 2>/dev/null || echo "")
+          echo "  Express-GT Job ID: $JOB_ID2"
+          if [ -n "$JOB_ID2" ]; then
+            sleep 30
+            curl -s http://127.0.0.1:3000/api/job-status/$JOB_ID2 2>&1 | python3 -c "import json,sys; d=json.load(sys.stdin); print(f'  status={d.get(\"status\")} progress={d.get(\"progress\")} message={d.get(\"message\",\"\")[:200]}')" 2>/dev/null || true
+          fi
+
+          echo ""
+          echo "=== PM2 logs (last 100 lines) — Express-GT crawler output ==="
+          pm2 logs cryptosentinel --lines 100 --nostream 2>&1 | grep -E "crawler|matrix|Generic|fallback|3010|idor|mass|BFLA|Found endpoint" | head -40
+          REMOTE_EOF
