@@ -292,6 +292,10 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
   let cookies = '';
   let token = '';
   let authHeader = 'Authorization';  // may be overridden to a custom header (e.g. 'Authorization-Token' for vAPI)
+  // Discovered paths map — declared here at top of function so Step 1 (base64
+  // auth fallback can pre-populate it with derived /{id} endpoints) and Step 3
+  // (HTML/JS crawl) can both append to it without TDZ issues.
+  const discoveredPaths = new Map<string, { path: string; method: string }>();
 
   // Step 1: Login (if auth configured)
   if (config.auth) {
@@ -501,7 +505,6 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
   const toVisit: string[] = [
     baseUrl, `${baseUrl}/`, ...universalApiPaths.map(p => `${baseUrl}${p}`),
   ];
-  const discoveredPaths = new Map<string, { path: string; method: string }>();
 
   for (let i = 0; i < toVisit.length && i < config.maxPages; i++) {
     const url = toVisit[i];
