@@ -670,11 +670,16 @@ async function runAnalysisInBackground(jobId: string, config: {
           // 0 confirmed, а не «спасибо hardcoded»."
           //
           // Telemetry is printed to jobMessage so benchmark can see it.
+          // NOTE: generic crawler runs REGARDLESS of allEndpoints — it does
+          // its own login + crawl, which is more thorough than static
+          // crawlForEndpoints. The static crawler might find paths from the
+          // HTML/JSON, but the generic crawler also does auth + identity matrix.
           const noFallback = reqBody.noFallback === true;  // --no-fallback flag
           let matrixTelemetry = '';
 
-          if (allEndpoints.length === 0 &&
-              (targetUrl.includes(':3009') || targetUrl.includes(':3010') || targetUrl.includes('/api/'))) {
+          // Run generic crawler on REST API targets (not DVWA — it has its own auth-crawler)
+          // Per Claude: "без хардкоженных путей"
+          if (targetUrl.includes(':3009') || targetUrl.includes(':3010') || targetUrl.includes('/api/')) {
             console.log(`[analyze-job]   Generic crawler: discovering API surface without hardcoded paths...`);
 
             // Login as user A
