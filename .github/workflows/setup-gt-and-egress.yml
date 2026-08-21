@@ -73,7 +73,7 @@ jobs:
             sleep 5
             # Check ALL GT ports
             ALL_OK=true
-            for port in 3001 3002 3005 3007 3008 3009; do
+            for port in 3001 3002 3005 3007 3008 3009 3010; do
               CODE=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" http://127.0.0.1:$port/ 2>/dev/null || echo "000")
               if ! echo "$CODE" | grep -qE '^[23][0-9][0-9]$'; then
                 ALL_OK=false
@@ -88,7 +88,7 @@ jobs:
           echo "=== GT container status ==="
           docker compose ps
           echo "=== Health check: curl each GT port ==="
-          for port in 3001 3002 3005 3007 3008 3009; do
+          for port in 3001 3002 3005 3007 3008 3009 3010; do
             echo "--- localhost:$port ---"
             curl -sI --max-time 10 http://127.0.0.1:$port/ | head -1 || echo "FAIL"
           done
@@ -158,7 +158,7 @@ jobs:
           iptables -A OUTPUT -p udp --dport 123 -j ACCEPT -m comment --comment "cs-egress-allow-ntp"
 
           # Allow GT docker ports (3001-3009) — host port for curl from fetch-url
-          for gt_port in 3001 3002 3003 3004 3005 3006 3007 3008 3009; do
+          for gt_port in 3001 3002 3003 3004 3005 3006 3007 3008 3009 3010; do
             iptables -A OUTPUT -p tcp --dport $gt_port -j ACCEPT -m comment --comment "cs-egress-allow-gt-port-$gt_port"
           done
 

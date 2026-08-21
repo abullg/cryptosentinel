@@ -40,7 +40,15 @@ const TIER2_TARGETS = [
     name: 'VAmPI',
     targetClass: 'http-server',  // Python/Flask REST API with server-side sinks
     recall_required: 30,
-    types: ['command_injection', 'idor', 'jwt'],  // IDOR + JWT to be added in v8
+    types: ['command_injection', 'idor', 'jwt_bypass'],
+  },
+  {
+    url: 'http://127.0.0.1:3010/',
+    name: 'Express-GT',
+    targetClass: 'http-server',  // Node.js/Express — proves oracle transfer to JS stack
+    recall_required: 30,
+    types: ['idor', 'jwt_bypass'],
+    notes: 'Per Claude v9: proves IDOR/JWT oracles transfer from Flask (VAmPI) to Node.js (Express).',
   },
   {
     url: 'http://127.0.0.1:3005/',

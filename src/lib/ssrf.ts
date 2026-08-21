@@ -88,6 +88,7 @@ const GT_ALLOWLIST_HOSTNAMES = new Set([
   'cs-crapi-main',
   'cs-webgoat',
   'cs-vampi',  // VAmPI Python/Flask — added 2026-08-21
+  'cs-express-gt',  // Express mini-GT — added v9
 ]);
 
 // GT allowlist ports (matches tests/gt/docker-compose.yml port mappings)
@@ -101,6 +102,7 @@ const GT_ALLOWLIST_PORTS = new Set([
   3007, // canary
   3008, // negative
   3009, // vampi — added 2026-08-21
+  3010, // express-gt — added v9
 ]);
 
 function isGtAllowlistEnabled(): boolean {

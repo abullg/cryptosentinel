@@ -142,3 +142,23 @@ services:
       timeout: 5s
       retries: 3
       start_period: 30s
+
+  # ─── TIER 2 GT — Express mini-GT (localhost:3010) ─────────────────
+  # Per Claude v9 Q3: "мини-приложение (Express: IDOR + mass assignment
+  # + race на /transfer) — как контролируемый GT для новых оракулов"
+  # Proves IDOR/JWT oracles transfer from Flask (VAmPI) to Node.js (Express).
+  # Vulns: IDOR, mass assignment, race condition, JWT alg=none, BFLA.
+  express-gt:
+    build:
+      context: ./express-gt
+      dockerfile: Dockerfile
+    container_name: cs-express-gt
+    ports:
+      - "3010:3010"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "true"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
