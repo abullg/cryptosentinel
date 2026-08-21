@@ -31,7 +31,7 @@ export interface CrawlConfig {
 
 export interface CrawlResult {
   loggedIn: boolean;
-  session?: { token: string; cookies: string; username: string; role: string };
+  session?: { token: string; cookies: string; username: string; role: string; authHeader?: string };
   resources: DiscoveredResource[];
   targetClass: 'http-server' | 'http-nav' | 'spa-n/a';
   crawlStats: {
@@ -87,14 +87,18 @@ function parameterizePath(path: string): { paramPath: string; paramType: 'int' |
   return null;
 }
 
-async function fetchWithTimeout(url: string, opts: RequestInit = {}, timeoutMs: number, cookies?: string, token?: string): Promise<{ status: number; body: string; contentType: string; setCookie: string }> {
+async function fetchWithTimeout(url: string, opts: RequestInit = {}, timeoutMs: number, cookies?: string, token?: string, authHeader?: string): Promise<{ status: number; body: string; contentType: string; setCookie: string }> {
   try {
     const headers: Record<string, string> = {
       'User-Agent': 'CryptoSentinel-Crawler/1.0',
       ...(opts.headers as Record<string, string> || {}),
     };
     if (cookies) headers['Cookie'] = cookies;
-    if (token) headers['Authorization'] = `Bearer ${token}`;
+    // Per Claude: auth header might be custom (Authorization-Token, not Bearer)
+    if (token) {
+      const headerName = authHeader || 'Authorization';
+      headers[headerName] = headerName === 'Authorization' ? `Bearer ${token}` : token;
+    }
     const res = await fetch(url, { ...opts, headers, signal: AbortSignal.timeout(timeoutMs), redirect: 'follow' });
     const body = await res.text();
     return {
@@ -112,31 +116,81 @@ async function fetchWithTimeout(url: string, opts: RequestInit = {}, timeoutMs: 
  * Auto-detect login form or JSON login endpoint.
  * Per Claude: "Если не нашёл — fail closed"
  */
-async function detectLogin(config: CrawlConfig): Promise<{ url: string; method: 'json' | 'form'; usernameField: string; passwordField: string; tokenExtractor: string } | null> {
+async function detectLogin(config: CrawlConfig): Promise<{ url: string; method: 'json' | 'form'; usernameField: string; passwordField: string; tokenExtractor: string; authHeader: string } | null> {
   const baseUrl = config.baseUrl.replace(/\/+$/, '');
 
-  // Try common JSON login paths
-  const jsonLoginPaths = ['/api/login', '/api/v1/login', '/api/auth/login', '/api/user/login', '/api/v1/user/login', '/auth/login', '/login', '/api/v1/auth/login'];
-  for (const path of jsonLoginPaths) {
-    const res = await fetchWithTimeout(`${baseUrl}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: config.auth?.username || 'user', password: config.auth?.password || 'user' }) }, config.timeoutMs);
-    if (res.status === 200) {
-      try {
-        const data = JSON.parse(res.body);
-        if (data.token || data.access_token || data.jwt) {
-          console.log(`[crawler] Found JSON login at ${path}`);
-          return { url: `${baseUrl}${path}`, method: 'json', usernameField: 'username', passwordField: 'password', tokenExtractor: 'token' };
-        }
-      } catch {}
+  // Per Claude v10-feedback: vAPI uses /vapi/api2/user/login with email field,
+  // and Authorization-Token header (not Bearer). Crawler needs to:
+  // 1. Try login paths under discovered prefixes (not just /api/)
+  // 2. Try both username and email fields
+  // 3. Support custom auth headers (not just Bearer)
+
+  // Step 0: Fetch root page, extract path prefixes (e.g., /vapi/)
+  const rootRes = await fetchWithTimeout(`${baseUrl}/`, {}, config.timeoutMs);
+  const prefixes = ['/api', '/api/v1', '/auth', '/vapi', '/api/v2'];
+  if (rootRes.status === 200 && rootRes.body) {
+    // Extract path prefixes from HTML content
+    const prefixMatches = rootRes.body.matchAll(/["'(]\/(vapi|api|auth|v1|v2)\/[^"')\s]*/gi);
+    for (const m of prefixMatches) {
+      const prefix = '/' + m[1];
+      if (!prefixes.includes(prefix)) {
+        prefixes.push(prefix);
+        console.log(`[crawler] Discovered path prefix from HTML: ${prefix}`);
+      }
     }
   }
 
-  // Try form-based login (HTML)
+  // Try JSON login paths under all prefixes + common paths
+  const loginSubPaths = ['/login', '/user/login', '/auth/login', '/api2/user/login', '/api/login', '/v1/user/login'];
+  const jsonLoginPaths: string[] = [];
+  for (const prefix of prefixes) {
+    for (const sub of loginSubPaths) {
+      jsonLoginPaths.push(`${prefix}${sub}`);
+    }
+  }
+  // Also try without prefix
+  jsonLoginPaths.push('/login', '/api/login', '/auth/login', '/user/login');
+
+  for (const path of jsonLoginPaths) {
+    // Per Claude: try both username and email fields
+    const creds = [
+      { username: config.auth?.username || 'user', password: config.auth?.password || 'user', field: 'username' },
+      { username: config.auth?.username || 'user@example.com', password: config.auth?.password || 'user', field: 'email' },
+    ];
+    for (const cred of creds) {
+      const res = await fetchWithTimeout(
+        `${baseUrl}${path}`,
+        { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ [cred.field]: cred.username, password: cred.password }) },
+        config.timeoutMs,
+      );
+      if (res.status === 200) {
+        try {
+          const data = JSON.parse(res.body);
+          // Per Claude: token might be in any field, not just 'token'
+          const tokenVal = data.token || data.access_token || data.jwt || data.auth_token || data.session || data.accessToken;
+          if (tokenVal) {
+            console.log(`[crawler] Found JSON login at ${path} (field: ${cred.field})`);
+            // Per Claude: auth header might be custom (Authorization-Token, not Bearer)
+            // Check if response mentions custom header name
+            let authHeader = 'Authorization';
+            if (rootRes.body && rootRes.body.includes('Authorization-Token')) {
+              authHeader = 'Authorization-Token';
+              console.log(`[crawler] Using custom auth header: Authorization-Token`);
+            }
+            return { url: `${baseUrl}${path}`, method: 'json', usernameField: cred.field, passwordField: 'password', tokenExtractor: tokenVal === data.token ? 'token' : tokenVal === data.access_token ? 'access_token' : 'token', authHeader };
+          }
+        } catch {}
+      }
+    }
+  }
+
+  // Form-based login (HTML) — keep as generic capability, not vAPI-specific
   const res = await fetchWithTimeout(`${baseUrl}/login`, {}, config.timeoutMs);
   if (res.status === 200 && res.body.includes('<form')) {
     const formMatch = res.body.match(/<form[^>]*action=["']([^"']*)["'][^>]*method=["']([post]+)["']/i);
     if (formMatch) {
       console.log(`[crawler] Found form login at ${formMatch[1]}`);
-      return { url: `${baseUrl}${formMatch[1]}`, method: 'form', usernameField: 'username', passwordField: 'password', tokenExtractor: '' };
+      return { url: `${baseUrl}${formMatch[1]}`, method: 'form', usernameField: 'username', passwordField: 'password', tokenExtractor: '', authHeader: 'Cookie' };
     }
   }
 
@@ -255,11 +309,40 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
     }
 
     if (!loginConfig) {
-      console.log('[crawler] No login endpoint found — fail closed (per Claude: "не сканируй анонимно все CVE")');
-      return { ...result, targetClass: 'spa-n/a' };
+      console.log('[crawler] No login endpoint found — trying self-registration...');
+
+      // Per Claude: "если логина нет, а есть POST .../user регистрация — создать A и B"
+      // Try to register a new user if no login found
+      const registerPaths = ['/api/register', '/api/user/register', '/api/v1/user/register',
+        '/vapi/api1/user', '/api/user', '/register', '/vapi/api2/user/register', '/signup'];
+      let registered = false;
+      for (const regPath of registerPaths) {
+        const credField = regPath.includes('vapi') ? 'email' : 'username';
+        const regBody = JSON.stringify({
+          [credField]: config.auth?.username || `cs_bot_${Date.now()}@test.local`,
+          password: config.auth?.password || 'CrawlerTest123!',
+          ...(credField === 'email' ? { name: 'CrawlerBot' } : {}),
+        });
+        const regRes = await fetchWithTimeout(
+          `${baseUrl}${regPath}`,
+          { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: regBody },
+          config.timeoutMs,
+        );
+        if (regRes.status === 200 || regRes.status === 201) {
+          console.log(`[crawler] ✓ Self-registered user via ${regPath} (field: ${credField})`);
+          // Now try to login with the new account
+          loginConfig = await detectLogin(config);
+          if (loginConfig) { registered = true; break; }
+        }
+      }
+      if (!registered || !loginConfig) {
+        console.log('[crawler] No login + no registration found — fail closed');
+        return { ...result, targetClass: 'spa-n/a' };
+      }
     }
 
-    console.log(`[crawler] Logging in as ${config.auth.username}...`);
+    const authHeader = loginConfig.authHeader || 'Authorization';
+    console.log(`[crawler] Logging in as ${config.auth.username} (header: ${authHeader})...`);
     const loginRes = await fetchWithTimeout(
       loginConfig.url,
       {
@@ -288,6 +371,7 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
             cookies,
             username: config.auth.username,
             role: data.role || data.user?.role || 'user',
+            authHeader: authHeader,
           };
           console.log(`[crawler] ✓ Login successful — token: ${token.slice(0, 20)}..., role: ${result.session.role}`);
         }

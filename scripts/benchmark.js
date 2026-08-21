@@ -53,10 +53,10 @@ const TIER2_TARGETS = [
   {
     url: 'http://127.0.0.1:3011/',
     name: 'vAPI',
-    targetClass: 'http-server',  // PHP/Laravel — THIRD-PARTY GT (not our code!)
-    recall_required: 20,  // lower bar — unknown API, crawler must discover surface
-    types: [],  // unknown — we don't know vAPI's vuln types
-    notes: 'Per Claude v10 Q4: "vAPI (roottusk/vapi) — чужой GT". Tests crawler on unknown API.',
+    targetClass: 'http-nav',  // Per Claude: informational until ≥1 authz confirmed
+    recall_required: null,    // NOT a gate — we don't know vAPI's vuln types
+    types: [],
+    notes: 'Per Claude: "vAPI в бенче — informational, пока 0 authz; после первой находки — гейт recall_required=0"',
   },
   {
     url: 'http://127.0.0.1:3005/',

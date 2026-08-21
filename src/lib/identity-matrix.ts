@@ -23,6 +23,7 @@ export interface AuthSession {
   username: string;
   role: string;
   cookies?: string;
+  authHeader?: string;  // custom auth header (e.g., 'Authorization-Token' for vAPI)
 }
 
 export interface DiscoveredResource {
@@ -59,7 +60,9 @@ function makeHeaders(session: AuthSession | undefined): Record<string, string> {
     'User-Agent': 'CryptoSentinel-Identity-Matrix/1.0',
   };
   if (session?.token) {
-    headers['Authorization'] = `Bearer ${session.token}`;
+    // Per Claude: support custom auth headers (Authorization-Token, not just Bearer)
+    const headerName = session.authHeader || 'Authorization';
+    headers[headerName] = headerName === 'Authorization' ? `Bearer ${session.token}` : session.token;
   }
   if (session?.cookies) {
     headers['Cookie'] = session.cookies;
