@@ -315,9 +315,22 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
     console.log(`[crawler] OpenAPI found: ${openApiResources.length} resources`);
   }
 
-  // Step 3: Crawl HTML pages for <a href> + form actions + JS endpoints
+  // Step 3: Crawl pages — HTML for <a href> + form + JS, JSON for endpoint lists
+  // Per Claude: "JSON-ответы: id, url, userId → новые ресурсы"
+  // And: "Короткий универсальный API-словарь (/api, /api/v1, /me, /users,
+  // /admin, /transfer, /profile) — не список вашего Express"
   const visited = new Set<string>();
-  const toVisit: string[] = [baseUrl, `${baseUrl}/`, `${baseUrl}/api`, `${baseUrl}/api/v1`];
+  // Universal API dictionary — common paths ANY REST API might have
+  // (NOT hardcoded to VAmPI/Express-GT — these are standard REST conventions)
+  const universalApiPaths = [
+    '/api', '/api/v1', '/api/users', '/api/me', '/api/profile',
+    '/api/login', '/api/auth/login', '/api/books', '/api/orders',
+    '/api/transfer', '/api/admin', '/api/admin/users',
+    '/api/resources', '/api/items', '/api/accounts',
+  ];
+  const toVisit: string[] = [
+    baseUrl, `${baseUrl}/`, ...universalApiPaths.map(p => `${baseUrl}${p}`),
+  ];
   const discoveredPaths = new Map<string, { path: string; method: string }>();
 
   for (let i = 0; i < toVisit.length && i < config.maxPages; i++) {
@@ -328,6 +341,60 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
 
     const res = await fetchWithTimeout(url, {}, config.timeoutMs, cookies, token);
     if (res.status !== 200 || !res.body) continue;
+
+    // Check if response is JSON (API-only targets return JSON, not HTML)
+    const isJson = res.contentType.includes('application/json') || res.body.trimStart().startsWith('{') || res.body.trimStart().startsWith('[');
+
+    if (isJson) {
+      // Parse JSON response for endpoint-like strings
+      // Per Claude: "JSON-ответы: id, url, userId, вложенные объекты → новые ресурсы"
+      try {
+        const jsonData = JSON.parse(res.body);
+
+        // Check for "endpoints" or "routes" or "links" field (many APIs list their endpoints)
+        const endpointLists = [jsonData.endpoints, jsonData.routes, jsonData.links, jsonData.paths, jsonData._links];
+        for (const list of endpointLists) {
+          if (Array.isArray(list)) {
+            for (const ep of list) {
+              if (typeof ep === 'string' && ep.startsWith('/')) {
+                // Parse "GET /api/users/:id" format or just "/api/users"
+                const parts = ep.match(/^(GET|POST|PUT|PATCH|DELETE)\s+(.+)$/i);
+                const method = parts ? parts[1].toUpperCase() : 'GET';
+                const path = parts ? parts[2] : ep;
+                const param = parameterizePath(path);
+                const finalPath = param?.paramPath || path;
+                const key = `${finalPath}:${method}`;
+                if (!discoveredPaths.has(key)) {
+                  discoveredPaths.set(key, { path: finalPath, method });
+                  console.log(`[crawler] Found endpoint from JSON: ${method} ${finalPath}`);
+                }
+              }
+            }
+          }
+        }
+
+        // Recursively scan JSON for URL-like strings
+        function scanJsonForPaths(obj: any, depth = 0) {
+          if (depth > 3) return;
+          if (typeof obj === 'string') {
+            // Check if it looks like an API path
+            if (obj.startsWith('/api/') || obj.startsWith('/v1/')) {
+              const param = parameterizePath(obj);
+              const finalPath = param?.paramPath || obj;
+              const key = `${finalPath}:GET`;
+              if (!discoveredPaths.has(key)) {
+                discoveredPaths.set(key, { path: finalPath, method: 'GET' });
+              }
+            }
+          } else if (Array.isArray(obj)) {
+            for (const item of obj.slice(0, 20)) scanJsonForPaths(item, depth + 1);
+          } else if (obj && typeof obj === 'object') {
+            for (const val of Object.values(obj).slice(0, 20)) scanJsonForPaths(val, depth + 1);
+          }
+        }
+        scanJsonForPaths(jsonData);
+      } catch {}
+    }
 
     // Extract <a href> links
     const hrefMatches = res.body.matchAll(/href=["']([^"']+)["']/gi);
