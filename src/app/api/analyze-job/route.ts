@@ -848,6 +848,25 @@ async function runAnalysisInBackground(jobId: string, config: {
             console.log(`[analyze-job] ✓ Active fuzzer completion — ${confirmedCount} findings, no LLM call`);
             return;
           }
+
+          // If active fuzzer ran but found 0 (e.g., --no-fallback and crawler found 0
+          // resources), return here WITH telemetry — don't fall through to SKIP_LLM
+          // which would show "static-only" and hide the crawler/matrix telemetry.
+          if (matrixTelemetry) {
+            console.log(`[analyze-job] Active fuzzer ran but 0 confirmed. Telemetry: ${matrixTelemetry}`);
+            const confirmedCount = savedStatic.length;
+            await updateJob(100, `Analysis complete (active fuzzer, 0 confirmed): ${confirmedCount} findings. ${matrixTelemetry}. LLM skipped.`);
+            fireAndForget(db.audit.update({ where: { id: auditId }, data: { status: 'completed', findings: confirmedCount, completedAt: new Date() } }), 'catch audit.update fuzzer-0');
+            fireAndForget(db.analysisJob.update({ where: { id: jobId }, data: { status: 'completed', resultCount: confirmedCount } }), 'catch analysisJob.update fuzzer-0');
+            writeProgressFile(jobId, { progress: 100, message: `Analysis complete (0 confirmed): ${matrixTelemetry}`, status: 'completed' });
+            if (progressInterval) clearInterval(progressInterval);
+            clearInterval(flushTimer); clearInterval(heartbeatTimer);
+            clearTimeout(globalTimeout);
+            clearTimeout(panicTimer);
+            await flushJobNow();
+            console.log(`[analyze-job] ✓ Active fuzzer 0-completion — telemetry: ${matrixTelemetry}`);
+            return;
+          }
         } catch (e) {
           console.error(`[analyze-job] Active fuzzer failed: ${String(e).slice(0, 200)}`);
         }
