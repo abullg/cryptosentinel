@@ -330,11 +330,15 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
           { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: regBody },
           config.timeoutMs,
         );
-        // 200/201 = success, but also check for JSON success field
+        // 200/201 = success, but check for error fields (vAPI uses errorInfo, success:"false")
         let success = regRes.status === 200 || regRes.status === 201;
         try {
           const data = JSON.parse(regRes.body);
-          if (data.error || data.success === false) success = false;
+          // vAPI returns {"errorInfo":[...]} on error, {"success":"false","cause":"..."} on fail
+          if (data.error || data.errorInfo || data.success === false || data.success === "false" || data.cause) {
+            success = false;
+            console.log(`[crawler] Registration at ${regPath} failed: ${JSON.stringify(data).slice(0, 100)}`);
+          }
         } catch {}
         if (success) {
           console.log(`[crawler] ✓ Self-registered user "${botId}" via ${regPath}`);
