@@ -236,12 +236,12 @@ function extractEndpointsFromJS(js: string, baseUrl: string): { path: string; me
 /**
  * Extract endpoints from OpenAPI/Swagger spec.
  */
-async function extractFromOpenAPI(baseUrl: string, cookies: string, token: string, timeoutMs: number): Promise<DiscoveredResource[]> {
+async function extractFromOpenAPI(baseUrl: string, cookies: string, token: string, timeoutMs: number, authHeader: string = 'Authorization'): Promise<DiscoveredResource[]> {
   const resources: DiscoveredResource[] = [];
   const openApiPaths = ['/openapi.json', '/swagger.json', '/v3/api-docs', '/api-docs', '/swagger/v1/swagger.json'];
 
   for (const path of openApiPaths) {
-    const res = await fetchWithTimeout(`${baseUrl}${path}`, {}, timeoutMs, cookies, token);
+    const res = await fetchWithTimeout(`${baseUrl}${path}`, {}, timeoutMs, cookies, token, authHeader);
     if (res.status !== 200) continue;
 
     try {
@@ -291,6 +291,7 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
 
   let cookies = '';
   let token = '';
+  let authHeader = 'Authorization';  // may be overridden to a custom header (e.g. 'Authorization-Token' for vAPI)
 
   // Step 1: Login (if auth configured)
   if (config.auth) {
@@ -316,6 +317,7 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
       const registerPaths = ['/api/register', '/api/user/register', '/api/v1/user/register',
         '/vapi/api1/user', '/api/user', '/register', '/vapi/api2/user/register', '/signup'];
       let registered = false;
+      let successfulRegPath: string | null = null;  // remember which path worked → derive GET /{id}
       for (const regPath of registerPaths) {
         // Generate unique username + email per attempt
         const botId = `csbot${Date.now().toString(36).slice(-6)}`;
@@ -345,12 +347,19 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
           // Store credentials for login
           if (!config.auth) config.auth = { username: '', password: '' };
           config.auth.username = botId;
+          // Mark registered=true REGARDLESS of login availability —
+          // some APIs (vAPI API1) have no login endpoint at all and rely
+          // on a custom auth header (e.g. Authorization-Token: base64(user:pass))
+          registered = true;
+          successfulRegPath = regPath;  // for later {id} derivation
           // Now try to login with the new account
           loginConfig = await detectLogin(config);
-          if (loginConfig) { registered = true; break; }
+          if (loginConfig) { break; }
+          // No login endpoint found — keep iterating registerPaths only
+          // to update credentials (most recent successful registration wins).
         }
       }
-      if (!registered || !loginConfig) {
+      if (!loginConfig) {
         // Per Claude: "если логина нет, а есть POST .../user регистрация —
         // создать A и B, сохранить секреты"
         // vAPI API1 pattern: no login endpoint, use Authorization-Token: base64(user:pass)
@@ -366,7 +375,42 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
             role: 'user',
             authHeader: 'Authorization-Token',  // vAPI custom header
           };
+          authHeader = 'Authorization-Token';  // for Step 2/3 fetches
           console.log(`[crawler] ✓ Using base64 auth (Authorization-Token header)`);
+          // Populate local token/cookies so Step 2 (OpenAPI) + Step 3 (HTML crawl)
+          // execute AS the authenticated user, not anonymous.
+          token = base64Token;
+          // Derive resource endpoints from the successful registration path.
+          // Pattern: POST /X/user registers a user → GET /X/user/{id} usually
+          // retrieves that user (BOLA/IDOR candidate). This is generic — applies
+          // to vAPI API1/API5, Django REST /api/users, Rails /users, etc.
+          // We probe /X/user/1..5 with the new session; 200/401/403 = endpoint exists
+          // (404 = no such route). Adding the found endpoints to discoveredPaths
+          // lets the identity matrix probe them for IDOR/BFLA/mass-assign.
+          if (successfulRegPath) {
+            const candidateGet = `${successfulRegPath}/{id}`;
+            // Try small IDs — most seed DBs use 1..5
+            for (const id of [1, 2, 3, 4, 5]) {
+              const probeUrl = `${baseUrl}${successfulRegPath}/${id}`;
+              const probeRes = await fetchWithTimeout(probeUrl, { method: 'GET' }, config.timeoutMs, '', base64Token, 'Authorization-Token');
+              if (probeRes.status !== 404) {
+                // 200/401/403 = endpoint exists (401/403 means auth required, still IDOR-able)
+                const key = `${candidateGet}:GET`;
+                if (!discoveredPaths.has(key)) {
+                  discoveredPaths.set(key, { path: candidateGet, method: 'GET' });
+                  console.log(`[crawler] Derived GET ${candidateGet} from registration path (probe ${probeRes.status} on /${id})`);
+                }
+                break;  // found one — stop probing
+              }
+            }
+            // Also try PUT /X/user/{id} (mass assignment candidate)
+            const candidatePut = `${successfulRegPath}/{id}`;
+            const keyPut = `${candidatePut}:PUT`;
+            if (!discoveredPaths.has(keyPut)) {
+              discoveredPaths.set(keyPut, { path: candidatePut, method: 'PUT' });
+              console.log(`[crawler] Derived PUT ${candidatePut} (mass-assignment candidate)`);
+            }
+          }
         } else {
           console.log('[crawler] No login + no registration found — fail closed');
           return { ...result, targetClass: 'spa-n/a' };
@@ -374,62 +418,67 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
       }
     }
 
-    const authHeader = loginConfig.authHeader || 'Authorization';
-    // Per Claude: try login with BOTH username and email fields
-    // detectLogin already determined which field the API uses
-    const loginValue = loginConfig.usernameField === 'email'
-      ? (config.auth.username.includes('@') ? config.auth.username : `${config.auth.username}@test.local`)
-      : config.auth.username;
-    console.log(`[crawler] Logging in as ${loginValue} (field: ${loginConfig.usernameField}, header: ${authHeader})...`);
-    const loginRes = await fetchWithTimeout(
-      loginConfig.url,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': loginConfig.method === 'json' ? 'application/json' : 'application/x-www-form-urlencoded' },
-        body: loginConfig.method === 'json'
-          ? JSON.stringify({ [loginConfig.usernameField]: loginValue, [loginConfig.passwordField]: config.auth.password })
-          : new URLSearchParams({ [loginConfig.usernameField]: loginValue, [loginConfig.passwordField]: config.auth.password }).toString(),
-      },
-      config.timeoutMs,
-    );
+    // Only run the explicit login flow when we actually found a login endpoint.
+    // When the base64 auth fallback was used (loginConfig=null), result.session
+    // is already populated with the base64 token — skip this block.
+    if (loginConfig) {
+      authHeader = loginConfig.authHeader || 'Authorization';
+      // Per Claude: try login with BOTH username and email fields
+      // detectLogin already determined which field the API uses
+      const loginValue = loginConfig.usernameField === 'email'
+        ? (config.auth.username.includes('@') ? config.auth.username : `${config.auth.username}@test.local`)
+        : config.auth.username;
+      console.log(`[crawler] Logging in as ${loginValue} (field: ${loginConfig.usernameField}, header: ${authHeader})...`);
+      const loginRes = await fetchWithTimeout(
+        loginConfig.url,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': loginConfig.method === 'json' ? 'application/json' : 'application/x-www-form-urlencoded' },
+          body: loginConfig.method === 'json'
+            ? JSON.stringify({ [loginConfig.usernameField]: loginValue, [loginConfig.passwordField]: config.auth.password })
+            : new URLSearchParams({ [loginConfig.usernameField]: loginValue, [loginConfig.passwordField]: config.auth.password }).toString(),
+        },
+        config.timeoutMs,
+      );
 
-    if (loginRes.setCookie) {
-      const match = loginRes.setCookie.match(/([^=]+)=([^;]+)/);
-      if (match) cookies = match[0];
-    }
+      if (loginRes.setCookie) {
+        const match = loginRes.setCookie.match(/([^=]+)=([^;]+)/);
+        if (match) cookies = match[0];
+      }
 
-    if (loginRes.status === 200) {
-      try {
-        const data = JSON.parse(loginRes.body);
-        token = data[loginConfig.tokenExtractor] || data.token || data.access_token || '';
-        if (token) {
-          result.loggedIn = true;
-          result.session = {
-            token,
-            cookies,
-            username: config.auth.username,
-            role: data.role || data.user?.role || 'user',
-            authHeader: authHeader,
-          };
-          console.log(`[crawler] ✓ Login successful — token: ${token.slice(0, 20)}..., role: ${result.session.role}`);
-        }
-      } catch {
-        // Form login — check if Set-Cookie has session
-        if (cookies) {
-          result.loggedIn = true;
-          result.session = { token: '', cookies, username: config.auth.username, role: 'user' };
-          console.log('[crawler] ✓ Form login successful (cookie-based)');
+      if (loginRes.status === 200) {
+        try {
+          const data = JSON.parse(loginRes.body);
+          token = data[loginConfig.tokenExtractor] || data.token || data.access_token || '';
+          if (token) {
+            result.loggedIn = true;
+            result.session = {
+              token,
+              cookies,
+              username: config.auth.username,
+              role: data.role || data.user?.role || 'user',
+              authHeader: authHeader,
+            };
+            console.log(`[crawler] ✓ Login successful — token: ${token.slice(0, 20)}..., role: ${result.session.role}`);
+          }
+        } catch {
+          // Form login — check if Set-Cookie has session
+          if (cookies) {
+            result.loggedIn = true;
+            result.session = { token: '', cookies, username: config.auth.username, role: 'user' };
+            console.log('[crawler] ✓ Form login successful (cookie-based)');
+          }
         }
       }
-    }
 
-    if (!result.loggedIn) {
-      console.log('[crawler] Login failed — continuing as anonymous');
+      if (!result.loggedIn) {
+        console.log('[crawler] Login failed — continuing as anonymous');
+      }
     }
   }
 
   // Step 2: Try OpenAPI/Swagger
-  const openApiResources = await extractFromOpenAPI(baseUrl, cookies, token, config.timeoutMs);
+  const openApiResources = await extractFromOpenAPI(baseUrl, cookies, token, config.timeoutMs, authHeader);
   if (openApiResources.length > 0) {
     result.crawlStats.openApiFound = true;
     result.crawlStats.apiPathsFound += openApiResources.length;
@@ -460,7 +509,7 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
     visited.add(url);
     result.crawlStats.pagesCrawled++;
 
-    const res = await fetchWithTimeout(url, {}, config.timeoutMs, cookies, token);
+    const res = await fetchWithTimeout(url, {}, config.timeoutMs, cookies, token, authHeader);
     if (res.status !== 200 || !res.body) continue;
 
     // Check if response is JSON (API-only targets return JSON, not HTML)
@@ -569,7 +618,7 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
       const src = m[1];
       if (src.startsWith('/') || src.startsWith(baseUrl)) {
         const jsUrl = src.startsWith('/') ? `${baseUrl}${src}` : src;
-        const jsRes = await fetchWithTimeout(jsUrl, {}, config.timeoutMs, cookies, token);
+        const jsRes = await fetchWithTimeout(jsUrl, {}, config.timeoutMs, cookies, token, authHeader);
         if (jsRes.status === 200 && jsRes.body) {
           result.crawlStats.jsAnalyzed++;
           const jsEndpoints = extractEndpointsFromJS(jsRes.body, baseUrl);
