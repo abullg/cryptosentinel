@@ -114,6 +114,16 @@ jobs:
           # ─── RUN BENCHMARK ───
           echo "=== Running benchmark.js ==="
           GT_ALLOWLIST_ENABLED=true node scripts/benchmark.js http://localhost:3000 2>&1
+
+          # ─── BENCH-DOWN: stop GT containers after bench (per Claude v8 Q10) ───
+          # GT containers should NOT live on production VPS that scans
+          # client targets. After bench completes, stop them.
+          # Future: move GT to separate staging VPS (Claude Q10 option b).
+          echo "=== Bench-down: stopping GT containers ==="
+          cd /opt/cryptosentinel/tests/gt
+          docker compose stop 2>&1 | tail -5
+          echo "  GT containers stopped (not removed — use 'docker compose start' to resume)"
+          docker compose ps 2>&1 | tail -5
           REMOTE_EOF
 
       - name: Upload benchmark results

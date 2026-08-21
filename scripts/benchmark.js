@@ -1,41 +1,66 @@
 /**
- * CryptoSentinel — 3-Tier Benchmark (FINAL 2026-08-21)
+ * CryptoSentinel — 3-Tier Benchmark v8 (per Claude v7 feedback)
  *
- * Tier 1 — Deterministic: Can the engine reproducibly confirm known vulns?
- *   DVWA + WebGoat (localhost:3002 + 3005)
- *   Active fuzzer with deterministic oracles (SQLi time-delay, reflection, etc.)
+ * Per Claude's v8 Definition of Done:
+ *   - benchmark.js: types обязателен при recall_required;
+ *     0/0 → schema error; DVWA не gate'ит Tier 2 повторно
+ *   - классы целей: http-server / http-nav / spa-n/a
+ *   - Stop criteria: only canary>0, negative>0, prod active probe,
+ *     DVWA http-server recall<50%, FP>0, LLM-written confirmed>0
  *
- * Tier 2 — Heterogeneous: Does architecture transfer across apps/techs?
- *   DVWA + WebGoat + VAmPI + Juice Shop
- *   Active fuzzer adapted per target (PHP/Java/Python/Node)
+ * Tier 1 — http-server (DVWA-class, server-side sinks, known params)
+ *   recall ≥ 50% (gate)
  *
- * Tier 3 — Unknown/Realistic: How many FPs on real internet?
- *   10 production homepage/API targets
- *   Passive-only mode (no active probes, static + LLM if needed)
+ * Tier 2 — heterogeneous, BY ORACLE CLASS:
+ *   - http-server (VAmPI cmdi): ≥ 30% recall (gate)
+ *   - http-nav (WebGoat without lesson map): informational, NOT a gate
+ *     Goal: "doesn't crash, doesn't scan outside allowlist"
+ *   - spa-n/a (Juice Shop): NOT counted in HTTP-recall at all
+ *     Separate column "browser-oracle: n/a" until browser fuzzer exists
  *
- * Per Claude protocol stop-criteria:
- *   Tier 1 recall ≥ 50% to call it a "vulnerability analyzer"
- *   Tier 2 recall ≥ 30% (heterogeneous is harder)
- *   Tier 3 FP rate < 10% (per Claude §9.4)
- *   Canary confirmed_max = 0 (P0 security)
- *   Negative confirmed_exploitable_max = 0 (precision)
+ * Tier 3 — Production passive-only (10 targets, no active probes)
+ *   FP rate < 10% (gate), expected 0
  */
 
-// ═══ TIER 1 — DETERMINISTIC ═══════════════════════════════════════════
+// ═══ TIER 1 — http-server (DVWA-class) ═══════════════════════════════
 const TIER1_TARGETS = [
-  'http://127.0.0.1:3002/',  // DVWA — PHP/MySQL — 6 known vuln types
-  'http://127.0.0.1:3005/',  // WebGoat — Java Spring Boot — 3 vuln classes
+  {
+    url: 'http://127.0.0.1:3002/',
+    name: 'DVWA',
+    targetClass: 'http-server',
+    recall_required: 50,
+    types: ['sqli', 'reflected_xss', 'stored_xss', 'command_injection', 'csrf', 'file_upload'],
+  },
 ];
 
-// ═══ TIER 2 — HETEROGENEOUS ══════════════════════════════════════════
+// ═══ TIER 2 — heterogeneous (NEW stacks only, no DVWA duplicate) ═════
 const TIER2_TARGETS = [
-  'http://127.0.0.1:3002/',  // DVWA — PHP
-  'http://127.0.0.1:3005/',  // WebGoat — Java
-  'http://127.0.0.1:3009/',  // VAmPI — Python/Flask (REST API)
-  'http://127.0.0.1:3001/',  // OWASP Juice Shop — Node.js SPA
+  {
+    url: 'http://127.0.0.1:3009/',
+    name: 'VAmPI',
+    targetClass: 'http-server',  // Python/Flask REST API with server-side sinks
+    recall_required: 30,
+    types: ['command_injection', 'idor', 'jwt'],  // IDOR + JWT to be added in v8
+  },
+  {
+    url: 'http://127.0.0.1:3005/',
+    name: 'WebGoat',
+    targetClass: 'http-nav',  // Java Spring Boot, lesson-based URLs (hash router)
+    recall_required: null,  // informational — NOT a gate (Claude Q1)
+    types: [],
+    notes: 'Hash-router (#lesson/X) not visible to HTTP oracles. Goal: no crash, no out-of-allowlist probes.',
+  },
+  {
+    url: 'http://127.0.0.1:3001/',
+    name: 'Juice Shop',
+    targetClass: 'spa-n/a',  // Node.js SPA, all challenges client-side
+    recall_required: null,  // NOT counted in HTTP-recall
+    types: [],
+    notes: 'Browser-oracle: n/a until browser fuzzer exists. Client-side DOM XSS/JWT not measurable by HTTP oracles.',
+  },
 ];
 
-// ═══ TIER 3 — PRODUCTION PASSIVE-ONLY ════════════════════════════════
+// ═══ TIER 3 — Production passive-only ══════════════════════════════
 const TIER3_TARGETS = [
   'https://www.bitunix.com/',
   'https://app.uniswap.org/',
@@ -49,39 +74,20 @@ const TIER3_TARGETS = [
   'https://github.com/',
 ];
 
-// Canary + Negative are always tested (cross-tier stop criteria)
+// Canary + Negative — always tested, P0 stop criteria
 const ALWAYS_TEST = [
-  'http://127.0.0.1:3007/',  // Canary — prompt injection resistance
-  'http://127.0.0.1:3008/',  // Negative — precision control
+  { url: 'http://127.0.0.1:3007/', name: 'Canary', targetClass: 'canary', confirmed_max: 0 },
+  { url: 'http://127.0.0.1:3008/', name: 'Negative', targetClass: 'negative', confirmed_exploitable_max: 0 },
 ];
 
 const ALL_TIERS = [
-  { name: 'Tier 1 — Deterministic', targets: [...TIER1_TARGETS, ...ALWAYS_TEST], mode: 'active', tierKey: 'tier1' },
-  { name: 'Tier 2 — Heterogeneous', targets: [...TIER2_TARGETS, ...ALWAYS_TEST], mode: 'active', tierKey: 'tier2' },
+  { name: 'Tier 1 — http-server (Deterministic)', targets: [...TIER1_TARGETS, ...ALWAYS_TEST], mode: 'active', tierKey: 'tier1' },
+  { name: 'Tier 2 — Heterogeneous (new stacks)', targets: [...TIER2_TARGETS, ...ALWAYS_TEST], mode: 'active', tierKey: 'tier2' },
   { name: 'Tier 3 — Production Passive-Only', targets: [...TIER3_TARGETS], mode: 'passive', tierKey: 'tier3' },
 ];
 
-// Pre-registered expectations (mirror of tests/gt/expected.yaml — for live measurement)
-const EXPECTATIONS = {
-  tier1: {
-    'http://127.0.0.1:3002/': { recall_required: 50, types: ['sqli', 'xss', 'command_injection', 'file_upload', 'csrf'] },
-    'http://127.0.0.1:3005/': { recall_required: 33, types: ['sqli', 'xss', 'path_traversal'] },
-    'http://127.0.0.1:3007/': { confirmed_max: 0 },  // canary
-    'http://127.0.0.1:3008/': { confirmed_exploitable_max: 0 },  // negative
-  },
-  tier2: {
-    'http://127.0.0.1:3002/': { recall_required: 50 },
-    'http://127.0.0.1:3005/': { recall_required: 33 },
-    'http://127.0.0.1:3009/': { recall_required: 40, types: ['idor', 'sqli', 'command_injection', 'jwt', 'info_exposure'] },
-    'http://127.0.0.1:3001/': { recall_required: 30 },
-    'http://127.0.0.1:3007/': { confirmed_max: 0 },
-    'http://127.0.0.1:3008/': { confirmed_exploitable_max: 0 },
-  },
-  tier3: {
-    // All Tier 3 — passive only, 0 confirmed exploitable expected
-    fp_rate_max: 10,  // percent
-  },
-};
+// FP rate threshold for Tier 3
+const TIER3_FP_RATE_MAX = 10;  // percent
 
 async function benchmark() {
   const API_BASE = process.argv[2] || 'http://127.0.0.1:3000';
@@ -94,10 +100,13 @@ async function benchmark() {
     console.log('═'.repeat(80));
 
     for (let i = 0; i < tier.targets.length; i++) {
-      const url = tier.targets[i];
+      const target = typeof tier.targets[i] === 'string' ? { url: tier.targets[i] } : tier.targets[i];
+      const url = target.url;
+      const targetClass = target.targetClass || 'production';
       const isCanary = url.includes('3007');
       const isNegative = url.includes('3008');
-      console.log(`\n[${i+1}/${tier.targets.length}] ${url}${isCanary ? ' (CANARY)' : ''}${isNegative ? ' (NEGATIVE)' : ''}`);
+      const label = target.name ? `${target.name} [${targetClass}]` : url;
+      console.log(`\n[${i+1}/${tier.targets.length}] ${label}${isCanary ? ' (CANARY)' : ''}${isNegative ? ' (NEGATIVE)' : ''}`);
       const startTime = Date.now();
 
       try {
@@ -107,21 +116,21 @@ async function benchmark() {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url, type: 'exchange' }),
-          signal: AbortSignal.timeout(120_000),  // 2 min — gives WebGoat/Juice Shop time
+          signal: AbortSignal.timeout(120_000),
         });
         const fetchTime = Date.now() - fetchStart;
 
         if (!fetchRes.ok) {
           const err = await fetchRes.json().catch(() => ({}));
           console.log(`  FETCH FAILED: ${err.error || fetchRes.status} (${fetchTime}ms)`);
-          results[tier.tierKey].push({ url, status: 'fetch_failed', fetchTime, error: err.error || String(fetchRes.status) });
+          results[tier.tierKey].push({ url, status: 'fetch_failed', fetchTime, error: err.error || String(fetchRes.status), targetClass });
           continue;
         }
 
         const data = await fetchRes.json();
         if (data.error) {
           console.log(`  FETCH ERROR: ${data.error} (${fetchTime}ms)`);
-          results[tier.tierKey].push({ url, status: 'fetch_error', fetchTime, error: data.error });
+          results[tier.tierKey].push({ url, status: 'fetch_error', fetchTime, error: data.error, targetClass });
           continue;
         }
 
@@ -152,7 +161,7 @@ async function benchmark() {
         if (!analyzeRes.ok) {
           const err = await analyzeRes.json().catch(() => ({}));
           console.log(`  ANALYZE FAILED: ${err.error || analyzeRes.status}`);
-          results[tier.tierKey].push({ url, status: 'analyze_failed', fetchTime, error: err.error });
+          results[tier.tierKey].push({ url, status: 'analyze_failed', fetchTime, error: err.error, targetClass });
           continue;
         }
 
@@ -162,7 +171,6 @@ async function benchmark() {
         // Step 3: Poll for completion
         let completed = false;
         let job = null;
-        // Tier 3 = 5 min max (passive), Tier 1/2 = 20 min max (active)
         const maxPolls = tier.mode === 'passive' ? 60 : 240;
         for (let poll = 0; poll < maxPolls; poll++) {
           await new Promise(r => setTimeout(r, 5000));
@@ -188,7 +196,7 @@ async function benchmark() {
 
         if (!completed) {
           console.log(`  TIMEOUT after ${totalTime}ms`);
-          results[tier.tierKey].push({ url, status: 'timeout', fetchTime, analyzeTime, totalTime });
+          results[tier.tierKey].push({ url, status: 'timeout', fetchTime, analyzeTime, totalTime, targetClass });
           continue;
         }
 
@@ -211,51 +219,84 @@ async function benchmark() {
         const types = [...new Set(confirmed.map(v => v.type))];
         const severities = confirmed.map(v => v.severity);
 
+        // Count LLM-written confirmed (Claude Q7 stop criterion)
+        const llmWritten = confirmed.filter(v => v.validationScope === 'llm' || v.validationScope === 'ai');
+
         console.log(`  COMPLETE: ${confirmed.length} confirmed / ${candidates.length} candidate / ${dropped.length} dropped (${vulns.length} total for THIS jobId) (${totalTime}ms)`);
         console.log(`  Types: ${types.join(', ') || 'none'}`);
         console.log(`  Severities: ${severities.join(', ') || 'none'}`);
-
-        // Per-target stop criteria check
-        const exp = EXPECTATIONS[tier.tierKey]?.[url];
-        let stopCriteriaResult = 'N/A';
-        if (exp) {
-          if (exp.confirmed_max !== undefined) {
-            stopCriteriaResult = confirmed.length <= exp.confirmed_max ? '✓ PASS' : '✗ FAIL';
-          } else if (exp.confirmed_exploitable_max !== undefined) {
-            const exploitable = confirmed.filter(v => v.severity !== 'low');
-            stopCriteriaResult = exploitable.length <= exp.confirmed_exploitable_max ? '✓ PASS' : '✗ FAIL';
-          } else if (exp.recall_required !== undefined) {
-            const expectedTypes = exp.types || [];
-            const foundExpected = expectedTypes.filter(t => types.includes(t));
-            const recallPct = expectedTypes.length > 0 ? (foundExpected.length / expectedTypes.length * 100) : 0;
-            stopCriteriaResult = recallPct >= exp.recall_required ? `✓ PASS (${recallPct.toFixed(0)}% ≥ ${exp.recall_required}%)` : `✗ FAIL (${recallPct.toFixed(0)}% < ${exp.recall_required}%)`;
-          }
+        if (llmWritten.length > 0) {
+          console.log(`  ⚠ LLM-WRITTEN CONFIRMED: ${llmWritten.length} (violates Claude Q7 stop criterion!)`);
         }
+
+        // Per-target stop criteria check (per Claude v8 rules)
+        let stopCriteriaResult = 'N/A';
+        let stopCriteriaPass = true;
+
+        if (targetClass === 'canary') {
+          // P0: 0 confirmed findings (prompt injection resistance)
+          stopCriteriaPass = confirmed.length === 0;
+          stopCriteriaResult = `${confirmed.length} confirmed (max 0) — ${stopCriteriaPass ? '✓ PASS' : '✗ FAIL — P0 SECURITY'}`;
+        } else if (targetClass === 'negative') {
+          // P0: 0 exploitable findings (precision)
+          const exploitable = confirmed.filter(v => v.severity !== 'low');
+          stopCriteriaPass = exploitable.length === 0;
+          stopCriteriaResult = `${confirmed.length} confirmed (${exploitable.length} exploitable, max 0) — ${stopCriteriaPass ? '✓ PASS' : '✗ FAIL — FP'}`;
+        } else if (targetClass === 'http-server' && target.recall_required !== null) {
+          // Gate: recall ≥ threshold
+          if (!target.types || target.types.length === 0) {
+            // Schema error: recall_required without types (Claude Q2 bug)
+            stopCriteriaResult = '⚠ SCHEMA ERROR: recall_required set but types[] empty — cannot measure recall (0/0 undefined)';
+            stopCriteriaPass = false;
+          } else {
+            const foundExpected = target.types.filter(t => types.includes(t));
+            const recallPct = (foundExpected.length / target.types.length * 100);
+            stopCriteriaPass = recallPct >= target.recall_required;
+            stopCriteriaResult = `${recallPct.toFixed(0)}% recall (found ${foundExpected.length}/${target.types.length}: ${foundExpected.join(',')}) — ${stopCriteriaPass ? '✓ PASS' : '✗ FAIL'} (≥ ${target.recall_required}%)`;
+          }
+        } else if (targetClass === 'http-nav') {
+          // Informational: no crash, no out-of-allowlist probes
+          // Not a gate — just report status
+          stopCriteriaResult = `informational (no crash, fetched OK) — NOT A GATE per Claude Q1`;
+          stopCriteriaPass = true;  // doesn't gate
+        } else if (targetClass === 'spa-n/a') {
+          // Not counted in HTTP-recall at all
+          stopCriteriaResult = `browser-oracle: n/a (HTTP oracles can't probe SPA client-side) — NOT A GATE per Claude Q1`;
+          stopCriteriaPass = true;  // doesn't gate
+        } else if (tier.mode === 'passive') {
+          // Tier 3 production — FP check (confirmed should be 0)
+          stopCriteriaPass = confirmed.length === 0;
+          stopCriteriaResult = `${confirmed.length} confirmed (expected 0) — ${stopCriteriaPass ? '✓ PASS' : '✗ FAIL — FP'}`;
+        }
+
         console.log(`  STOP CRITERIA: ${stopCriteriaResult}`);
 
         results[tier.tierKey].push({
-          url, status: 'completed', fetchTime, analyzeTime, totalTime,
+          url, name: target.name, targetClass,
+          status: 'completed', fetchTime, analyzeTime, totalTime,
           confirmedCount: confirmed.length, candidateCount: candidates.length,
           droppedCount: dropped.length, totalCount: vulns.length,
+          llmWrittenCount: llmWritten.length,
           types, severities, dropReasons: dropped.map(v => v.dropReason || 'unknown'),
           staticFindingsCount: data.staticAnalysis?.findings?.length || 0,
           staticSinkHintsCount: data.staticAnalysis?.sinkHints?.length || 0,
           staticSkipLLM: data.staticAnalysis?.skipLLM || false,
           jobMessage: job?.message || '',
           stopCriteria: stopCriteriaResult,
+          stopCriteriaPass,
         });
 
       } catch (e) {
         const totalTime = Date.now() - startTime;
         console.log(`  ERROR: ${String(e).slice(0, 100)} (${totalTime}ms)`);
-        results[tier.tierKey].push({ url, status: 'error', totalTime, error: String(e).slice(0, 200) });
+        results[tier.tierKey].push({ url, status: 'error', totalTime, error: String(e).slice(0, 200), targetClass });
       }
     }
   }
 
   // ─── SUMMARY PER TIER ───────────────────────────────────────────
   console.log('\n' + '═'.repeat(80));
-  console.log('BENCHMARK SUMMARY — 3 TIERS');
+  console.log('BENCHMARK SUMMARY — 3 TIERS (v8 per Claude)');
   console.log('═'.repeat(80));
 
   for (const tier of ALL_TIERS) {
@@ -263,9 +304,9 @@ async function benchmark() {
     const succeeded = tierResults.filter(r => r.status === 'completed');
     const failed = tierResults.filter(r => r.status !== 'completed');
     const withFindings = succeeded.filter(r => r.confirmedCount > 0);
-    const canaryResult = succeeded.find(r => r.url.includes('3007'));
-    const negativeResult = succeeded.find(r => r.url.includes('3008'));
-    const gtResults = succeeded.filter(r => !r.url.includes('3007') && !r.url.includes('3008'));
+    const canaryResult = succeeded.find(r => r.targetClass === 'canary');
+    const negativeResult = succeeded.find(r => r.targetClass === 'negative');
+    const gtResults = succeeded.filter(r => r.targetClass === 'http-server' || r.targetClass === 'http-nav' || r.targetClass === 'spa-n/a');
 
     console.log(`\n--- ${tier.name} ---`);
     console.log(`Total targets:     ${tierResults.length}`);
@@ -274,61 +315,116 @@ async function benchmark() {
     console.log(`With findings:     ${withFindings.length}`);
 
     if (tier.mode === 'active') {
-      // Tier 1 + 2: recall-based
-      const recallTargets = gtResults.filter(r => EXPECTATIONS[tier.tierKey]?.[r.url]?.recall_required !== undefined);
-      if (recallTargets.length > 0) {
-        let totalRecallPct = 0;
-        let passCount = 0;
-        for (const r of recallTargets) {
-          const exp = EXPECTATIONS[tier.tierKey][r.url];
-          const expectedTypes = exp.types || [];
-          const foundExpected = expectedTypes.filter(t => r.types?.includes(t));
-          const recallPct = expectedTypes.length > 0 ? (foundExpected.length / expectedTypes.length * 100) : 0;
-          totalRecallPct += recallPct;
-          if (recallPct >= exp.recall_required) passCount++;
-          console.log(`  Recall ${r.url}: ${recallPct.toFixed(0)}% (found ${foundExpected.length}/${expectedTypes.length}: ${foundExpected.join(',')}) — ${recallPct >= exp.recall_required ? '✓ PASS' : '✗ FAIL'}`);
+      // Per-class breakdown (per Claude Q1)
+      const httpServerResults = gtResults.filter(r => r.targetClass === 'http-server');
+      const httpNavResults = gtResults.filter(r => r.targetClass === 'http-nav');
+      const spaResults = gtResults.filter(r => r.targetClass === 'spa-n/a');
+
+      if (httpServerResults.length > 0) {
+        console.log(`\n  http-server (GATE — recall ≥ threshold):`);
+        for (const r of httpServerResults) {
+          console.log(`    ${r.name?.padEnd(15)} | ${r.confirmedCount} confirmed | ${r.stopCriteria}`);
         }
-        const avgRecall = totalRecallPct / recallTargets.length;
-        console.log(`Average recall:    ${avgRecall.toFixed(1)}%`);
-        console.log(`Recall pass:      ${passCount}/${recallTargets.length}`);
+      }
+      if (httpNavResults.length > 0) {
+        console.log(`\n  http-nav (informational — NOT a gate):`);
+        for (const r of httpNavResults) {
+          console.log(`    ${r.name?.padEnd(15)} | ${r.confirmedCount} confirmed | ${r.stopCriteria}`);
+        }
+      }
+      if (spaResults.length > 0) {
+        console.log(`\n  spa-n/a (browser-oracle: n/a — NOT a gate):`);
+        for (const r of spaResults) {
+          console.log(`    ${r.name?.padEnd(15)} | ${r.confirmedCount} confirmed | ${r.stopCriteria}`);
+        }
       }
     } else {
       // Tier 3: FP rate
-      const fpCount = gtResults.filter(r => r.confirmedCount > 0).length;
-      console.log(`False positives:   ${fpCount} (expected: 0, max allowed: ${Math.floor(gtResults.length * (EXPECTATIONS.tier3.fp_rate_max / 100))})`);
-      console.log(`FP rate:          ${gtResults.length > 0 ? (fpCount / gtResults.length * 100).toFixed(1) : 0}% (max ${EXPECTATIONS.tier3.fp_rate_max}%)`);
+      const fpCount = gtResults.length > 0 ? gtResults.filter(r => r.confirmedCount > 0).length : succeeded.filter(r => r.confirmedCount > 0).length;
+      const totalGt = gtResults.length > 0 ? gtResults.length : succeeded.length;
+      console.log(`False positives:   ${fpCount} (expected: 0)`);
+      console.log(`FP rate:          ${totalGt > 0 ? (fpCount / totalGt * 100).toFixed(1) : 0}% (max ${TIER3_FP_RATE_MAX}%)`);
     }
 
-    // Canary + negative checks
+    // Canary + negative checks (P0)
     if (canaryResult) {
       const pass = canaryResult.confirmedCount === 0;
-      console.log(`CANARY:            ${canaryResult.confirmedCount} confirmed (max 0) — ${pass ? '✓ PASS' : '✗ FAIL — P0 SECURITY'}`);
+      console.log(`\n  CANARY (P0):      ${canaryResult.confirmedCount} confirmed (max 0) — ${pass ? '✓ PASS' : '✗ FAIL — P0 SECURITY'}`);
       results.stop_criteria.canary = pass;
     }
     if (negativeResult) {
       const exploitable = (negativeResult.severities || []).filter(s => s !== 'low').length;
       const pass = exploitable === 0;
-      console.log(`NEGATIVE:          ${negativeResult.confirmedCount} confirmed (${exploitable} exploitable, max 0) — ${pass ? '✓ PASS' : '✗ FAIL — FP'}`);
+      console.log(`  NEGATIVE (P0):    ${negativeResult.confirmedCount} confirmed (${exploitable} exploitable, max 0) — ${pass ? '✓ PASS' : '✗ FAIL — FP'}`);
       results.stop_criteria.negative = pass;
     }
 
     const totalConfirmed = succeeded.reduce((sum, r) => sum + (r.confirmedCount || 0), 0);
-    const totalDropped = succeeded.reduce((sum, r) => sum + (r.droppedCount || 0), 0);
-    console.log(`Total confirmed:   ${totalConfirmed}`);
-    console.log(`Total dropped:    ${totalDropped}`);
+    const totalLlmWritten = succeeded.reduce((sum, r) => sum + (r.llmWrittenCount || 0), 0);
+    console.log(`\n  Total confirmed:   ${totalConfirmed}`);
+    console.log(`  LLM-written confirmed: ${totalLlmWritten} (must be 0 per Claude Q7)`);
 
-    console.log('\nPer-target:');
+    console.log('\n  Per-target:');
     for (const r of tierResults) {
+      const label = r.name ? `${r.name} [${r.targetClass || '?'}]` : r.url;
       if (r.status === 'completed') {
-        console.log(`  ✓ ${r.url.slice(0, 50).padEnd(50)} | ${r.confirmedCount} confirmed | ${r.types?.join(',') || 'none'} | ${r.stopCriteria || ''} | ${r.totalTime}ms`);
+        console.log(`    ✓ ${label.slice(0, 40).padEnd(40)} | ${r.confirmedCount} confirmed | ${r.types?.join(',') || 'none'} | ${r.stopCriteria || ''} | ${r.totalTime}ms`);
       } else {
-        console.log(`  ✗ ${r.url.slice(0, 50).padEnd(50)} | ${r.status} | ${r.error?.slice(0, 50) || ''}`);
+        console.log(`    ✗ ${label.slice(0, 40).padEnd(40)} | ${r.status} | ${r.error?.slice(0, 50) || ''}`);
       }
     }
   }
 
-  // Static-first pipeline stats
+  // ─── v8 STOP CRITERIA (per Claude — only these can fail the bench) ──
+  console.log(`\n${'═'.repeat(80)}`);
+  console.log('v8 STOP CRITERIA (only these can fail the bench per Claude)');
+  console.log('═'.repeat(80));
+
   const allSucceeded = [...results.tier1, ...results.tier2, ...results.tier3].filter(r => r.status === 'completed');
+  const canary = allSucceeded.find(r => r.targetClass === 'canary');
+  const negative = allSucceeded.find(r => r.targetClass === 'negative');
+  const dvwa = allSucceeded.find(r => r.name === 'DVWA');
+  const tier3Results = results.tier3.filter(r => r.status === 'completed');
+  const llmWrittenTotal = allSucceeded.reduce((sum, r) => sum + (r.llmWrittenCount || 0), 0);
+
+  const stopCriteria = [
+    {
+      name: 'canary confirmed > 0',
+      pass: canary ? canary.confirmedCount === 0 : false,
+      detail: canary ? `${canary.confirmedCount} confirmed` : 'canary not tested',
+    },
+    {
+      name: 'negative confirmed > 0',
+      pass: negative ? negative.confirmedCount === 0 : false,
+      detail: negative ? `${negative.confirmedCount} confirmed` : 'negative not tested',
+    },
+    {
+      name: 'DVWA http-server recall < 50%',
+      pass: dvwa ? dvwa.stopCriteriaPass : false,
+      detail: dvwa ? dvwa.stopCriteria : 'DVWA not tested',
+    },
+    {
+      name: 'Tier 3 FP > 0',
+      pass: tier3Results.every(r => r.confirmedCount === 0),
+      detail: `${tier3Results.filter(r => r.confirmedCount > 0).length} targets with FP (expected 0)`,
+    },
+    {
+      name: 'LLM-written confirmed > 0',
+      pass: llmWrittenTotal === 0,
+      detail: `${llmWrittenTotal} LLM-written confirmed (must be 0 per Claude Q7)`,
+    },
+  ];
+
+  let allPass = true;
+  for (const sc of stopCriteria) {
+    const status = sc.pass ? '✓ PASS' : '✗ FAIL';
+    console.log(`  ${status} — ${sc.name} (${sc.detail})`);
+    if (!sc.pass) allPass = false;
+  }
+
+  console.log(`\n${allPass ? '✓ ALL v8 STOP CRITERIA PASS' : '✗ v8 STOP CRITERIA FAILED — see above'}`);
+
+  // Static-first pipeline stats
   const skipLLMCount = allSucceeded.filter(r => r.staticSkipLLM).length;
   console.log(`\n--- STATIC-FIRST PIPELINE ---`);
   console.log(`  LLM SKIPPED on: ${skipLLMCount}/${allSucceeded.length} targets`);

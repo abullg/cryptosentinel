@@ -726,9 +726,20 @@ async function runAnalysisInBackground(jobId: string, config: {
         }
       }
 
-      if (sa && sa.skipLLM) {
-        console.log(`[analyze-job] STATIC-FIRST: skipping LLM (no sink-hints found in static analysis)`);
-        console.log(`[analyze-job]   Static findings: ${sa.findings?.length || 0}, sink-hints: ${sa.sinkHints?.length || 0}, total static time: ${sa.stats?.totalMs || 'N/A'}ms`);
+      // ─── Per Claude v8 Q7: LLM does NOT create Vulnerability ───
+      // Detection path REMOVED. LLM is only used post-confirmation for
+      // PoC generation (generatePoc=true on already-confirmed findings).
+      // Previously: if sink-hints found → LLM pass 1+2 → save as
+      // 'candidate' → validate. This violated the thesis "LLM doesn't
+      // detect, LLM interprets". Now: ALWAYS skip LLM detection,
+      // regardless of sink-hints. Static findings are saved as
+      // 'confirmed' (deterministic) and job completes.
+      // Future: add generatePoc=true flag that runs LLM ONLY on
+      // findings already confirmed by active fuzzer/static analysis.
+      const SKIP_LLM_DETECTION = true;  // per Claude v8 Q7 — was: (sa && sa.skipLLM)
+      if (SKIP_LLM_DETECTION || (sa && sa.skipLLM)) {
+        console.log(`[analyze-job] STATIC-FIRST: skipping LLM detection (Claude v8 Q7 — LLM does not create Vulnerability)`);
+        console.log(`[analyze-job]   Static findings: ${sa?.findings?.length || 0}, sink-hints: ${sa?.sinkHints?.length || 0}`);
 
         // Save static findings as 'confirmed' (deterministic, high confidence)
         for (const f of (sa.findings || [])) {

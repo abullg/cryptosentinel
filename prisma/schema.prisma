@@ -60,6 +60,10 @@ model Vulnerability {
   v3Formal      Float?
   v4Economic    Float?
   hashSignature String?
+  // Per Claude v8 Q3: UNIQUE per contractId (not globally)
+  // Same vuln found in different bench runs = different contracts = different rows
+  // Same vuln found twice in same run = dedup (same contractId + hashSignature)
+  @@unique([contractId, hashSignature])
   isDuplicate   Boolean  @default(false)
   duplicateOf   String?
   patternTag    String?
