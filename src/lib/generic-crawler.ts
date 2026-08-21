@@ -116,7 +116,7 @@ async function detectLogin(config: CrawlConfig): Promise<{ url: string; method: 
   const baseUrl = config.baseUrl.replace(/\/+$/, '');
 
   // Try common JSON login paths
-  const jsonLoginPaths = ['/api/login', '/api/v1/login', '/api/auth/login', '/api/user/login', '/auth/login', '/login'];
+  const jsonLoginPaths = ['/api/login', '/api/v1/login', '/api/auth/login', '/api/user/login', '/api/v1/user/login', '/auth/login', '/login', '/api/v1/auth/login'];
   for (const path of jsonLoginPaths) {
     const res = await fetchWithTimeout(`${baseUrl}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: config.auth?.username || 'user', password: config.auth?.password || 'user' }) }, config.timeoutMs);
     if (res.status === 200) {
@@ -356,18 +356,29 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
         for (const list of endpointLists) {
           if (Array.isArray(list)) {
             for (const ep of list) {
-              if (typeof ep === 'string' && ep.startsWith('/')) {
-                // Parse "GET /api/users/:id" format or just "/api/users"
-                const parts = ep.match(/^(GET|POST|PUT|PATCH|DELETE)\s+(.+)$/i);
-                const method = parts ? parts[1].toUpperCase() : 'GET';
-                const path = parts ? parts[2] : ep;
-                const param = parameterizePath(path);
-                const finalPath = param?.paramPath || path;
-                const key = `${finalPath}:${method}`;
-                if (!discoveredPaths.has(key)) {
-                  discoveredPaths.set(key, { path: finalPath, method });
-                  console.log(`[crawler] Found endpoint from JSON: ${method} ${finalPath}`);
-                }
+              if (typeof ep !== 'string') continue;
+              // Handle both formats:
+              // 1. "GET /api/users/:id (IDOR)" — method + path + optional description
+              // 2. "/api/v1/books" — just path
+              // 3. "POST /api/login" — method + path
+              const parts = ep.match(/^(GET|POST|PUT|PATCH|DELETE)\s+([^\s(]+)/i);
+              let method = 'GET';
+              let path = ep;
+              if (parts) {
+                method = parts[1].toUpperCase();
+                path = parts[2];
+              } else if (ep.startsWith('/')) {
+                path = ep;
+              } else {
+                continue; // skip non-path strings
+              }
+              // Clean up path (remove :id → {id}, remove trailing descriptions)
+              const param = parameterizePath(path);
+              const finalPath = param?.paramPath || path.replace(/\/:id/g, '/{id}').replace(/\/<id>/g, '/{id}');
+              const key = `${finalPath}:${method}`;
+              if (!discoveredPaths.has(key)) {
+                discoveredPaths.set(key, { path: finalPath, method });
+                console.log(`[crawler] Found endpoint from JSON: ${method} ${finalPath}`);
               }
             }
           }
