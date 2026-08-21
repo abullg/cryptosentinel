@@ -351,8 +351,26 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
         }
       }
       if (!registered || !loginConfig) {
-        console.log('[crawler] No login + no registration found — fail closed');
-        return { ...result, targetClass: 'spa-n/a' };
+        // Per Claude: "если логина нет, а есть POST .../user регистрация —
+        // создать A и B, сохранить секреты"
+        // vAPI API1 pattern: no login endpoint, use Authorization-Token: base64(user:pass)
+        // If we registered users but no login found, try base64 auth directly
+        if (registered) {
+          console.log('[crawler] Registration succeeded but no login found — trying base64 auth...');
+          const base64Token = Buffer.from(`${config.auth?.username}:${config.auth?.password}`).toString('base64');
+          result.loggedIn = true;
+          result.session = {
+            token: base64Token,
+            cookies: '',
+            username: config.auth?.username || '',
+            role: 'user',
+            authHeader: 'Authorization-Token',  // vAPI custom header
+          };
+          console.log(`[crawler] ✓ Using base64 auth (Authorization-Token header)`);
+        } else {
+          console.log('[crawler] No login + no registration found — fail closed');
+          return { ...result, targetClass: 'spa-n/a' };
+        }
       }
     }
 
