@@ -666,14 +666,13 @@ async function runAnalysisInBackground(jobId: string, config: {
           }
 
           // ─── GENERIC CRAWLER + IDENTITY MATRIX (per Claude v10 §4.2 + §4.3) ───
-          // Replaces hardcoded REST API fallback. The generic crawler discovers
-          // endpoints from HTML/JS/OpenAPI WITHOUT knowing the app's structure.
-          // The identity matrix runs IDOR + mass assignment + BFLA on discovered
-          // resources using 2 authenticated sessions (user A + user B).
+          // Per Claude v10-feedback: "--no-fallback. Если crawler нашёл 0 —
+          // 0 confirmed, а не «спасибо hardcoded»."
           //
-          // Per Claude: "Пока crawler и identity matrix не first-class, новый
-          // оракул сработает только на Express-GT. На реальной программе вы
-          // снова не найдёте, куда слать PUT {role:admin}."
+          // Telemetry is printed to jobMessage so benchmark can see it.
+          const noFallback = reqBody.noFallback === true;  // --no-fallback flag
+          let matrixTelemetry = '';
+
           if (allEndpoints.length === 0 &&
               (targetUrl.includes(':3009') || targetUrl.includes(':3010') || targetUrl.includes('/api/'))) {
             console.log(`[analyze-job]   Generic crawler: discovering API surface without hardcoded paths...`);
@@ -698,10 +697,13 @@ async function runAnalysisInBackground(jobId: string, config: {
 
             if (crawlResultA.loggedIn && crawlResultB.loggedIn && crawlResultA.resources.length > 0) {
               console.log(`[analyze-job]   Crawler found ${crawlResultA.resources.length} resources, targetClass=${crawlResultA.targetClass}`);
+              matrixTelemetry = `crawler: auth.A=ok auth.B=ok openapi=${crawlResultA.crawlStats.openApiFound} resources_found=${crawlResultA.resources.length} paths=[${crawlResultA.resources.map(r => r.path).join(',')}]`;
 
               // Run identity matrix on discovered resources
-              console.log(`[analyze-job]   Running identity matrix (IDOR + mass assignment + BFLA)...`);
-              const matrixFindings = await runIdentityMatrix({
+              // Per Claude: "Нашёл ресурс GET /api/users/{id} → обязан прогнать
+              // GET/PUT/PATCH/DELETE от A и от B"
+              console.log(`[analyze-job]   Running identity matrix (IDOR + mass assignment + BFLA + missing authn)...`);
+              const matrixResult = await runIdentityMatrix({
                 baseUrl: targetUrl.replace(/\/+$/, ''),
                 sessionA: crawlResultA.session!,
                 sessionB: crawlResultB.session!,
@@ -710,7 +712,10 @@ async function runAnalysisInBackground(jobId: string, config: {
                 timeoutMs: 15_000,
               });
 
-              for (const f of matrixFindings) {
+              matrixTelemetry += ` | matrix: idor_tested=${matrixResult.telemetry.idor_tested} mass_assign_tested=${matrixResult.telemetry.mass_assign_tested} bfla_tested=${matrixResult.telemetry.bfla_tested} missing_authn_tested=${matrixResult.telemetry.missing_authn_tested} verbs=[${[...matrixResult.telemetry.verbs_tried].join(',')}]`;
+              console.log(`[analyze-job]   ${matrixTelemetry}`);
+
+              for (const f of matrixResult.findings) {
                 if (f.confirmed) {
                   fuzzFindings.push({ ...f, endpoint: targetUrl, cookies: '' });
                   console.log(`[analyze-job]     ✅ CONFIRMED ${f.type} via ${f.oracle}: ${f.evidence.slice(0, 80)}`);
@@ -718,26 +723,31 @@ async function runAnalysisInBackground(jobId: string, config: {
               }
             } else {
               console.log(`[analyze-job]   Crawler: loggedInA=${crawlResultA.loggedIn}, loggedInB=${crawlResultB.loggedIn}, resources=${crawlResultA.resources.length}`);
+              matrixTelemetry = `crawler: auth.A=${crawlResultA.loggedIn ? 'ok' : 'fail'} auth.B=${crawlResultB.loggedIn ? 'ok' : 'fail'} resources_found=0 fallback_used=${!noFallback}`;
 
-              // Fallback: if crawler didn't find resources, run fuzzAllOracles directly
-              // (keeps backward compatibility with VAmPI/Express-GT hardcoded oracles)
-              console.log(`[analyze-job]   Crawler found 0 resources — falling back to direct oracle probing`);
-              const fallbackFindings = await fuzzAllOracles(targetUrl, undefined, {
-                allowlistPatterns: [
-                  'http://localhost:',
-                  'http://127.0.0.1:',
-                  'http://cs-juice-shop:',
-                  'http://cs-dvwa:',
-                  'http://cs-canary:',
-                  'http://cs-negative:',
-                ],
-                perProbeTimeoutMs: 15_000,
-                sqliTimeDeltaMs: 4_500,
-              });
-              for (const f of fallbackFindings) {
-                if (f.confirmed) {
-                  fuzzFindings.push({ ...f, endpoint: targetUrl, cookies: '' });
-                  console.log(`[analyze-job]     ✅ CONFIRMED ${f.type} via ${f.oracle}: ${f.evidence.slice(0, 80)}`);
+              // Per Claude: "--no-fallback. Если crawler нашёл 0 — 0 confirmed"
+              if (noFallback) {
+                console.log(`[analyze-job]   --no-fallback: crawler found 0 resources → 0 confirmed (no hardcoded fallback)`);
+              } else {
+                // Fallback: if crawler didn't find resources, run fuzzAllOracles directly
+                console.log(`[analyze-job]   Crawler found 0 resources — falling back to direct oracle probing (fallback_used=true)`);
+                const fallbackFindings = await fuzzAllOracles(targetUrl, undefined, {
+                  allowlistPatterns: [
+                    'http://localhost:',
+                    'http://127.0.0.1:',
+                    'http://cs-juice-shop:',
+                    'http://cs-dvwa:',
+                    'http://cs-canary:',
+                    'http://cs-negative:',
+                  ],
+                  perProbeTimeoutMs: 15_000,
+                  sqliTimeDeltaMs: 4_500,
+                });
+                for (const f of fallbackFindings) {
+                  if (f.confirmed) {
+                    fuzzFindings.push({ ...f, endpoint: targetUrl, cookies: '' });
+                    console.log(`[analyze-job]     ✅ CONFIRMED ${f.type} via ${f.oracle}: ${f.evidence.slice(0, 80)}`);
+                  }
                 }
               }
             }
@@ -826,7 +836,7 @@ async function runAnalysisInBackground(jobId: string, config: {
 
             // Active fuzzer found real vulns — no need for LLM detection
             const confirmedCount = savedStatic.length;
-            await updateJob(100, `Analysis complete (active fuzzer): ${confirmedCount} confirmed via deterministic oracles (time-delay, reflection, error-message). LLM skipped — found real vulns.`);
+            await updateJob(100, `Analysis complete (active fuzzer): ${confirmedCount} confirmed via deterministic oracles. ${matrixTelemetry || 'No matrix telemetry (not REST API target)'}. LLM skipped — found real vulns.`);
             fireAndForget(db.audit.update({ where: { id: auditId }, data: { status: 'completed', findings: confirmedCount, completedAt: new Date() } }), 'catch audit.update fuzzer');
             fireAndForget(db.analysisJob.update({ where: { id: jobId }, data: { status: 'completed', resultCount: confirmedCount } }), 'catch analysisJob.update fuzzer');
             writeProgressFile(jobId, { progress: 100, message: `Analysis complete (active fuzzer): ${confirmedCount} confirmed`, status: 'completed' });

@@ -162,6 +162,12 @@ async function benchmark() {
             discoveredForms: data.discoveredForms || [],
             discoveredParams: data.discoveredParams || [],
             staticAnalysis: data.staticAnalysis || null,
+            // Per Claude v10-feedback: --no-fallback for REST API targets
+            // "Если crawler нашёл 0 — 0 confirmed, а не «спасибо hardcoded»"
+            // Tier 1 (DVWA) uses DVWA-specific auth-crawler, not affected.
+            // Tier 2 REST API targets (VAmPI, Express-GT) get noFallback=true
+            // to prove the generic crawler finds surface WITHOUT hardcoded paths.
+            noFallback: tier.tierKey === 'tier2' && (url.includes(':3009') || url.includes(':3010') || url.includes('/api/')),
           }),
           signal: AbortSignal.timeout(15_000),
         });

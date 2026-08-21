@@ -325,19 +325,29 @@ async function testMissingAuthn(
 /**
  * Run the full identity matrix on all discovered resources.
  *
- * Per Claude v10 §4.3:
- * "для каждого resource, созданного/прочитанного A:
- *   для каждого verb ∈ {GET, PUT, PATCH, DELETE}:
- *     replay тем же path от B → horizontal IDOR
- *     replay от anonymous → missing authn
- * для каждого endpoint, который видел admin и не видел user:
- *   user вызывает его → BFLA
- * для каждого JSON-поля, которое admin GET возвращает, а user PUT принимает:
- *   user PUT чужие поля → mass assignment"
+ * Per Claude v10 §4.3 + v10-feedback:
+ * "Нашёл ресурс GET /api/users/{id} → обязан прогнать GET/PUT/PATCH/DELETE
+ *  от A и от B."
+ *
+ * Verb-inference: ANY discovered path is tested with ALL verbs, not just
+ * the verb the crawler found. If we found GET /api/users/{id}, we also
+ * try PUT/PATCH/DELETE on the same path — because the API might accept
+ * them even if the HTML/JS only showed GET.
  */
 export async function runIdentityMatrix(
   config: IdentityMatrixConfig,
-): Promise<MatrixFinding[]> {
+): Promise<{ findings: MatrixFinding[]; telemetry: MatrixTelemetry }> {
+  const telemetry: MatrixTelemetry = {
+    resources_found: config.resources.length,
+    idor_tested: 0,
+    mass_assign_tested: 0,
+    bfla_tested: 0,
+    missing_authn_tested: 0,
+    verbs_tried: new Set<string>(),
+    paths_tested: [],
+    fallback_used: false,
+  };
+
   console.log(`[matrix] Starting identity matrix on ${config.resources.length} resources`);
   console.log(`[matrix]   User A: ${config.sessionA.username} (${config.sessionA.role})`);
   console.log(`[matrix]   User B: ${config.sessionB.username} (${config.sessionB.role})`);
@@ -349,30 +359,77 @@ export async function runIdentityMatrix(
 
   for (const resource of config.resources) {
     console.log(`[matrix] Processing ${resource.method} ${resource.path} (paramType=${resource.paramType}, ids=${resource.sampleIds.length})`);
+    telemetry.paths_tested.push(`${resource.method} ${resource.path}`);
 
-    // For each sample ID, test IDOR + missing authn
+    // For each sample ID, test with ALL verbs (verb-inference per Claude)
     for (const id of resource.sampleIds.slice(0, 3)) {
-      if (resource.method.toUpperCase() === 'GET') {
-        console.log(`[matrix]   Testing IDOR on id=${id}...`);
-        allFindings.push(...await testIdor(config, resource, id));
+      const testResource = { ...resource, path: resource.path.replace(/\{id\}|:id/, String(id)) };
 
-        console.log(`[matrix]   Testing missing authn on id=${id}...`);
-        allFindings.push(...await testMissingAuthn(config, resource, id));
-      }
+      // ALWAYS test GET (IDOR + missing authn) — even if discovered as PUT
+      console.log(`[matrix]   Testing GET (IDOR + missing authn) on id=${id}...`);
+      telemetry.verbs_tried.add('GET');
+      telemetry.idor_tested++;
+      allFindings.push(...await testIdor(config, resource, id));
+      telemetry.missing_authn_tested++;
+      allFindings.push(...await testMissingAuthn(config, resource, id));
 
-      if (resource.method.toUpperCase() === 'PUT' || resource.method.toUpperCase() === 'PATCH') {
-        console.log(`[matrix]   Testing mass assignment on id=${id}...`);
-        allFindings.push(...await testMassAssignment(config, resource, id));
+      // ALWAYS test PUT (mass assignment) — even if discovered as GET
+      // Per Claude: "Нашёл ресурс GET /api/users/{id} → обязан прогнать PUT"
+      console.log(`[matrix]   Testing PUT (mass assignment) on id=${id}...`);
+      telemetry.verbs_tried.add('PUT');
+      telemetry.mass_assign_tested++;
+      allFindings.push(...await testMassAssignment(config, resource, id));
+
+      // Also try PATCH
+      console.log(`[matrix]   Testing PATCH on id=${id}...`);
+      telemetry.verbs_tried.add('PATCH');
+      // PATCH is same as PUT for mass assignment test
+      allFindings.push(...await testMassAssignment(config, { ...resource, method: 'PATCH' }, id));
+
+      // Try DELETE (can user B delete user A's resource?)
+      console.log(`[matrix]   Testing DELETE on id=${id}...`);
+      telemetry.verbs_tried.add('DELETE');
+      const path = resource.path.replace(/\{id\}|:id/, String(id));
+      const resDel = await fetchJson(
+        `${config.baseUrl}${path}`,
+        { method: 'DELETE', headers: makeHeaders(config.sessionB) },
+        config.timeoutMs,
+      );
+      if (resDel.status >= 200 && resDel.status < 300) {
+        allFindings.push({
+          type: 'idor',
+          severity: 'critical',
+          confirmed: true,
+          oracle: 'auth-diff',
+          evidence: `IDOR (DELETE) confirmed: user B (${config.sessionB.username}) deleted resource id=${id} belonging to user A. Server returned ${resDel.status} — no authorization check on DELETE.`,
+          payload: `DELETE ${path} with user B's token`,
+          target: `${config.baseUrl}${path}`,
+          parameter: 'id (path)',
+        });
+        console.log(`[matrix]   delete: ✅ CONFIRMED — B deleted A's resource`);
       }
     }
 
-    // Test BFLA on admin-like endpoints
+    // Test BFLA on admin-like endpoints (or any POST/PUT/DELETE endpoint)
     console.log(`[matrix]   Testing BFLA...`);
+    telemetry.bfla_tested++;
     allFindings.push(...await testBfla(config, resource));
   }
 
   const confirmed = allFindings.filter(f => f.confirmed);
   console.log(`[matrix] Done. ${confirmed.length}/${allFindings.length} confirmed.`);
+  console.log(`[matrix] Telemetry: resources=${telemetry.resources_found}, idor_tested=${telemetry.idor_tested}, mass_assign_tested=${telemetry.mass_assign_tested}, bfla_tested=${telemetry.bfla_tested}, verbs=${[...telemetry.verbs_tried].join(',')}`);
 
-  return allFindings;
+  return { findings: allFindings, telemetry };
+}
+
+export interface MatrixTelemetry {
+  resources_found: number;
+  idor_tested: number;
+  mass_assign_tested: number;
+  bfla_tested: number;
+  missing_authn_tested: number;
+  verbs_tried: Set<string>;
+  paths_tested: string[];
+  fallback_used: boolean;
 }
