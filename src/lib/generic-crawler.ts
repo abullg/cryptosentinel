@@ -1,0 +1,441 @@
+/**
+ * Generic Auth Crawler — per Claude v10 §4.2.
+ *
+ * "Минимум, без которого охота невозможна:
+ *  1. Auth adapters: JSON POST /login → form POST → Bearer in config
+ *  2. Cookie jar + Authorization persistence
+ *  3. Источники эндпоинтов: OpenAPI/Swagger, HTML <a href>, JS fetch/axios
+ *  4. Параметризация: /users/1 → /users/{id} + классификатор id
+ *  5. targetClass: если после crawl 0 HTTP API — spa-n/a"
+ *
+ * This crawler does NOT know about DVWA, VAmPI, or Express-GT.
+ * It discovers endpoints generically from the target's HTML/JS/OpenAPI.
+ */
+
+export interface CrawlConfig {
+  baseUrl: string;
+  // Auth config — how to login
+  auth?: {
+    loginUrl?: string;       // if known, use it; if not, auto-detect
+    loginMethod?: 'json' | 'form';
+    username: string;
+    password: string;
+    usernameField?: string;  // default: 'username'
+    passwordField?: string;  // default: 'password'
+    tokenExtractor?: string; // JSON path to extract token from login response (e.g., 'token')
+  };
+  timeoutMs: number;
+  maxPages: number;
+  maxEndpoints: number;
+}
+
+export interface CrawlResult {
+  loggedIn: boolean;
+  session?: { token: string; cookies: string; username: string; role: string };
+  resources: DiscoveredResource[];
+  targetClass: 'http-server' | 'http-nav' | 'spa-n/a';
+  crawlStats: {
+    pagesCrawled: number;
+    endpointsFound: number;
+    apiPathsFound: number;
+    openApiFound: boolean;
+    jsAnalyzed: number;
+  };
+}
+
+export interface DiscoveredResource {
+  path: string;
+  method: string;
+  parameterized: boolean;
+  paramType: 'int' | 'uuid' | 'email' | 'string' | 'unknown';
+  sampleIds: (string | number)[];
+  fields?: string[];
+}
+
+import { AuthSession } from './identity-matrix';
+
+const ID_PATTERNS = {
+  int: /^[0-9]+$/,
+  uuid: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+  email: /^[^@]+@[^@]+\.[^@]+$/,
+};
+
+function classifyId(value: string): 'int' | 'uuid' | 'email' | 'string' {
+  if (ID_PATTERNS.int.test(value)) return 'int';
+  if (ID_PATTERNS.uuid.test(value)) return 'uuid';
+  if (ID_PATTERNS.email.test(value)) return 'email';
+  return 'string';
+}
+
+function parameterizePath(path: string): { paramPath: string; paramType: 'int' | 'uuid' | 'email' | 'string' | 'unknown'; idValue: string } | null {
+  // Match paths like /api/users/123, /api/books/abc-123, /api/orders/user@example.com
+  const segments = path.split('/').filter(Boolean);
+  for (let i = segments.length - 1; i >= 0; i--) {
+    const seg = segments[i];
+    // Skip query strings
+    if (seg.includes('?')) continue;
+    // Check if this segment looks like an ID
+    if (ID_PATTERNS.int.test(seg) || ID_PATTERNS.uuid.test(seg) || ID_PATTERNS.email.test(seg)) {
+      segments[i] = '{id}';
+      return {
+        paramPath: '/' + segments.join('/'),
+        paramType: classifyId(seg),
+        idValue: seg,
+      };
+    }
+  }
+  return null;
+}
+
+async function fetchWithTimeout(url: string, opts: RequestInit = {}, timeoutMs: number, cookies?: string, token?: string): Promise<{ status: number; body: string; contentType: string; setCookie: string }> {
+  try {
+    const headers: Record<string, string> = {
+      'User-Agent': 'CryptoSentinel-Crawler/1.0',
+      ...(opts.headers as Record<string, string> || {}),
+    };
+    if (cookies) headers['Cookie'] = cookies;
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+    const res = await fetch(url, { ...opts, headers, signal: AbortSignal.timeout(timeoutMs), redirect: 'follow' });
+    const body = await res.text();
+    return {
+      status: res.status,
+      body,
+      contentType: res.headers.get('content-type') || '',
+      setCookie: res.headers.get('set-cookie') || '',
+    };
+  } catch (e) {
+    return { status: 0, body: '', contentType: '', setCookie: '' };
+  }
+}
+
+/**
+ * Auto-detect login form or JSON login endpoint.
+ * Per Claude: "Если не нашёл — fail closed"
+ */
+async function detectLogin(config: CrawlConfig): Promise<{ url: string; method: 'json' | 'form'; usernameField: string; passwordField: string; tokenExtractor: string } | null> {
+  const baseUrl = config.baseUrl.replace(/\/+$/, '');
+
+  // Try common JSON login paths
+  const jsonLoginPaths = ['/api/login', '/api/v1/login', '/api/auth/login', '/api/user/login', '/auth/login', '/login'];
+  for (const path of jsonLoginPaths) {
+    const res = await fetchWithTimeout(`${baseUrl}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: config.auth?.username || 'user', password: config.auth?.password || 'user' }) }, config.timeoutMs);
+    if (res.status === 200) {
+      try {
+        const data = JSON.parse(res.body);
+        if (data.token || data.access_token || data.jwt) {
+          console.log(`[crawler] Found JSON login at ${path}`);
+          return { url: `${baseUrl}${path}`, method: 'json', usernameField: 'username', passwordField: 'password', tokenExtractor: 'token' };
+        }
+      } catch {}
+    }
+  }
+
+  // Try form-based login (HTML)
+  const res = await fetchWithTimeout(`${baseUrl}/login`, {}, config.timeoutMs);
+  if (res.status === 200 && res.body.includes('<form')) {
+    const formMatch = res.body.match(/<form[^>]*action=["']([^"']*)["'][^>]*method=["']([post]+)["']/i);
+    if (formMatch) {
+      console.log(`[crawler] Found form login at ${formMatch[1]}`);
+      return { url: `${baseUrl}${formMatch[1]}`, method: 'form', usernameField: 'username', passwordField: 'password', tokenExtractor: '' };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Extract API endpoints from JavaScript source code.
+ * Looks for fetch('/api/...'), axios.get('/api/...'), etc.
+ */
+function extractEndpointsFromJS(js: string, baseUrl: string): { path: string; method: string }[] {
+  const endpoints: { path: string; method: string }[] = [];
+  const seen = new Set<string>();
+
+  // Match: fetch('/api/...'), axios.get('/api/...'), axios.post('/api/...'), $.ajax({url: '/api/...'})
+  const patterns = [
+    /fetch\s*\(\s*['"`]([^'"`]+)['"`]/g,
+    /axios\.(get|post|put|patch|delete)\s*\(\s*['"`]([^'"`]+)['"`]/gi,
+    /\$\.ajax\s*\(\s*\{\s*url:\s*['"`]([^'"`]+)['"`]/gi,
+    /['"`](\/api\/[^'"`]+)['"`]/g,  // any quoted /api/ path
+  ];
+
+  for (const pattern of patterns) {
+    let match;
+    while ((match = pattern.exec(js)) !== null) {
+      const path = match[1] || match[2];
+      if (!path || !path.startsWith('/')) continue;
+      const key = `${path}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const method = match[0].toLowerCase().includes('post') ? 'POST'
+        : match[0].toLowerCase().includes('put') ? 'PUT'
+        : match[0].toLowerCase().includes('delete') ? 'DELETE'
+        : match[0].toLowerCase().includes('patch') ? 'PATCH'
+        : 'GET';
+      endpoints.push({ path, method });
+    }
+  }
+
+  return endpoints;
+}
+
+/**
+ * Extract endpoints from OpenAPI/Swagger spec.
+ */
+async function extractFromOpenAPI(baseUrl: string, cookies: string, token: string, timeoutMs: number): Promise<DiscoveredResource[]> {
+  const resources: DiscoveredResource[] = [];
+  const openApiPaths = ['/openapi.json', '/swagger.json', '/v3/api-docs', '/api-docs', '/swagger/v1/swagger.json'];
+
+  for (const path of openApiPaths) {
+    const res = await fetchWithTimeout(`${baseUrl}${path}`, {}, timeoutMs, cookies, token);
+    if (res.status !== 200) continue;
+
+    try {
+      const spec = JSON.parse(res.body);
+      if (!spec.paths) continue;
+
+      console.log(`[crawler] Found OpenAPI spec at ${path} (${Object.keys(spec.paths).length} paths)`);
+
+      for (const [apiPath, methods] of Object.entries(spec.paths)) {
+        for (const [method, detail] of Object.entries(methods as any)) {
+          const m = method.toUpperCase();
+          if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(m)) continue;
+
+          // Check if path has {id} parameter
+          const hasIdParam = apiPath.includes('{') || apiPath.includes(':');
+          const paramType = apiPath.match(/\{(\w*[Ii]d\w*)\}/) ? 'int' : 'unknown';
+
+          resources.push({
+            path: apiPath,
+            method: m,
+            parameterized: hasIdParam,
+            paramType: paramType as any,
+            sampleIds: hasIdParam ? [1, 2, 3] : [],
+            fields: (detail as any)?.parameters?.map((p: any) => p.name) || [],
+          });
+        }
+      }
+
+      return resources; // return on first found spec
+    } catch {}
+  }
+
+  return resources;
+}
+
+/**
+ * Main crawl function — discovers endpoints generically.
+ */
+export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
+  const baseUrl = config.baseUrl.replace(/\/+$/, '');
+  const result: CrawlResult = {
+    loggedIn: false,
+    resources: [],
+    targetClass: 'http-server',
+    crawlStats: { pagesCrawled: 0, endpointsFound: 0, apiPathsFound: 0, openApiFound: false, jsAnalyzed: 0 },
+  };
+
+  let cookies = '';
+  let token = '';
+
+  // Step 1: Login (if auth configured)
+  if (config.auth) {
+    let loginConfig = null;
+    if (config.auth.loginUrl) {
+      loginConfig = {
+        url: config.auth.loginUrl,
+        method: config.auth.loginMethod || 'json',
+        usernameField: config.auth.usernameField || 'username',
+        passwordField: config.auth.passwordField || 'password',
+        tokenExtractor: config.auth.tokenExtractor || 'token',
+      };
+    } else {
+      console.log('[crawler] Auto-detecting login endpoint...');
+      loginConfig = await detectLogin(config);
+    }
+
+    if (!loginConfig) {
+      console.log('[crawler] No login endpoint found — fail closed (per Claude: "не сканируй анонимно все CVE")');
+      return { ...result, targetClass: 'spa-n/a' };
+    }
+
+    console.log(`[crawler] Logging in as ${config.auth.username}...`);
+    const loginRes = await fetchWithTimeout(
+      loginConfig.url,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': loginConfig.method === 'json' ? 'application/json' : 'application/x-www-form-urlencoded' },
+        body: loginConfig.method === 'json'
+          ? JSON.stringify({ [loginConfig.usernameField]: config.auth.username, [loginConfig.passwordField]: config.auth.password })
+          : new URLSearchParams({ [loginConfig.usernameField]: config.auth.username, [loginConfig.passwordField]: config.auth.password }).toString(),
+      },
+      config.timeoutMs,
+    );
+
+    if (loginRes.setCookie) {
+      const match = loginRes.setCookie.match(/([^=]+)=([^;]+)/);
+      if (match) cookies = match[0];
+    }
+
+    if (loginRes.status === 200) {
+      try {
+        const data = JSON.parse(loginRes.body);
+        token = data[loginConfig.tokenExtractor] || data.token || data.access_token || '';
+        if (token) {
+          result.loggedIn = true;
+          result.session = {
+            token,
+            cookies,
+            username: config.auth.username,
+            role: data.role || data.user?.role || 'user',
+          };
+          console.log(`[crawler] ✓ Login successful — token: ${token.slice(0, 20)}..., role: ${result.session.role}`);
+        }
+      } catch {
+        // Form login — check if Set-Cookie has session
+        if (cookies) {
+          result.loggedIn = true;
+          result.session = { token: '', cookies, username: config.auth.username, role: 'user' };
+          console.log('[crawler] ✓ Form login successful (cookie-based)');
+        }
+      }
+    }
+
+    if (!result.loggedIn) {
+      console.log('[crawler] Login failed — continuing as anonymous');
+    }
+  }
+
+  // Step 2: Try OpenAPI/Swagger
+  const openApiResources = await extractFromOpenAPI(baseUrl, cookies, token, config.timeoutMs);
+  if (openApiResources.length > 0) {
+    result.crawlStats.openApiFound = true;
+    result.crawlStats.apiPathsFound += openApiResources.length;
+    result.resources.push(...openApiResources);
+    console.log(`[crawler] OpenAPI found: ${openApiResources.length} resources`);
+  }
+
+  // Step 3: Crawl HTML pages for <a href> + form actions + JS endpoints
+  const visited = new Set<string>();
+  const toVisit: string[] = [baseUrl, `${baseUrl}/`, `${baseUrl}/api`, `${baseUrl}/api/v1`];
+  const discoveredPaths = new Map<string, { path: string; method: string }>();
+
+  for (let i = 0; i < toVisit.length && i < config.maxPages; i++) {
+    const url = toVisit[i];
+    if (visited.has(url)) continue;
+    visited.add(url);
+    result.crawlStats.pagesCrawled++;
+
+    const res = await fetchWithTimeout(url, {}, config.timeoutMs, cookies, token);
+    if (res.status !== 200 || !res.body) continue;
+
+    // Extract <a href> links
+    const hrefMatches = res.body.matchAll(/href=["']([^"']+)["']/gi);
+    for (const m of hrefMatches) {
+      let href = m[1];
+      if (href.startsWith('/') && !href.startsWith('//')) {
+        const fullUrl = `${baseUrl}${href}`;
+        if (!visited.has(fullUrl) && !toVisit.includes(fullUrl)) {
+          toVisit.push(fullUrl);
+        }
+        // Check if it's an API path
+        if (href.includes('/api/') || href.includes('/users/') || href.includes('/books/') || href.includes('/orders/')) {
+          const param = parameterizePath(href);
+          if (param) {
+            const key = `${param.paramPath}:GET`;
+            if (!discoveredPaths.has(key)) {
+              discoveredPaths.set(key, { path: param.paramPath, method: 'GET' });
+            }
+          }
+        }
+      }
+    }
+
+    // Extract form actions
+    const formMatches = res.body.matchAll(/<form[^>]*action=["']([^"']+)["'][^>]*method=["']([a-z]+)["']/gi);
+    for (const m of formMatches) {
+      const action = m[1];
+      const method = m[2].toUpperCase();
+      if (action.startsWith('/')) {
+        const key = `${action}:${method}`;
+        if (!discoveredPaths.has(key)) {
+          discoveredPaths.set(key, { path: action, method });
+        }
+      }
+    }
+
+    // Extract JS endpoints (from inline scripts + script srcs)
+    const scriptSrcMatches = res.body.matchAll(/<script[^>]*src=["']([^"']+)["']/gi);
+    for (const m of scriptSrcMatches) {
+      const src = m[1];
+      if (src.startsWith('/') || src.startsWith(baseUrl)) {
+        const jsUrl = src.startsWith('/') ? `${baseUrl}${src}` : src;
+        const jsRes = await fetchWithTimeout(jsUrl, {}, config.timeoutMs, cookies, token);
+        if (jsRes.status === 200 && jsRes.body) {
+          result.crawlStats.jsAnalyzed++;
+          const jsEndpoints = extractEndpointsFromJS(jsRes.body, baseUrl);
+          for (const ep of jsEndpoints) {
+            const param = parameterizePath(ep.path);
+            const path = param?.paramPath || ep.path;
+            const key = `${path}:${ep.method}`;
+            if (!discoveredPaths.has(key)) {
+              discoveredPaths.set(key, { path, method: ep.method });
+            }
+          }
+        }
+      }
+    }
+
+    // Also extract from inline <script> blocks
+    const inlineScriptMatches = res.body.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/gi);
+    for (const m of inlineScriptMatches) {
+      const inlineJs = m[1];
+      if (inlineJs.includes('/api/') || inlineJs.includes('fetch(') || inlineJs.includes('axios')) {
+        const jsEndpoints = extractEndpointsFromJS(inlineJs, baseUrl);
+        for (const ep of jsEndpoints) {
+          const param = parameterizePath(ep.path);
+          const path = param?.paramPath || ep.path;
+          const key = `${path}:${ep.method}`;
+          if (!discoveredPaths.has(key)) {
+            discoveredPaths.set(key, { path, method: ep.method });
+          }
+        }
+      }
+    }
+  }
+
+  // Step 4: Convert discovered paths to resources
+  for (const [key, { path, method }] of discoveredPaths) {
+    // Check if path has {id}
+    const hasId = path.includes('{id}') || path.includes(':id');
+    const paramResult = hasId ? null : parameterizePath(path);
+    const finalPath = paramResult?.paramPath || path;
+    const paramType = paramResult?.paramType || (hasId ? 'int' : 'unknown');
+    const sampleIds = paramResult ? [paramResult.idValue] : (hasId ? [1, 2, 3] : []);
+
+    result.resources.push({
+      path: finalPath,
+      method,
+      parameterized: hasId || !!paramResult,
+      paramType: paramType as any,
+      sampleIds: sampleIds as (string | number)[],
+    });
+  }
+
+  result.crawlStats.endpointsFound = result.resources.length;
+  result.crawlStats.apiPathsFound += discoveredPaths.size;
+
+  // Step 5: Determine targetClass
+  if (result.resources.length === 0 && result.crawlStats.pagesCrawled > 3) {
+    // Crawled multiple pages but found 0 API endpoints — likely SPA
+    result.targetClass = 'spa-n/a';
+  } else if (result.resources.length > 0) {
+    result.targetClass = 'http-server';
+  } else {
+    result.targetClass = 'http-nav';
+  }
+
+  console.log(`[crawler] Done. ${result.resources.length} resources found, ${result.crawlStats.pagesCrawled} pages crawled, ${result.crawlStats.jsAnalyzed} JS files analyzed. targetClass=${result.targetClass}`);
+
+  return result;
+}

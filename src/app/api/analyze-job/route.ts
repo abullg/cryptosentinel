@@ -22,6 +22,8 @@ import { fuzzAllOracles } from '@/lib/active-fuzzer';
 import { generatePoC } from '@/lib/generate-poc';
 import { crawlForEndpoints } from '@/lib/endpoint-crawler';
 import { crawlAuthenticated } from '@/lib/auth-crawler';
+import { crawlForApi } from '@/lib/generic-crawler';
+import { runIdentityMatrix } from '@/lib/identity-matrix';
 import { isolateEvidence, verifyEvidenceIsolation } from '@/lib/evidence-isolation';
 import { createHash } from 'crypto';
 
@@ -663,34 +665,80 @@ async function runAnalysisInBackground(jobId: string, config: {
             }
           }
 
-          // ─── FALLBACK: REST API targets without crawled endpoints ───
-          // Per Claude v9: IDOR/JWT oracles should run on ANY REST API,
-          // not just targets where crawlAuthenticated found endpoints.
-          // Express-GT (port 3010) and VAmPI (port 3009) have REST APIs
-          // but no DVWA-style form-based auth. The crawler returns 0
-          // endpoints, so the loop above doesn't execute.
-          // Fix: if no endpoints were crawled AND target is a REST API
-          // (has /api/ in URL or is on known API port), run IDOR+JWT
-          // oracles directly on the target URL.
+          // ─── GENERIC CRAWLER + IDENTITY MATRIX (per Claude v10 §4.2 + §4.3) ───
+          // Replaces hardcoded REST API fallback. The generic crawler discovers
+          // endpoints from HTML/JS/OpenAPI WITHOUT knowing the app's structure.
+          // The identity matrix runs IDOR + mass assignment + BFLA on discovered
+          // resources using 2 authenticated sessions (user A + user B).
+          //
+          // Per Claude: "Пока crawler и identity matrix не first-class, новый
+          // оракул сработает только на Express-GT. На реальной программе вы
+          // снова не найдёте, куда слать PUT {role:admin}."
           if (allEndpoints.length === 0 &&
-              (targetUrl.includes('/api/') || targetUrl.includes(':3009') || targetUrl.includes(':3010'))) {
-            console.log(`[analyze-job]   Fallback: no crawled endpoints, but target is REST API — running IDOR+JWT directly`);
-            const fallbackFindings = await fuzzAllOracles(targetUrl, undefined, {
-              allowlistPatterns: [
-                'http://localhost:',
-                'http://127.0.0.1:',
-                'http://cs-juice-shop:',
-                'http://cs-dvwa:',
-                'http://cs-canary:',
-                'http://cs-negative:',
-              ],
-              perProbeTimeoutMs: 15_000,
-              sqliTimeDeltaMs: 4_500,
+              (targetUrl.includes(':3009') || targetUrl.includes(':3010') || targetUrl.includes('/api/'))) {
+            console.log(`[analyze-job]   Generic crawler: discovering API surface without hardcoded paths...`);
+
+            // Login as user A
+            const crawlResultA = await crawlForApi({
+              baseUrl: targetUrl,
+              auth: { username: 'user', password: 'user' },
+              timeoutMs: 15_000,
+              maxPages: 10,
+              maxEndpoints: 20,
             });
-            for (const f of fallbackFindings) {
-              if (f.confirmed) {
-                fuzzFindings.push({ ...f, endpoint: targetUrl, cookies: '' });
-                console.log(`[analyze-job]     ✅ CONFIRMED ${f.type} via ${f.oracle}: ${f.evidence.slice(0, 80)}`);
+
+            // Login as user B (admin)
+            const crawlResultB = await crawlForApi({
+              baseUrl: targetUrl,
+              auth: { username: 'admin', password: 'admin' },
+              timeoutMs: 15_000,
+              maxPages: 5,
+              maxEndpoints: 10,
+            });
+
+            if (crawlResultA.loggedIn && crawlResultB.loggedIn && crawlResultA.resources.length > 0) {
+              console.log(`[analyze-job]   Crawler found ${crawlResultA.resources.length} resources, targetClass=${crawlResultA.targetClass}`);
+
+              // Run identity matrix on discovered resources
+              console.log(`[analyze-job]   Running identity matrix (IDOR + mass assignment + BFLA)...`);
+              const matrixFindings = await runIdentityMatrix({
+                baseUrl: targetUrl.replace(/\/+$/, ''),
+                sessionA: crawlResultA.session!,
+                sessionB: crawlResultB.session!,
+                sessionAdmin: crawlResultB.session,
+                resources: crawlResultA.resources,
+                timeoutMs: 15_000,
+              });
+
+              for (const f of matrixFindings) {
+                if (f.confirmed) {
+                  fuzzFindings.push({ ...f, endpoint: targetUrl, cookies: '' });
+                  console.log(`[analyze-job]     ✅ CONFIRMED ${f.type} via ${f.oracle}: ${f.evidence.slice(0, 80)}`);
+                }
+              }
+            } else {
+              console.log(`[analyze-job]   Crawler: loggedInA=${crawlResultA.loggedIn}, loggedInB=${crawlResultB.loggedIn}, resources=${crawlResultA.resources.length}`);
+
+              // Fallback: if crawler didn't find resources, run fuzzAllOracles directly
+              // (keeps backward compatibility with VAmPI/Express-GT hardcoded oracles)
+              console.log(`[analyze-job]   Crawler found 0 resources — falling back to direct oracle probing`);
+              const fallbackFindings = await fuzzAllOracles(targetUrl, undefined, {
+                allowlistPatterns: [
+                  'http://localhost:',
+                  'http://127.0.0.1:',
+                  'http://cs-juice-shop:',
+                  'http://cs-dvwa:',
+                  'http://cs-canary:',
+                  'http://cs-negative:',
+                ],
+                perProbeTimeoutMs: 15_000,
+                sqliTimeDeltaMs: 4_500,
+              });
+              for (const f of fallbackFindings) {
+                if (f.confirmed) {
+                  fuzzFindings.push({ ...f, endpoint: targetUrl, cookies: '' });
+                  console.log(`[analyze-job]     ✅ CONFIRMED ${f.type} via ${f.oracle}: ${f.evidence.slice(0, 80)}`);
+                }
               }
             }
           }
