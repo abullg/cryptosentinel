@@ -1019,20 +1019,53 @@ export async function fuzzIdor(
     const tokenB = loginBData.token;
 
     // Step 3: As user A, list resources to find an ID
+    // If no list endpoint exists, try direct ID access (1, 2, 3)
     console.log('[active-fuzzer]   idor: Step 3 — list resources as user A...');
+    let resourceId: number | null = null;
+    let resourceValue: string = '';
+
+    // First try: list all resources
     const listA = await fetch(`${base}${resourcePath}`, {
       headers: { 'User-Agent': 'CryptoSentinel-Active-Fuzzer/1.0', 'Authorization': `Bearer ${tokenA}` },
       signal: AbortSignal.timeout(config.perProbeTimeoutMs),
     });
-    const listAData = await listA.json();
-    const resources = listAData.books || listAData.users || listAData;
-    if (!Array.isArray(resources) || resources.length === 0) {
-      console.log('[active-fuzzer]   idor: no resources found — skipping');
+    let resources: any[] = [];
+    try {
+      const listAData = await listA.json();
+      resources = listAData.books || listAData.users || listAData;
+      if (Array.isArray(resources) && resources.length > 0) {
+        resourceId = resources[0].id;
+        resourceValue = resources[0][resourceField] || resources[0].title || resources[0].username || '';
+      }
+    } catch { resources = []; }
+
+    // Fallback: if no list endpoint or empty list, try direct IDs 1-5
+    if (!resourceId) {
+      console.log('[active-fuzzer]   idor: no list endpoint — trying direct IDs 1-5...');
+      for (const tryId of [1, 2, 3, 4, 5]) {
+        const probe = await fetch(`${base}${resourcePath}/${tryId}`, {
+          headers: { 'User-Agent': 'CryptoSentinel-Active-Fuzzer/1.0', 'Authorization': `Bearer ${tokenA}` },
+          signal: AbortSignal.timeout(config.perProbeTimeoutMs),
+        });
+        if (probe.status === 200) {
+          const probeData = await probe.json().catch(() => ({}));
+          const item = probeData[resourceSingular] || probeData;
+          if (item && (item.id || item[resourceField])) {
+            resourceId = tryId;
+            resourceValue = item[resourceField] || item.title || item.username || '';
+            console.log(`[active-fuzzer]   idor: found ${resourceSingular} id=${resourceId} ${resourceField}="${resourceValue}" (via direct ID probe)`);
+            break;
+          }
+        }
+      }
+    } else {
+      console.log(`[active-fuzzer]   idor: found ${resourceSingular} id=${resourceId} ${resourceField}="${resourceValue}"`);
+    }
+
+    if (!resourceId) {
+      console.log('[active-fuzzer]   idor: no resources found (list + direct ID both failed) — skipping');
       return [];
     }
-    const resourceId = resources[0].id;
-    const resourceValue = resources[0][resourceField] || resources[0].title || resources[0].username;
-    console.log(`[active-fuzzer]   idor: found ${resourceSingular} id=${resourceId} ${resourceField}="${resourceValue}"`);
 
     // Step 4: As user B, access user A's resource by ID
     console.log('[active-fuzzer]   idor: Step 4 — access resource as user B (different session)...');
