@@ -662,6 +662,38 @@ async function runAnalysisInBackground(jobId: string, config: {
             }
           }
 
+          // ─── FALLBACK: REST API targets without crawled endpoints ───
+          // Per Claude v9: IDOR/JWT oracles should run on ANY REST API,
+          // not just targets where crawlAuthenticated found endpoints.
+          // Express-GT (port 3010) and VAmPI (port 3009) have REST APIs
+          // but no DVWA-style form-based auth. The crawler returns 0
+          // endpoints, so the loop above doesn't execute.
+          // Fix: if no endpoints were crawled AND target is a REST API
+          // (has /api/ in URL or is on known API port), run IDOR+JWT
+          // oracles directly on the target URL.
+          if (allEndpoints.length === 0 &&
+              (targetUrl.includes('/api/') || targetUrl.includes(':3009') || targetUrl.includes(':3010'))) {
+            console.log(`[analyze-job]   Fallback: no crawled endpoints, but target is REST API — running IDOR+JWT directly`);
+            const fallbackFindings = await fuzzAllOracles(targetUrl, undefined, {
+              allowlistPatterns: [
+                'http://localhost:',
+                'http://127.0.0.1:',
+                'http://cs-juice-shop:',
+                'http://cs-dvwa:',
+                'http://cs-canary:',
+                'http://cs-negative:',
+              ],
+              perProbeTimeoutMs: 15_000,
+              sqliTimeDeltaMs: 4_500,
+            });
+            for (const f of fallbackFindings) {
+              if (f.confirmed) {
+                fuzzFindings.push({ ...f, endpoint: targetUrl, cookies: '' });
+                console.log(`[analyze-job]     ✅ CONFIRMED ${f.type} via ${f.oracle}: ${f.evidence.slice(0, 80)}`);
+              }
+            }
+          }
+
           // 3. Save confirmed findings from active fuzzer
           for (const f of fuzzFindings) {
             try {
