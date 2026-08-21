@@ -115,15 +115,23 @@ jobs:
           echo "=== Running benchmark.js ==="
           GT_ALLOWLIST_ENABLED=true node scripts/benchmark.js http://localhost:3000 2>&1
 
-          # ─── BENCH-DOWN: stop GT containers after bench (per Claude v8 Q10) ───
-          # GT containers should NOT live on production VPS that scans
-          # client targets. After bench completes, stop them.
-          # Future: move GT to separate staging VPS (Claude Q10 option b).
+          # ─── hunt.mjs SMOKE (per Claude v10 Q3) ───
+          # Per Claude: "Один smoke в CI: Express-GT через hunt, сверить
+          # что mass+BFLA на месте."
+          echo "=== hunt.mjs smoke on Express-GT (--no-fallback) ==="
+          GT_ALLOWLIST_ENABLED=true node scripts/hunt.mjs \
+            --url http://127.0.0.1:3010 \
+            --auth '{"username":"user","password":"user"}' \
+            --auth '{"username":"alice","password":"alice"}' \
+            --no-fallback 2>&1
+
+          # ─── BENCH-DOWN: stop GT containers + vAPI ───
           echo "=== Bench-down: stopping GT containers ==="
           cd /opt/cryptosentinel/tests/gt
           docker compose stop 2>&1 | tail -5
-          echo "  GT containers stopped (not removed — use 'docker compose start' to resume)"
-          docker compose ps 2>&1 | tail -5
+          # Stop vAPI too
+          cd /opt/vapi 2>/dev/null && docker compose stop 2>&1 | tail -3 || true
+          echo "  All GT containers stopped"
           REMOTE_EOF
 
       - name: Upload benchmark results

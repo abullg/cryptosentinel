@@ -163,20 +163,7 @@ services:
       retries: 3
       start_period: 10s
 
-  # ─── TIER 2 GT — vAPI (localhost:3011) ────────────────────────────
-  # Per Claude v10 Q4: "vAPI (roottusk/vapi): docker-compose up -d,
-  # PHP/Laravel, OWASP API Top 10, не ваш код."
-  # This is a THIRD-PARTY GT — we did NOT write this code.
-  # Tests generic crawler + identity matrix on unknown API.
-  vapi:
-    image: roottusk/vapi:latest
-    container_name: cs-vapi
-    ports:
-      - "3011:8080"
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "true"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
+  # vAPI is NOT in this docker-compose — it's deployed separately from
+  # /opt/vapi (cloned from roottusk/vapi) with its own compose (www + MySQL).
+  # Per Claude v10 Q1: "vAPI их compose (www+db), не latest:8080."
+  # See setup-gt-and-egress.yml for the vAPI deployment step.

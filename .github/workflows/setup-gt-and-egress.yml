@@ -60,11 +60,39 @@ jobs:
 
           echo "=== Bringing up GT containers (force-recreate to clear stale docker-proxy state) ==="
           # Force-recreate: stop + remove old containers, create new ones
-          # Previous issue: docker-proxy was in a bad state — listening on host
-          # ports but not forwarding to containers properly. Force recreate
-          # rebuilds the docker-proxy mapping from scratch.
           docker compose down --remove-orphans 2>&1 | tail -5
           docker compose up -d --build --force-recreate 2>&1 | tail -10
+
+          # ─── vAPI: third-party GT from source (per Claude v10 Q1) ───
+          # Per Claude: "vAPI их compose (www+db), не latest:8080"
+          # Clone vAPI repo, modify port to 3011, bring up with MySQL
+          echo "=== Setting up vAPI (third-party GT, per Claude) ==="
+          if [ ! -d /opt/vapi ]; then
+            echo "  Cloning roottusk/vapi..."
+            git clone --depth 1 https://github.com/roottusk/vapi.git /opt/vapi 2>&1 | tail -3
+          else
+            echo "  vAPI repo already exists, pulling..."
+            cd /opt/vapi && git pull --ff-only 2>&1 | tail -2
+          fi
+          cd /opt/vapi
+          # Modify their docker-compose to use port 3011 instead of 8000
+          # and MySQL on 3316 instead of 3306 (don't conflict with host)
+          sed -i 's/"8000:80"/"3011:80"/' docker-compose.yml
+          sed -i 's/"3306:3306"/"3316:3306"/' docker-compose.yml
+          sed -i 's/8001:80/8011:80/' docker-compose.yml
+          # Build + start vAPI (www + db + phpmyadmin)
+          docker compose up -d --build 2>&1 | tail -10
+          echo "  vAPI starting (needs MySQL init ~30s)..."
+          # Wait for vAPI to be ready
+          for i in $(seq 1 12); do
+            sleep 5
+            CODE=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" http://127.0.0.1:3011/ 2>/dev/null || echo "000")
+            if echo "$CODE" | grep -qE '^[23][0-9][0-9]$'; then
+              echo "  ✓ vAPI ready on port 3011 (HTTP $CODE)"
+              break
+            fi
+            echo "  vAPI attempt $i/12: HTTP $CODE (waiting...)"
+          done
           echo "=== Waiting for GT containers to be READY (extended healthcheck loop) ==="
           # WebGoat Spring Boot needs ~90s startup. Juice Shop Node.js ~60s.
           # Loop up to 5 min (60 attempts × 5s).
