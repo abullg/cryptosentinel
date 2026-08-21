@@ -19,6 +19,7 @@ import { checkPassiveEvidence } from '@/lib/passive-evidence';
 import { runProvenanceChain } from '@/lib/provenance-chain';
 import { fullVerify } from '@/lib/impact-engine';
 import { fuzzAllOracles } from '@/lib/active-fuzzer';
+import { generatePoC } from '@/lib/generate-poc';
 import { crawlForEndpoints } from '@/lib/endpoint-crawler';
 import { crawlAuthenticated } from '@/lib/auth-crawler';
 import { isolateEvidence, verifyEvidenceIsolation } from '@/lib/evidence-isolation';
@@ -739,7 +740,43 @@ async function runAnalysisInBackground(jobId: string, config: {
           const fuzzConfirmed = fuzzFindings.length;
           console.log(`[analyze-job] ACTIVE FUZZER complete: ${fuzzConfirmed} confirmed findings from ${allEndpoints.length} probed URLs`);
           if (fuzzConfirmed > 0) {
-            // Active fuzzer found real vulns — no need for LLM
+            // ─── generatePoC: LLM writes report text on ALREADY CONFIRMED findings ───
+            // Per Claude v10: "LLM только упаковывает уже доказанный HTTP-replay.
+            // Не трогает severity, не предлагает ещё вектор."
+            // This runs ONLY after findings are confirmed by deterministic oracles.
+            // LLM does NOT detect — it formats proven evidence into report text.
+            if (apiKey && apiKey.startsWith('sk-or-v1-')) {
+              console.log(`[analyze-job] generatePoC: writing PoC reports for ${savedStatic.length} confirmed findings...`);
+              await updateJob(90, `Generating PoC reports for ${savedStatic.length} confirmed findings...`);
+              for (const s of savedStatic) {
+                try {
+                  const poc = await generatePoC({
+                    type: s.rawFinding?.type || s.vuln?.type || 'unknown',
+                    severity: s.rawFinding?.severity || s.vuln?.severity || 'medium',
+                    evidence: s.rawFinding?.evidence || s.vuln?.description || '',
+                    payload: s.rawFinding?.payload || s.vuln?.codeSnippet || '',
+                    target: s.rawFinding?.target || s.vuln?.location || '',
+                    oracle: s.rawFinding?.oracle || 'unknown',
+                    parameter: s.rawFinding?.parameter,
+                  }, apiKey, model);
+                  if (poc) {
+                    // Update the finding with PoC report text
+                    const pocText = `CWE: ${poc.cwe}\n\nImpact:\n${poc.impact}\n\nReproduction:\n${poc.steps}\n\nRemediation:\n${poc.remediation}\n\ncurl replay:\n${poc.curlReplay}`;
+                    await withTimeout(db.vulnerability.update({
+                      where: { id: s.vuln.id },
+                      data: { poc: pocText } as any,
+                    }), 10_000, null, 'generatePoC update');
+                    console.log(`[analyze-job]   ✓ PoC generated for ${s.rawFinding?.type} on ${s.rawFinding?.target?.slice(0, 50)}`);
+                  }
+                } catch (e) {
+                  console.warn(`[analyze-job]   generatePoC failed for finding: ${String(e).slice(0, 80)}`);
+                }
+              }
+            } else {
+              console.log('[analyze-job] generatePoC: skipped (no API key configured)');
+            }
+
+            // Active fuzzer found real vulns — no need for LLM detection
             const confirmedCount = savedStatic.length;
             await updateJob(100, `Analysis complete (active fuzzer): ${confirmedCount} confirmed via deterministic oracles (time-delay, reflection, error-message). LLM skipped — found real vulns.`);
             fireAndForget(db.audit.update({ where: { id: auditId }, data: { status: 'completed', findings: confirmedCount, completedAt: new Date() } }), 'catch audit.update fuzzer');

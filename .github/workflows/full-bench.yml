@@ -127,30 +127,36 @@ jobs:
           TARGETS
 
           echo "Running nuclei (http/cves + misconfig + exposures + secrets)..."
+          # Per Claude v10 Q5: use -jsonl -o file, not tee pipe.
+          # tee on 27KB single JSON line breaks the pipe.
+          # JSONL = one finding per line, pipe survives.
           nuclei -l /tmp/cs-nuclei/targets.txt \
             -t http/cves/ \
             -t http/misconfiguration/ \
             -t http/exposures/ \
             -t http/secrets/ \
             -severity low,medium,high,critical \
-            -j \
-            -o /tmp/cs-nuclei/nuclei-results.json \
+            -jsonl \
+            -o /tmp/cs-nuclei/nuclei-results.jsonl \
             -silent \
             -rate-limit 30 \
             -timeout 10 \
             -retries 1 \
-            2>&1 | head -50
+            2>&1 | tail -5
 
           echo "=== Nuclei findings summary ==="
-          if [ -f /tmp/cs-nuclei/nuclei-results.json ]; then
+          if [ -f /tmp/cs-nuclei/nuclei-results.jsonl ]; then
             python3 << 'NUCLEISUMMARY'
           import json
           from collections import Counter
-          try:
-              with open('/tmp/cs-nuclei/nuclei-results.json') as f:
-                  items = [json.loads(l) for l in f if l.strip()]
-          except:
-              items = []
+          items = []
+          with open('/tmp/cs-nuclei/nuclei-results.jsonl') as f:
+              for line in f:
+                  if line.strip():
+                      try:
+                          items.append(json.loads(line))
+                      except:
+                          pass
           print(f'Nuclei total findings: {len(items)}')
           sev = Counter(i.get('info',{}).get('severity','?') for i in items)
           print('By severity:', dict(sev))
