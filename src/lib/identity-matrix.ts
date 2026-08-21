@@ -116,12 +116,46 @@ async function testIdor(
     return [];
   }
 
-  // Extract user A's sensitive fields (SSN, email, etc.)
-  const sensitiveFields = ['ssn', 'email', 'password', 'token', 'secret', 'balance', 'phone', 'address'];
+  // Extract user A's sensitive fields. Two detection paths:
+  //  (a) Field name in a known sensitive-field list (email, password, …)
+  //  (b) Field VALUE looks like a secret/flag — covers vAPI's `course`
+  //      field that stores flag{api1_...}, and any custom field whose
+  //      value is a CTF flag, JWT, API key, etc. This is generic — we
+  //      don't hardcode `course` (that would be vAPI-specific).
+  const sensitiveFields = ['ssn', 'email', 'password', 'token', 'secret', 'balance', 'phone', 'address', 'apikey', 'api_key', 'private_key', 'ssn_last4'];
   const aSensitiveData: Record<string, any> = {};
-  for (const field of sensitiveFields) {
-    if (resA.body[field] !== undefined) {
-      aSensitiveData[field] = resA.body[field];
+  const publicFields = new Set(['id', 'username', 'name', 'first_name', 'last_name', 'display_name', 'avatar', 'profile_pic', 'created_at', 'updated_at']);
+  // Heuristic: detect common secret/flag value shapes in the response body.
+  const looksLikeSecret = (v: any): boolean => {
+    if (v == null) return false;
+    const s = String(v);
+    if (s.length < 4) return false;
+    // CTF flags (flag{...}, FLAG{...}, CTF{...})
+    if (/\b(?:flag|FLAG|CTF|ctf)\{[^}]{4,}\}/.test(s)) return true;
+    // JWT (3 base64 segments separated by dots)
+    if (/^ey[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}$/.test(s)) return true;
+    // API keys / bearer tokens (high-entropy strings ≥ 24 chars)
+    if (/^[A-Za-z0-9_\-]{24,}$/.test(s)) return true;
+    // Long hex strings (private keys, hashes, secrets) ≥ 32 hex chars
+    if (/^[a-f0-9]{32,}$/i.test(s)) return true;
+    // Credit-card-shaped (groups of 4 digits)
+    if (/^\d{4}[ -]?\d{4}[ -]?\d{4}[ -]?\d{4}$/.test(s)) return true;
+    return false;
+  };
+  if (resA.body && typeof resA.body === 'object') {
+    for (const [field, value] of Object.entries(resA.body)) {
+      if (sensitiveFields.includes(field.toLowerCase())) {
+        aSensitiveData[field] = value;
+        continue;
+      }
+      // Skip public-ish fields — we don't want 'id' or 'username' to trigger
+      // false IDOR positives (those are often public and not a leak).
+      if (publicFields.has(field.toLowerCase())) continue;
+      // Otherwise: if the VALUE itself looks like a secret, treat the field
+      // as sensitive (this is what catches vAPI's `course: "flag{api1_...}"`).
+      if (looksLikeSecret(value)) {
+        aSensitiveData[field] = value;
+      }
     }
   }
 
