@@ -114,6 +114,7 @@ export async function POST(req: NextRequest) {
       discoveredEndpoints: Array.isArray(discoveredEndpoints) ? discoveredEndpoints : [],
       discoveredForms: Array.isArray(discoveredForms) ? discoveredForms : [],
       discoveredParams: Array.isArray(discoveredParams) ? discoveredParams : [],
+      noFallback: reqBody?.noFallback === true,  // pass --no-fallback from POST body
       // Static analysis layer (Claude §8) — from /api/fetch-url
       staticAnalysis: staticAnalysis || null,
     }).catch(async (err) => {
@@ -149,6 +150,7 @@ async function runAnalysisInBackground(jobId: string, config: {
   discoveredEndpoints: string[];
   discoveredForms: { action: string; method: string; fields: string[] }[];
   discoveredParams: string[];
+  noFallback?: boolean;  // --no-fallback flag: if true, don't fall back to hardcoded oracles
   // Static analysis layer (Claude §8) — gitleaks + sink-hints from /api/fetch-url
   staticAnalysis?: any;
 }) {
@@ -674,7 +676,7 @@ async function runAnalysisInBackground(jobId: string, config: {
           // its own login + crawl, which is more thorough than static
           // crawlForEndpoints. The static crawler might find paths from the
           // HTML/JSON, but the generic crawler also does auth + identity matrix.
-          const noFallback = reqBody.noFallback === true;  // --no-fallback flag
+          const noFallback = config.noFallback === true;  // --no-fallback flag (from POST body)
           let matrixTelemetry = '';
 
           // Run generic crawler on REST API targets (not DVWA — it has its own auth-crawler)
