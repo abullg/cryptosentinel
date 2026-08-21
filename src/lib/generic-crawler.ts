@@ -312,24 +312,35 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
       console.log('[crawler] No login endpoint found — trying self-registration...');
 
       // Per Claude: "если логина нет, а есть POST .../user регистрация — создать A и B"
-      // Try to register a new user if no login found
+      // Send BOTH username AND email (vAPI requires username, Express uses email)
       const registerPaths = ['/api/register', '/api/user/register', '/api/v1/user/register',
         '/vapi/api1/user', '/api/user', '/register', '/vapi/api2/user/register', '/signup'];
       let registered = false;
       for (const regPath of registerPaths) {
-        const credField = regPath.includes('vapi') ? 'email' : 'username';
+        // Generate unique username + email per attempt
+        const botId = `csbot${Date.now().toString(36).slice(-6)}`;
         const regBody = JSON.stringify({
-          [credField]: config.auth?.username || `cs_bot_${Date.now()}@test.local`,
+          username: botId,
+          email: `${botId}@test.local`,
           password: config.auth?.password || 'CrawlerTest123!',
-          ...(credField === 'email' ? { name: 'CrawlerBot' } : {}),
+          name: 'CrawlerBot',
         });
         const regRes = await fetchWithTimeout(
           `${baseUrl}${regPath}`,
           { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: regBody },
           config.timeoutMs,
         );
-        if (regRes.status === 200 || regRes.status === 201) {
-          console.log(`[crawler] ✓ Self-registered user via ${regPath} (field: ${credField})`);
+        // 200/201 = success, but also check for JSON success field
+        let success = regRes.status === 200 || regRes.status === 201;
+        try {
+          const data = JSON.parse(regRes.body);
+          if (data.error || data.success === false) success = false;
+        } catch {}
+        if (success) {
+          console.log(`[crawler] ✓ Self-registered user "${botId}" via ${regPath}`);
+          // Store credentials for login
+          if (!config.auth) config.auth = { username: '', password: '' };
+          config.auth.username = botId;
           // Now try to login with the new account
           loginConfig = await detectLogin(config);
           if (loginConfig) { registered = true; break; }
@@ -342,15 +353,20 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
     }
 
     const authHeader = loginConfig.authHeader || 'Authorization';
-    console.log(`[crawler] Logging in as ${config.auth.username} (header: ${authHeader})...`);
+    // Per Claude: try login with BOTH username and email fields
+    // detectLogin already determined which field the API uses
+    const loginValue = loginConfig.usernameField === 'email'
+      ? (config.auth.username.includes('@') ? config.auth.username : `${config.auth.username}@test.local`)
+      : config.auth.username;
+    console.log(`[crawler] Logging in as ${loginValue} (field: ${loginConfig.usernameField}, header: ${authHeader})...`);
     const loginRes = await fetchWithTimeout(
       loginConfig.url,
       {
         method: 'POST',
         headers: { 'Content-Type': loginConfig.method === 'json' ? 'application/json' : 'application/x-www-form-urlencoded' },
         body: loginConfig.method === 'json'
-          ? JSON.stringify({ [loginConfig.usernameField]: config.auth.username, [loginConfig.passwordField]: config.auth.password })
-          : new URLSearchParams({ [loginConfig.usernameField]: config.auth.username, [loginConfig.passwordField]: config.auth.password }).toString(),
+          ? JSON.stringify({ [loginConfig.usernameField]: loginValue, [loginConfig.passwordField]: config.auth.password })
+          : new URLSearchParams({ [loginConfig.usernameField]: loginValue, [loginConfig.passwordField]: config.auth.password }).toString(),
       },
       config.timeoutMs,
     );
