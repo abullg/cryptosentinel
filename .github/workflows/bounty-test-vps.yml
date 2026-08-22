@@ -101,6 +101,10 @@ jobs:
           echo "=== Git check: ensure latest code ==="
           git pull --ff-only 2>&1 | tail -3
           git log --oneline -3
+          echo "=== Rebuild Next.js (git pull updates source, need to recompile .next/) ==="
+          npx next build 2>&1 | tail -5
+          pm2 restart cryptosentinel --update-env 2>&1 | tail -3
+          sleep 5
           echo "=== Verify bounty mode code exists ==="
           grep -c "bountyMode" src/app/api/analyze-job/route.ts || echo "bountyMode NOT found in code!"
           echo "=== Verify BOUNTY_MODE env var ==="
