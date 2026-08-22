@@ -126,7 +126,7 @@ async function testIdor(
   resourceId: string | number,
 ): Promise<MatrixFinding[]> {
   const findings: MatrixFinding[] = [];
-  const path = resource.path.replace(/\{id\}|:id/, String(resourceId));
+  const path = resource.path.replace(/\{[^}]*id[^}]*\}|\/:[a-zA-Z_]*id[a-zA-Z_]*/i, String(resourceId));
 
   // Per Claude v10-feedback: "Нужны минимум 3 личности: A — user, tenant 1;
   // B — user, тот же роль/tenant ← только так IDOR; Admin — для BFLA."
@@ -359,7 +359,7 @@ async function testMassAssignment(
   resourceId: string | number,
 ): Promise<MatrixFinding[]> {
   const findings: MatrixFinding[] = [];
-  const path = resource.path.replace(/\{id\}|:id/, String(resourceId));
+  const path = resource.path.replace(/\{[^}]*id[^}]*\}|\/:[a-zA-Z_]*id[a-zA-Z_]*/i, String(resourceId));
 
   // Step 1: GET baseline — what fields does the resource have?
   const resA = await fetchJson(
@@ -502,7 +502,7 @@ async function testMissingAuthn(
   resourceId: string | number,
 ): Promise<MatrixFinding[]> {
   const findings: MatrixFinding[] = [];
-  const path = resource.path.replace(/\{id\}|:id/, String(resourceId));
+  const path = resource.path.replace(/\{[^}]*id[^}]*\}|\/:[a-zA-Z_]*id[a-zA-Z_]*/i, String(resourceId));
 
   const resAnon = await fetchJson(
     `${config.baseUrl}${path}`,
@@ -567,7 +567,7 @@ export async function runIdentityMatrix(
 
     // For each sample ID, test with ALL verbs (verb-inference per Claude)
     for (const id of resource.sampleIds.slice(0, 3)) {
-      const testResource = { ...resource, path: resource.path.replace(/\{id\}|:id/, String(id)) };
+      const testResource = { ...resource, path: resource.path.replace(/\{[^}]*id[^}]*\}|\/:[a-zA-Z_]*id[a-zA-Z_]*/i, String(id)) };
 
       // ALWAYS test GET (IDOR + missing authn) — even if discovered as PUT
       console.log(`[matrix]   Testing GET (IDOR + missing authn) on id=${id}...`);
@@ -593,7 +593,7 @@ export async function runIdentityMatrix(
       // Try DELETE (can user B delete user A's resource?)
       console.log(`[matrix]   Testing DELETE on id=${id}...`);
       telemetry.verbs_tried.add('DELETE');
-      const path = resource.path.replace(/\{id\}|:id/, String(id));
+      const path = resource.path.replace(/\{[^}]*id[^}]*\}|\/:[a-zA-Z_]*id[a-zA-Z_]*/i, String(id));
       const resDel = await fetchJson(
         `${config.baseUrl}${path}`,
         { method: 'DELETE', headers: makeHeaders(config.sessionB) },

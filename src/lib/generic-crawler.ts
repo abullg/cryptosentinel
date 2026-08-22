@@ -843,11 +843,21 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
   if (!result.loggedIn && config.auth) {
     // Find parent paths of /X/{id} paths — these are registration candidates.
     // E.g., /vapi/api1/user/{id} → parent /vapi/api1/user.
+    // Also /vapi/api1/user/{api1_id} → parent /vapi/api1/user (vAPI uses
+    // named IDs like {api1_id}, {api5_id} — must match any {xxx_id} or
+    // {id} or :id pattern, not just literal '{id}').
     const regCandidates: string[] = [];
+    // Match any path segment that's {something_id}, {id}, :id, or :something_id
+    const idSegmentRegex = /\/\{[^}]*id[^}]*\}|\/:[a-zA-Z_]*id[a-zA-Z_]* /i;
     for (const [, { path, method }] of discoveredPaths) {
       if (method !== 'GET') continue;
-      if (!(path.includes('{id}') || path.includes(':id'))) continue;
-      const parent = path.replace(/\/\{id\}.*$/, '').replace(/\/:id.*$/, '');
+      // Strip the trailing {id}-style segment to derive parent.
+      // Pattern: /X/user/{any_id} → /X/user
+      //          /X/user/:id     → /X/user
+      //          /X/user/{id}/sub → /X/user  (also strips /sub)
+      const idMatch = path.match(/^(.+?)\/\{[^}]*id[^}]*\}.*$/i) || path.match(/^(.+?)\/:[a-zA-Z_]*id[a-zA-Z_]*.*$/i);
+      if (!idMatch) continue;
+      const parent = idMatch[1];
       if (!parent || parent.includes('{') || parent.includes(':')) continue;
       if (!regCandidates.includes(parent)) regCandidates.push(parent);
     }
@@ -941,8 +951,10 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
 
   // Step 4: Convert discovered paths to resources
   for (const [key, { path, method, ownedId }] of discoveredPaths) {
-    // Check if path has {id}
-    const hasId = path.includes('{id}') || path.includes(':id');
+    // Check if path has any {id}-style placeholder.
+    // Per Claude v11 P2: vAPI uses named IDs like {api1_id}, {api5_id} —
+    // match any {something_id} or {id} or :id pattern.
+    const hasId = /\{[^}]*id[^}]*\}|\/:[a-zA-Z_]*id/i.test(path);
     const paramResult = hasId ? null : parameterizePath(path);
     const finalPath = paramResult?.paramPath || path;
     const paramType = paramResult?.paramType || (hasId ? 'int' : 'unknown');
