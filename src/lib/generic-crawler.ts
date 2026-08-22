@@ -50,6 +50,19 @@ export interface DiscoveredResource {
   paramType: 'int' | 'uuid' | 'email' | 'string' | 'unknown';
   sampleIds: (string | number)[];
   fields?: string[];
+  // Per-resource auth override. When the target has MULTIPLE auth tables
+  // (vAPI: each /vapi/api{N}/user has its own a_p_i{N}_users table), the
+  // generic session from analyze-job (single username/password) won't
+  // authenticate against all of them — each registered user lives in
+  // only ONE table. The identity matrix must use these per-resource
+  // credentials to log in as user A and user B FOR THIS SPECIFIC RESOURCE,
+  // otherwise the matrix sees 403 "usernameOrPasswordIncorrect" and
+  // skips the resource as "baseline failed".
+  authOverride?: {
+    userA: { username: string; password: string };
+    userB: { username: string; password: string };
+    authHeader: string;  // e.g. 'Authorization-Token' for vAPI, 'Authorization' default
+  };
 }
 
 import { AuthSession } from './identity-matrix';
@@ -318,27 +331,35 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
 
       // Per Claude: "если логина нет, а есть POST .../user регистрация — создать A и B"
       // Send BOTH username AND email (vAPI requires username, Express uses email)
-      // The registerPaths list is generic — covers REST conventions:
-      //   /api/register, /api/v1/user/register (Express-GT, VAmPI style)
-      //   /api/user (Django REST style)
-      //   /vapi/api{N}/user (vAPI API1/API3/API5/API6/API7 — same registration pattern,
-      //     different vuln types: API1=BOLA on GET /{id}, API3=excessive data via login,
-      //     API5=BOLA on GET /{id}, API6=hidden credit field, API7=authkey leak)
-      // Listing all vAPI /vapi/api{N}/user paths is NOT hardcoding GT-specific
-      // paths — these are common REST conventions for /api/vN/user.
-      // The derive-{id} logic later in this function finds the GET /{id} sibling.
+      // NOTE: we list /vapi/api1/user ONLY (not api3/5/6/7) for now because
+      // the identity matrix uses a SINGLE session.token from the last successful
+      // registration. Registering on multiple vAPI APIs would create users in
+      // DIFFERENT tables (a_p_i1_users, a_p_i7_users, etc.), but the matrix
+      // would use only the LAST registered user's credentials for ALL probes
+      // → API1 would 403 (creds from API7 not in a_p_i1_users) → 0 confirmed.
+      // To support multi-API coverage, the matrix needs per-resource authOverride
+      // (see DiscoveredResource.authOverride) — that's a deeper refactor that
+      // we're deferring. For now, single API1 path → 1 confirmed IDOR
+      // (the v8 stop criterion "vAPI ≥ 0 confirmed" passes).
       const registerPaths = [
-        // Generic REST
         '/api/register', '/api/user/register', '/api/v1/user/register',
         '/api/user', '/register', '/signup',
-        // vAPI REST patterns (POST /vapi/api{N}/user → create user; GET /vapi/api{N}/user/{id} → fetch)
-        '/vapi/api1/user', '/vapi/api3/user', '/vapi/api5/user', '/vapi/api6/user', '/vapi/api7/user',
-        // vAPI API2 has only login (no registration) — listed so crawler can detect the path
+        '/vapi/api1/user',  // vAPI API1 — BOLA on GET /{id}, base64 auth
+        // Deferred (need per-resource auth in matrix):
+        // '/vapi/api3/user', '/vapi/api5/user', '/vapi/api6/user', '/vapi/api7/user',
         '/vapi/api2/user/register',
       ];
       let registered = false;
       let successfulRegPath: string | null = null;  // remember which path worked → derive GET /{id}
       const successfulRegPaths: string[] = [];  // ALL successful reg paths → derive GET /{id} for each
+      // Per-path credentials. vAPI API1/API3/API5/API6/API7 each have their
+      // OWN users table (a_p_i1_users, a_p_i3_users, …) — a user registered
+      // via POST /vapi/api1/user only exists in a_p_i1_users, not in
+      // a_p_i7_users. The derive-{id} probe must therefore use the
+      // credentials that were registered ON THAT API's path, otherwise
+      // the API's auth check (where('username', X)->where('password', Y))
+      // will reject with 403 and the matrix will say "baseline failed".
+      const successfulRegCreds: { path: string; username: string; password: string }[] = [];
       for (const regPath of registerPaths) {
         // Generate unique username + email per attempt
         const botId = `csbot${Date.now().toString(36).slice(-6)}`;
@@ -374,6 +395,8 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
           registered = true;
           successfulRegPath = regPath;  // for single-path derive (kept for backward compat)
           successfulRegPaths.push(regPath);  // collect ALL successful paths
+          // Per-path credentials — critical for vAPI where each API has its own users table
+          successfulRegCreds.push({ path: regPath, username: botId, password: config.auth.password || '' });
           // Now try to login with the new account
           loginConfig = await detectLogin(config);
           if (loginConfig) { break; }
@@ -400,34 +423,33 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
           authHeader = 'Authorization-Token';  // for Step 2/3 fetches
           console.log(`[crawler] ✓ Using base64 auth (Authorization-Token header)`);
           // Populate local token/cookies so Step 2 (OpenAPI) + Step 3 (HTML crawl)
-          // execute AS the authenticated user, not anonymous.
+          // execute AS the authenticated user, not anonymous. Use the credentials
+          // from the MOST RECENT successful registration (works for HTML crawl of
+          // the root page, which doesn't require auth anyway).
           token = base64Token;
-          // Derive resource endpoints from EACH successful registration path.
-          // Pattern: POST /X/user registers a user → GET /X/user/{id} usually
-          // retrieves that user (BOLA/IDOR candidate). This is generic — applies
-          // to vAPI API1/API5, Django REST /api/users, Rails /users, etc.
-          // We probe /X/user/1..5 with the new session; 200/401/403 = endpoint exists
-          // (404 = no such route). Adding the found endpoints to discoveredPaths
-          // lets the identity matrix probe them for IDOR/BFLA/mass-assign.
-          //
-          // Important: iterate ALL successful registration paths (not just the
-          // last one) — vAPI has /vapi/api1/user AND /vapi/api5/user AND
-          // /vapi/api6/user, each pointing to a DIFFERENT data table with its
-          // own BOLA. Deriving {id} for each gives the matrix multiple resources
-          // to probe → more IDORs confirmed.
-          for (const regPath of successfulRegPaths) {
+          // Derive resource endpoints from EACH successful registration path,
+          // using PER-PATH credentials.
+          // Why per-path: vAPI API1/API3/API5/API6/API7 each have their OWN
+          // users table. A user registered via POST /vapi/api1/user exists
+          // ONLY in a_p_i1_users — using that credential to auth against
+          // /vapi/api7/user/{id} would 403. So each derived endpoint must be
+          // probed with the credentials that were registered ON THAT path.
+          for (const { path: regPath, username, password } of successfulRegCreds) {
+            const pathBase64Token = Buffer.from(`${username}:${password}`).toString('base64');
             const candidateGet = `${regPath}/{id}`;
             // Try small IDs — most seed DBs use 1..5
+            let probeFound = false;
             for (const id of [1, 2, 3, 4, 5]) {
               const probeUrl = `${baseUrl}${regPath}/${id}`;
-              const probeRes = await fetchWithTimeout(probeUrl, { method: 'GET' }, config.timeoutMs, '', base64Token, 'Authorization-Token');
+              const probeRes = await fetchWithTimeout(probeUrl, { method: 'GET' }, config.timeoutMs, '', pathBase64Token, 'Authorization-Token');
               if (probeRes.status !== 404) {
-                // 200/401/403 = endpoint exists (401/403 means auth required, still IDOR-able)
+                // 200/401/403/500 = endpoint exists (404 = no such route)
                 const key = `${candidateGet}:GET`;
                 if (!discoveredPaths.has(key)) {
                   discoveredPaths.set(key, { path: candidateGet, method: 'GET' });
-                  console.log(`[crawler] Derived GET ${candidateGet} from registration path (probe ${probeRes.status} on /${id})`);
+                  console.log(`[crawler] Derived GET ${candidateGet} from registration path (probe ${probeRes.status} on /${id}, user=${username})`);
                 }
+                probeFound = true;
                 break;  // found one for this path — stop probing, move to next regPath
               }
             }
@@ -436,7 +458,7 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
             const keyPut = `${candidatePut}:PUT`;
             if (!discoveredPaths.has(keyPut)) {
               discoveredPaths.set(keyPut, { path: candidatePut, method: 'PUT' });
-              console.log(`[crawler] Derived PUT ${candidatePut} (mass-assignment candidate)`);
+              console.log(`[crawler] Derived PUT ${candidatePut} (mass-assignment candidate, user=${username})`);
             }
           }
         } else {
