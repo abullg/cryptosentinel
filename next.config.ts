@@ -48,10 +48,18 @@ const nextConfig: NextConfig = {
           { key: 'X-Content-Type-Options', value: 'nosniff' },
           { key: 'Referrer-Policy', value: 'strict-origin-when-cross-origin' },
           { key: 'Permissions-Policy', value: 'camera=(), microphone=(), geolocation=()' },
-          {
-            key: 'Strict-Transport-Security',
-            value: 'max-age=31536000; includeSubDomains; preload',
-          },
+          // NOTE: Strict-Transport-Security (HSTS) intentionally REMOVED.
+          // The VPS currently serves the app over plain HTTP on port 3000
+          // (no TLS, no domain, no Caddy in front). Sending HSTS over HTTP
+          // is harmless per spec, BUT once any browser ever tries HTTPS
+          // for the IP (Chrome HTTPS-First Mode, a stray redirect, an
+          // accidental https:// prefix), it stores the policy for a year
+          // and silently rewrites every http://IP:3000 to https://IP:3000,
+          // which has no listener → ERR_CONNECTION_REFUSED. Result: the
+          // user types the correct IP and the site "doesn't load".
+          // Re-add HSTS ONLY after putting Caddy/nginx with TLS in front
+          // (real domain + Let's Encrypt). For plain-HTTP IP access,
+          // HSTS is actively harmful.
           { key: 'Cache-Control', value: 'no-store, no-cache, must-revalidate, max-age=0' },
           { key: 'Pragma', value: 'no-cache' },
           { key: 'Expires', value: '0' },

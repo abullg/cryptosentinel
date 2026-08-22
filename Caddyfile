@@ -14,28 +14,29 @@
 #     There is no legitimate use case for this in production.
 
 :81 {
-	# Standard reverse proxy to the Next.js standalone server.
-	reverse_proxy localhost:3000 {
-		header_up Host {host}
-		header_up X-Forwarded-For {remote_host}
-		header_up X-Forwarded-Proto {scheme}
-		header_up X-Real-IP {remote_host}
-	}
+        # Standard reverse proxy to the Next.js standalone server.
+        reverse_proxy localhost:3000 {
+                header_up Host {host}
+                header_up X-Forwarded-For {remote_host}
+                header_up X-Forwarded-Proto {scheme}
+                header_up X-Real-IP {remote_host}
+        }
 
-	# Security headers (defense in depth — also set in next.config.ts)
-	header {
-		X-Frame-Options "DENY"
-		X-Content-Type-Options "nosniff"
-		Referrer-Policy "strict-origin-when-cross-origin"
-		Permissions-Policy "camera=(), microphone=(), geolocation=()"
-		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
-	}
+        # Security headers (defense in depth — also set in next.config.ts)
+        # NOTE: HSTS intentionally REMOVED — see next.config.ts for rationale.
+        # Only re-add when serving HTTPS on :443 with a real domain + LE cert.
+        header {
+                X-Frame-Options "DENY"
+                X-Content-Type-Options "nosniff"
+                Referrer-Policy "strict-origin-when-cross-origin"
+                Permissions-Policy "camera=(), microphone=(), geolocation=()"
+        }
 
-	# Long timeout for AI streaming (analyze-stream uses SSE)
-	# Caddy default is 0 (no timeout) for streaming, but set explicit
-	# timeouts for normal requests to avoid hanging connections.
-	transport {
-		read_timeout 5m
-		write_timeout 5m
-	}
+        # Long timeout for AI streaming (analyze-stream uses SSE)
+        # Caddy default is 0 (no timeout) for streaming, but set explicit
+        # timeouts for normal requests to avoid hanging connections.
+        transport {
+                read_timeout 5m
+                write_timeout 5m
+        }
 }
