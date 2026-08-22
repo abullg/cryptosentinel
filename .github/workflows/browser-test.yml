@@ -22,6 +22,7 @@ jobs:
           const ctx = await browser.newContext({
             ignoreHTTPSErrors: true,
             bypassCSP: true,
+            viewport: { width: 1400, height: 900 },
           });
           const page = await ctx.newPage();
 
@@ -44,21 +45,33 @@ jobs:
           for (const url of targets) {
             console.log(`\n========== ${url} ==========`);
             try {
-              const resp = await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
+              // Use 'domcontentloaded' instead of 'networkidle' —
+              // the page has background polling that never lets the
+              // network go idle, so 'networkidle' times out.
+              const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
               console.log(`HTTP: ${resp?.status()} ${resp?.statusText()}`);
               console.log(`URL after nav: ${page.url()}`);
-              console.log(`Title: ${await page.title()}`);
 
-              // Check the body content
-              const bodyText = await page.evaluate(() => document.body.innerText.slice(0, 500));
-              console.log(`Body text (first 500): ${bodyText.replace(/\n/g, ' | ')}`);
+              // Screenshot IMMEDIATELY — before any timeout
+              const fname1 = url.replace(/[^a-z0-9]/gi, '_') + '_dom.png';
+              await page.screenshot({ path: fname1, fullPage: false });
+              console.log(`DOM screenshot saved: ${fname1}`);
+
+              // Wait for hydration (5s)
+              await page.waitForTimeout(5000);
+
+              const title = await page.title();
+              console.log(`Title (after 5s wait): ${title}`);
+
+              const bodyText = await page.evaluate(() => document.body.innerText.slice(0, 800));
+              console.log(`Body text (first 800): ${bodyText.replace(/\n/g, ' | ')}`);
 
               const bodyLen = await page.evaluate(() => document.body.innerHTML.length);
               console.log(`Body HTML length: ${bodyLen}`);
 
               // Check what tabs/buttons are visible
-              const tabs = await page.$$eval('[role="tab"], button', els => els.slice(0, 10).map(e => e.textContent?.trim().slice(0, 30)));
-              console.log(`First 10 buttons/tabs: ${JSON.stringify(tabs)}`);
+              const tabs = await page.$$eval('[role="tab"], button', els => els.slice(0, 15).map(e => (e.textContent?.trim() || '').slice(0, 30)).filter(Boolean));
+              console.log(`First 15 buttons/tabs: ${JSON.stringify(tabs)}`);
 
               // Check for the Auto-Reg panel
               const autoRegText = await page.evaluate(() => {
@@ -68,12 +81,27 @@ jobs:
               });
               console.log(`Auto-Reg panel: ${autoRegText}`);
 
-              // Screenshot
-              const fname = url.replace(/[^a-z0-9]/gi, '_') + '.png';
-              await page.screenshot({ path: fname, fullPage: false });
-              console.log(`Screenshot saved: ${fname}`);
+              // Check for cyber-grid background (new UI marker)
+              const hasCyberGrid = await page.evaluate(() => {
+                const root = document.querySelector('div');
+                if (!root) return 'no root div';
+                const style = window.getComputedStyle(root);
+                return `bg: ${style.backgroundColor}, color: ${style.color}`;
+              });
+              console.log(`Root style: ${hasCyberGrid}`);
+
+              // Screenshot AFTER hydration
+              const fname2 = url.replace(/[^a-z0-9]/gi, '_') + '_hydrated.png';
+              await page.screenshot({ path: fname2, fullPage: false });
+              console.log(`Hydrated screenshot saved: ${fname2}`);
             } catch (e) {
-              console.log(`ERROR: ${String(e).slice(0, 300)}`);
+              console.log(`ERROR: ${String(e).slice(0, 500)}`);
+              // Still try to screenshot the error state
+              try {
+                const ferr = url.replace(/[^a-z0-9]/gi, '_') + '_error.png';
+                await page.screenshot({ path: ferr, fullPage: false });
+                console.log(`Error screenshot saved: ${ferr}`);
+              } catch {}
             }
           }
 
