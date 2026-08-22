@@ -102,10 +102,12 @@ jobs:
           git fetch origin 2>&1 | tail -3
           git reset --hard origin/main 2>&1 | tail -3
           git log --oneline -3
-          echo "=== Rebuild Next.js (git pull updates source, need to recompile .next/) ==="
-          npx next build 2>&1 | tail -5
-          pm2 restart cryptosentinel --update-env 2>&1 | tail -3
-          sleep 5
+          echo "=== Rebuild Next.js (clear cache first!) ==="
+          rm -rf .next
+          npx next build 2>&1 | tail -10
+          pm2 delete cryptosentinel 2>&1 | tail -2 || true
+          pm2 start ecosystem.config.js --env production 2>&1 | tail -3
+          sleep 8
           echo "=== Verify bounty mode code exists ==="
           grep -c "bountyMode" src/app/api/analyze-job/route.ts || echo "bountyMode NOT found in code!"
           echo "=== Verify BOUNTY_MODE env var ==="
