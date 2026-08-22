@@ -93,7 +93,7 @@ async function tryRegister(
   botId: string,
   password: string,
   timeoutMs: number,
-): Promise<RegisteredAccount | null> => {
+): Promise<RegisteredAccount | null> {
   const email = `${botId}@test.local`;
   const jsonBody = JSON.stringify({
     username: botId,
