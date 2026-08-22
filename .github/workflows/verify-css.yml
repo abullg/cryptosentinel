@@ -1,0 +1,44 @@
+name: Verify CSS Bundle
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fetch HTML + extract CSS path + fetch CSS + dump headers
+        run: |
+          set -e
+          BASE="http://187.77.181.127"
+
+          echo "=== 1. HTML response headers (port 80) ==="
+          curl -sI --max-time 10 "$BASE/" 2>&1 | head -25
+
+          echo ""
+          echo "=== 2. HTML response headers (port 3000 direct) ==="
+          curl -sI --max-time 10 "$BASE:3000/" 2>&1 | head -25
+
+          echo ""
+          echo "=== 3. Extract CSS bundle path from HTML ==="
+          CSS_PATH=$(curl -s --max-time 10 "$BASE/" 2>&1 | grep -oE 'href="/_next/static/chunks/[^"]*\.css"' | head -1 | sed 's/href="//;s/"//')
+          echo "CSS path: $CSS_PATH"
+
+          echo ""
+          echo "=== 4. Fetch CSS bundle headers (does it 200?) ==="
+          curl -sI --max-time 10 "$BASE$CSS_PATH" 2>&1 | head -15
+
+          echo ""
+          echo "=== 5. Fetch CSS body (first 200 bytes) ==="
+          curl -s --max-time 10 "$BASE$CSS_PATH" 2>&1 | head -c 200
+          echo ""
+          echo "=== 6. CSS bundle size ==="
+          curl -s --max-time 10 "$BASE$CSS_PATH" 2>&1 | wc -c
+
+          echo ""
+          echo "=== 7. HTML size and ETag ==="
+          curl -sI --max-time 10 "$BASE/" 2>&1 | grep -iE 'content-length|etag|cache-control|strict-transport'
+
+          echo ""
+          echo "=== DONE ==="
