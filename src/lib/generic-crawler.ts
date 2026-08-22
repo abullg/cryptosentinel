@@ -613,11 +613,16 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
   // /swagger/ benefits, not just vAPI. Per Claude v11 P2: "после fetch
   // корня ходить в очевидные docs: /vapi/, /docs, /swagger, /api-docs".
   const universalApiPaths = [
-    '/api', '/api/v1', '/api/me', '/api/users',
-    '/openapi.json', '/swagger.json', '/v3/api-docs', '/api-docs',
-    // Common docs mounts (any app exposing API docs at these gets crawled)
+    // Docs mounts FIRST — these expose API paths via Redoc/Swagger HTML
+    // and are highest-value for generic path discovery. vAPI /vapi/
+    // returns a 1.15MB Redoc page with all 20 API paths as text.
+    // Putting docs first ensures they get crawled even with small
+    // maxPages budgets (analyze-job uses maxPages=10).
     '/vapi/', '/docs/', '/docs', '/swagger/', '/swagger', '/redoc',
-    '/api/docs', '/api-docs/',
+    '/api/docs', '/api-docs/', '/api-docs',
+    // Standard API conventions (lower priority — often 404)
+    '/api', '/api/v1', '/api/me', '/api/users',
+    '/openapi.json', '/swagger.json', '/v3/api-docs',
   ];
   const toVisit: string[] = [
     baseUrl, `${baseUrl}/`, ...universalApiPaths.map(p => `${baseUrl}${p}`),
