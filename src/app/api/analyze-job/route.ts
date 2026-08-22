@@ -990,7 +990,7 @@ async function runAnalysisInBackground(jobId: string, config: {
               // BOUNTY MODE: only test IDOR (GET) — skip mass-assign, BFLA, missing-authn
               // Per Claude: "только GET (IDOR + missing authn), запрет PUT {role:admin}, DELETE"
               // missing_authn is also GET (anonymous GET) — safe for bounty
-              const { runIdentityMatrix } = await import('@/lib/identity-matrix');
+              // runIdentityMatrix is already statically imported at top of file
               const matrixResult = await runIdentityMatrix(bountyConfig);
               const bountyFindings = matrixResult.findings.filter(f => f.confirmed);
               console.log(`[analyze-job]   Bounty matrix: ${bountyFindings.length} confirmed (GET-only IDOR)`);
