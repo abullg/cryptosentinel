@@ -164,9 +164,14 @@ async function runAnalysisInBackground(jobId: string, config: {
   noFallback?: boolean;  // --no-fallback flag: if true, don't fall back to hardcoded oracles
   // Static analysis layer (Claude §8) — gitleaks + sink-hints from /api/fetch-url
   staticAnalysis?: any;
+  // Per Claude v11 §2: bounty mode — header-based sessions + owned resources
+  bountyMode?: boolean;
+  authSessions?: any[];
+  ownedResources?: string[];
 }) {
   const { sourceCode, contractName, targetType, targetUrl, apiKey, model, contractId, auditId,
-          discoveredEndpoints, discoveredForms, discoveredParams, staticAnalysis: sa } = config;
+          discoveredEndpoints, discoveredForms, discoveredParams, staticAnalysis: sa,
+          noFallback, bountyMode, authSessions, ownedResources } = config;
   const isWeb = targetType === 'exchange' || contractName.endsWith('.html');
 
   // ─── IN-MEMORY PROGRESS STATE + FILE-BASED FLUSH ───
