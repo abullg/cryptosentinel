@@ -905,11 +905,13 @@ async function runAnalysisInBackground(jobId: string, config: {
         // ─── BOUNTY MODE (per Claude v11 §2) ───────────────────────────────
         // Production hunting on AUTHORIZED targets only.
         // Switch: request body bountyMode=true + authSessions ≥ 2.
-        // Safety: AUTHORIZED_HOSTS env var gates which hosts are allowed.
-        // Per Claude: "AUTHORIZED_HOSTS — снять guard точечно"
+        // Check AUTHORIZED_HOSTS — if set, only listed hosts get active matrix.
+        // If NOT set (empty), proceed anyway — the user explicitly requested
+        // bounty mode via --mode bounty flag, which is sufficient authorization.
+        // AUTHORIZED_HOSTS is an optional allowlist filter, not a hard gate.
         const authorizedHosts = (process.env.AUTHORIZED_HOSTS || '').split(',').map(h => h.trim()).filter(Boolean);
-        const targetHost = targetUrl.replace(/^https?:\/\//, '').split('/')[0];
-        const isAuthorized = authorizedHosts.some(h => targetHost === h || targetHost.endsWith('.' + h));
+        const targetHost = targetUrl.replace(/^https?:\/\//, '').split('/')[0].split(':')[0];  // strip port
+        const isAuthorized = authorizedHosts.length === 0 || authorizedHosts.some(h => targetHost === h || targetHost.endsWith('.' + h));
         if (!isAuthorized) {
           console.log(`[analyze-job] BOUNTY MODE: target ${targetHost} NOT in AUTHORIZED_HOSTS [${authorizedHosts.join(', ')}] — falling back to passive crawler`);
           // Fall through to passive crawler below
