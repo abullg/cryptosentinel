@@ -786,22 +786,61 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
     }
 
     // Extract JS endpoints (from inline scripts + script srcs)
+    // Per Claude v11 §7: also fetch cross-origin (CDN) JS bundles.
+    // Production SPAs like vvs.finance serve JS from CDN URLs like
+    // https://cdn.example.com/bundle.js — the previous check
+    // (src.startsWith('/') || src.startsWith(baseUrl)) would skip
+    // these, missing the entire API surface hidden in JS.
     const scriptSrcMatches = res.body.matchAll(/<script[^>]*src=["']([^"']+)["']/gi);
     for (const m of scriptSrcMatches) {
       const src = m[1];
-      if (src.startsWith('/') || src.startsWith(baseUrl)) {
-        const jsUrl = src.startsWith('/') ? `${baseUrl}${src}` : src;
-        const jsRes = await fetchWithTimeout(jsUrl, {}, config.timeoutMs, cookies, token, authHeader);
-        if (jsRes.status === 200 && jsRes.body) {
-          result.crawlStats.jsAnalyzed++;
-          const jsEndpoints = extractEndpointsFromJS(jsRes.body, baseUrl);
-          for (const ep of jsEndpoints) {
-            const param = parameterizePath(ep.path);
-            const path = param?.paramPath || ep.path;
-            const key = `${path}:${ep.method}`;
-            if (!discoveredPaths.has(key)) {
-              discoveredPaths.set(key, { path, method: ep.method });
-            }
+      // Resolve relative, absolute, and cross-origin script srcs
+      let jsUrl: string;
+      if (src.startsWith('http://') || src.startsWith('https://')) {
+        // Cross-origin (CDN) — fetch directly (passive, just GET)
+        jsUrl = src;
+      } else if (src.startsWith('//')) {
+        // Protocol-relative — use same protocol as baseUrl
+        jsUrl = `${baseUrl.match(/^https?/)?.[0] || 'https'}:${src}`;
+      } else if (src.startsWith('/')) {
+        // Same-origin absolute path
+        jsUrl = `${baseUrl}${src}`;
+      } else {
+        // Relative path (e.g., src="bundle.js") — resolve against page URL
+        jsUrl = `${baseUrl}/${src}`;
+      }
+      // Skip obvious non-JS srcs (analytics, fonts, etc.)
+      if (jsUrl.match(/\.(png|jpg|gif|svg|ico|css|woff|ttf)(\?|$)/i)) continue;
+
+      const jsRes = await fetchWithTimeout(jsUrl, {}, config.timeoutMs, cookies, token, authHeader);
+      if (jsRes.status === 200 && jsRes.body) {
+        result.crawlStats.jsAnalyzed++;
+        const jsEndpoints = extractEndpointsFromJS(jsRes.body, baseUrl);
+        for (const ep of jsEndpoints) {
+          const param = parameterizePath(ep.path);
+          const path = param?.paramPath || ep.path;
+          const key = `${path}:${ep.method}`;
+          if (!discoveredPaths.has(key)) {
+            discoveredPaths.set(key, { path, method: ep.method });
+          }
+        }
+        // Also run generic text-path extraction on JS body — many
+        // frameworks (React/Vue/Angular) embed API paths as string
+        // constants in bundled JS, not as fetch() calls.
+        const textPathRegex = /\/[a-z][a-z0-9_-]*(?:\/[a-z0-9_{}.-]+){2,5}/gi;
+        const textAssetExt = /\.(png|jpg|jpeg|gif|svg|ico|css|js|html?|woff2?|ttf|eot|map|webp|mp[34])$/i;
+        const textPathMatches = jsRes.body.matchAll(textPathRegex);
+        for (const tm of textPathMatches) {
+          let p = tm[0].replace(/[",;)\]]+$/g, '');
+          if (textAssetExt.test(p)) continue;
+          if (p.includes('://') || p.startsWith('//')) continue;
+          const hasApiMarker = /(?:^|\/)(?:api|vapi|v[0-9])/i.test(p) || /\{[^}]*id[^}]*\}/i.test(p);
+          if (!hasApiMarker) continue;
+          const param = parameterizePath(p);
+          const finalPath = param?.paramPath || p;
+          const key = `${finalPath}:GET`;
+          if (!discoveredPaths.has(key)) {
+            discoveredPaths.set(key, { path: finalPath, method: 'GET' });
           }
         }
       }

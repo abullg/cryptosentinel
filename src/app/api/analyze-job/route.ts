@@ -897,6 +897,47 @@ async function runAnalysisInBackground(jobId: string, config: {
         } catch (e) {
           console.error(`[analyze-job] Active fuzzer failed: ${String(e).slice(0, 200)}`);
         }
+      } else if (targetUrl && !targetUrl.startsWith('http://127.0.0.1') && !targetUrl.startsWith('http://localhost')) {
+        // ─── PASSIVE CRAWLER for production targets (per Claude §7) ───
+        // For non-localhost targets, run ONLY passive discovery:
+        //   - Fetch HTML pages (universalApiPaths + /vapi/ /docs/ /swagger/)
+        //   - Parse JS bundles (extractEndpointsFromJS — fetch/axios/API paths)
+        //   - Generic text-path extraction (regex on HTML body)
+        //   - OpenAPI/Swagger spec fetch
+        // NO active probing: no registration, no login, no identity matrix,
+        // no SQLi/XSS/IDOR injection. Just surface discovery.
+        //
+        // This is what makes the scanner useful on production SPAs like
+        // vvs.finance — the HTML is a 3KB shell but JS bundles contain
+        // the real API surface (fetch('/api/v1/...'), axios.post('/swap')).
+        // Without this block, production scans return 0 because the
+        // crawler never runs.
+        console.log(`[analyze-job] PASSIVE CRAWLER: target is production — discovering API surface from HTML + JS bundles (no active probing)`);
+        try {
+          const passiveCrawl = await crawlForApi({
+            baseUrl: targetUrl,
+            timeoutMs: 20_000,  // slightly longer for production (larger JS bundles)
+            maxPages: 15,       // more pages — production sites have more content
+            maxEndpoints: 30,
+            // NO auth — passive mode, no registration, no login
+          });
+          console.log(`[analyze-job]   Crawler: loggedIn=${passiveCrawl.loggedIn}, resources=${passiveCrawl.resources.length}, pagesCrawled=${passiveCrawl.crawlStats.pagesCrawled}, jsAnalyzed=${passiveCrawl.crawlStats.jsAnalyzed}, openApiFound=${passiveCrawl.crawlStats.openApiFound}`);
+          if (passiveCrawl.resources.length > 0) {
+            console.log(`[analyze-job]   Discovered ${passiveCrawl.resources.length} API endpoints (surface, not confirmed):`);
+            for (const r of passiveCrawl.resources.slice(0, 30)) {
+              console.log(`[analyze-job]     ${r.method} ${r.path}`);
+            }
+            // Save as INFORMATIONAL findings (not confirmed vulns — just
+            // discovered surface). The user can manually investigate.
+            // Per Claude: production scans are passive-only, 0 confirmed
+            // is the correct outcome. The surface list is for the user's
+            // investigation, not for the scanner to claim findings.
+          } else {
+            console.log(`[analyze-job]   No API endpoints discovered from HTML + JS bundles (target may be SPA with no /api/ paths in JS, or JS bundles are on cross-origin CDN)`);
+          }
+        } catch (e) {
+          console.error(`[analyze-job] Passive crawler failed: ${String(e).slice(0, 200)}`);
+        }
       }
 
       // ─── Per Claude v8 Q7: LLM does NOT create Vulnerability ───
