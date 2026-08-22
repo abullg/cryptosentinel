@@ -1,4 +1,4 @@
-name: Verify CSS Bundle
+name: Verify CSS v2
 
 on:
   workflow_dispatch:
@@ -8,37 +8,63 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Fetch HTML + extract CSS path + fetch CSS + dump headers
+      - name: Diagnose CSS 500 on nginx vs Next.js direct
         run: |
-          set -e
+          set +e
           BASE="http://187.77.181.127"
 
-          echo "=== 1. HTML response headers (port 80) ==="
-          curl -sI --max-time 10 "$BASE/" 2>&1 | head -25
-
-          echo ""
-          echo "=== 2. HTML response headers (port 3000 direct) ==="
-          curl -sI --max-time 10 "$BASE:3000/" 2>&1 | head -25
-
-          echo ""
-          echo "=== 3. Extract CSS bundle path from HTML ==="
-          CSS_PATH=$(curl -s --max-time 10 "$BASE/" 2>&1 | grep -oE 'href="/_next/static/chunks/[^"]*\.css"' | head -1 | sed 's/href="//;s/"//')
+          echo "=== 1. Fetch HTML from port 80 + extract asset paths ==="
+          HTML80=$(curl -s --max-time 10 "$BASE/")
+          CSS_PATH=$(echo "$HTML80" | grep -oE 'href="/_next/static/chunks/[^"]*\.css"' | head -1 | sed 's/href="//;s/"//')
+          JS_PATH=$(echo "$HTML80" | grep -oE 'src="/_next/static/chunks/[^"]*\.js"' | head -1 | sed 's/src="//;s/"//')
           echo "CSS path: $CSS_PATH"
+          echo "JS  path: $JS_PATH"
 
           echo ""
-          echo "=== 4. Fetch CSS bundle headers (does it 200?) ==="
-          curl -sI --max-time 10 "$BASE$CSS_PATH" 2>&1 | head -15
-
-          echo ""
-          echo "=== 5. Fetch CSS body (first 200 bytes) ==="
+          echo "=== 2. CSS via nginx port 80 ==="
+          curl -sI --max-time 10 "$BASE$CSS_PATH" 2>&1 | head -5
+          echo "  body (200 bytes):"
           curl -s --max-time 10 "$BASE$CSS_PATH" 2>&1 | head -c 200
           echo ""
-          echo "=== 6. CSS bundle size ==="
-          curl -s --max-time 10 "$BASE$CSS_PATH" 2>&1 | wc -c
+          echo "  size: $(curl -s --max-time 10 "$BASE$CSS_PATH" 2>&1 | wc -c)"
 
           echo ""
-          echo "=== 7. HTML size and ETag ==="
-          curl -sI --max-time 10 "$BASE/" 2>&1 | grep -iE 'content-length|etag|cache-control|strict-transport'
+          echo "=== 3. CSS via Next.js direct port 3000 ==="
+          curl -sI --max-time 10 "$BASE:3000$CSS_PATH" 2>&1 | head -5
+          echo "  body (200 bytes):"
+          curl -s --max-time 10 "$BASE:3000$CSS_PATH" 2>&1 | head -c 200
+          echo ""
+          echo "  size: $(curl -s --max-time 10 "$BASE:3000$CSS_PATH" 2>&1 | wc -c)"
+
+          echo ""
+          echo "=== 4. JS via nginx port 80 ==="
+          curl -sI --max-time 10 "$BASE$JS_PATH" 2>&1 | head -5
+          echo "  size: $(curl -s --max-time 10 "$BASE$JS_PATH" 2>&1 | wc -c)"
+
+          echo ""
+          echo "=== 5. JS via Next.js direct port 3000 ==="
+          curl -sI --max-time 10 "$BASE:3000$JS_PATH" 2>&1 | head -5
+          echo "  size: $(curl -s --max-time 10 "$BASE:3000$JS_PATH" 2>&1 | wc -c)"
+
+          echo ""
+          echo "=== 6. HTML HEAD via port 80 + port 3000 (compare ETag) ==="
+          curl -sI --max-time 10 "$BASE/" 2>&1 | grep -iE 'etag|content-length'
+          curl -sI --max-time 10 "$BASE:3000/" 2>&1 | grep -iE 'etag|content-length'
+
+          echo ""
+          echo "=== 7. PM2 status (is the process alive?) ==="
+          # Can't directly SSH from here; check via API
+          curl -s --max-time 5 "$BASE/api/admin?action=status" 2>&1 | head -c 500
+          echo ""
+
+          echo ""
+          echo "=== 8. Try the SECOND css path (there may be 2 css bundles) ==="
+          echo "$HTML80" | grep -oE 'href="/_next/static/chunks/[^"]*\.css"' | head -5
+
+          echo ""
+          echo "=== 9. Check nginx error log (via /api/admin if accessible) ==="
+          curl -s --max-time 5 "$BASE/api/admin?action=logs&lines=20" 2>&1 | head -c 1000
+          echo ""
 
           echo ""
           echo "=== DONE ==="
