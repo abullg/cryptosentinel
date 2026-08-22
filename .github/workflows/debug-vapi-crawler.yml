@@ -54,7 +54,11 @@ jobs:
           echo ""
           echo "=== Running hunt.mjs on vAPI (--no-fallback) ==="
           cd /opt/cryptosentinel
-          GT_ALLOWLIST_ENABLED=true timeout 90 node scripts/hunt.mjs \
+          # Flush PM2 logs FIRST so the buffer only has fresh output from
+          # this hunt.mjs run (otherwise 600 lines of old logs push out
+          # the new ones).
+          pm2 flush cryptosentinel 2>&1 | tail -2
+          GT_ALLOWLIST_ENABLED=true timeout 120 node scripts/hunt.mjs \
             --url http://127.0.0.1:3011/ \
             --auth '{"username":"user","password":"user"}' \
             --auth '{"username":"alice","password":"alice"}' \
@@ -62,6 +66,6 @@ jobs:
 
           # Show PM2 logs for the analyze-job that hunt.mjs triggered
           echo ""
-          echo "=== PM2 logs (last 600 lines, filtered) ==="
-          pm2 logs cryptosentinel --lines 600 --nostream 2>&1 | grep -E "crawler|matrix|analyze-job|register|login|derived|base64|vapi|api[0-9]|IDOR|BFLA|mass|CONFIRMED|sensitive|course|flag\{|baseline" | tail -200
+          echo "=== PM2 logs (last 400 lines, flushed before hunt) ==="
+          pm2 logs cryptosentinel --lines 400 --nostream 2>&1 | grep -E "crawler|matrix|analyze-job|register|login|derived|base64|vapi|api[0-9]|IDOR|BFLA|mass|CONFIRMED|sensitive|course|flag\{|baseline|Step 3|HTML text|DISCOVERED|fail closed|No login|continuing unauthenticated|Found.*path" | tail -200
           REMOTE_EOF
