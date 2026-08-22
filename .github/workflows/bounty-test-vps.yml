@@ -107,8 +107,8 @@ jobs:
             --no-fallback 2>&1 || echo "hunt.mjs exited non-zero"
 
           echo ""
-          echo "=== Step 7: PM2 logs (bounty mode telemetry) ==="
-          pm2 logs cryptosentinel --lines 300 --nostream 2>&1 | grep -iE "BOUNTY|authorized|bounty|session|owned|matrix|confirmed|IDOR|PASSIVE|CRAWLER|auth\.A|auth\.B|first.party|login|Step 3.5|crawlForApi|Discovered|resource" | tail -80
+          echo "=== Step 7: PM2 logs (RAW, no grep — show everything) ==="
+          pm2 logs cryptosentinel --lines 100 --nostream --raw 2>&1 | tail -60
 
           echo ""
           echo "=== Cleanup: remove BOUNTY_MODE from PM2 env ==="
