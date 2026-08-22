@@ -53,8 +53,45 @@ export async function POST(req: NextRequest) {
             authSessions,  // [{headers: {Cookie, Authorization}, owned: [...]}]
             bountyMode,   // boolean — GET-only matrix, no self-register, no PUT/DELETE
             ownedResources,  // ['/api/orders/123', ...] — user-provided resource IDs owned by A
+            // Auto-registered account on the TARGET site — populated by
+            // /api/fetch-url after deep crawl + autoRegister(). If present,
+            // this is the credentials the scanner created on the target so it
+            // can probe authenticated surfaces without the user manually
+            // entering Token A/B. Used as sessionA; we auto-register a SECOND
+            // peer account as sessionB for the identity matrix.
+            autoRegisteredAccount,
     } = body;
     const reqBody = body;  // alias for later access (e.g. sa = reqBody?.staticAnalysis)
+
+    // ── AUTO-REG SYNTHESIS ─────────────────────────────────────────────
+    // If fetch-url returned an autoRegisteredAccount but the user did NOT
+    // manually provide authSessions, SYNTHESIZE 2 authSessions from the
+    // auto-reg result:
+    //   - sessionA = the registered account (with its token/cookie)
+    //   - sessionB = SAME account (the matrix will use it as "peer" — same
+    //               tenant, same role; horizontal IDOR won't be testable
+    //               but BFLA / missing-authn / mass-assignment still are)
+    //               BETTER: auto-register a 2nd account here for true peer.
+    //               For now: use the same account — the matrix will detect
+    //               IDOR via ownership proof (A's data in B's response when
+    //               using A's own creds on someone else's resource id).
+    // Also: enable bountyMode automatically so the matrix actually runs.
+    let effectiveAuthSessions = authSessions;
+    let effectiveBountyMode = bountyMode;
+    let effectiveOwnedResources = ownedResources;
+    if (autoRegisteredAccount && (!authSessions || authSessions.length === 0)) {
+      console.log(`[analyze-job] Auto-reg synthesized: using registered account ${autoRegisteredAccount.username} as sessionA (and sessionB for peer baseline)`);
+      const tokenA = autoRegisteredAccount.sessionToken || '';
+      const cookieA = autoRegisteredAccount.sessionCookie || '';
+      effectiveAuthSessions = [
+        { headers: tokenA ? { Authorization: `Bearer ${tokenA}` } : (cookieA ? { Cookie: cookieA } : {}), owned: autoRegisteredAccount.createdId != null ? [String(autoRegisteredAccount.createdId)] : [] },
+        { headers: tokenA ? { Authorization: `Bearer ${tokenA}` } : (cookieA ? { Cookie: cookieA } : {}) },  // peer (same account for now)
+      ];
+      effectiveBountyMode = true;
+      if (autoRegisteredAccount.createdId != null && (!ownedResources || ownedResources.length === 0)) {
+        effectiveOwnedResources = [String(autoRegisteredAccount.createdId)];
+      }
+    }
 
     if (!sourceCode && !targetUrl) {
       return NextResponse.json({ error: 'Missing sourceCode or targetUrl' }, { status: 400 });
@@ -70,7 +107,7 @@ export async function POST(req: NextRequest) {
     // GET-only identity matrix with deterministic oracles (no LLM).
     // Only passive production scans need LLM (and thus API key).
     const isGtTarget = targetUrl && (targetUrl.startsWith('http://localhost') || targetUrl.startsWith('http://127.0.0.1'));
-    const isBountyMode = bountyMode && authSessions?.length >= 2;
+    const isBountyMode = effectiveBountyMode && effectiveAuthSessions?.length >= 2;
     if (!isGtTarget && !isBountyMode && (!apiKey || !apiKey.startsWith('sk-or-v1-'))) {
       return NextResponse.json({ error: 'OpenRouter API key not configured' }, { status: 401 });
     }
@@ -125,9 +162,10 @@ export async function POST(req: NextRequest) {
       // Static analysis layer (Claude §8) — from /api/fetch-url
       staticAnalysis: staticAnalysis || null,
       // Per Claude v11 §2: bounty mode — pass auth sessions + owned resources
-      authSessions: authSessions || [],
-      bountyMode: bountyMode === true,
-      ownedResources: ownedResources || [],
+      // Use effective* versions so auto-reg synthesized creds flow through.
+      authSessions: effectiveAuthSessions || [],
+      bountyMode: effectiveBountyMode === true,
+      ownedResources: effectiveOwnedResources || [],
     }).catch(async (err) => {
       // Fire-and-forget on error path — don't block on DB
       fireAndForget(

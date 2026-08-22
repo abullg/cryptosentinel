@@ -93,7 +93,7 @@ function usePersistedState<T>(key: string, defaultValue: T) {
 // Activity Item Type
 interface ActivityItem {
   id: string;
-  type: 'scan' | 'finding' | 'method' | 'system' | 'validation' | 'attack-sim';
+  type: 'scan' | 'finding' | 'method' | 'system' | 'validation' | 'attack-sim' | 'reg';
   message: string;
   detail?: string;
   timestamp: number;
@@ -197,6 +197,14 @@ export default function CryptoSentinelDashboard() {
   const [hackenproofContext, setHackenproofContext] = useState<{description: string; priorities: string; projectName: string} | null>(null);
   const [pocView, setPocView] = useState<{title: string; filename: string; code: string} | null>(null);
   const [pocCopied, setPocCopied] = useState(false);
+  // Auto-registered account on the TARGET — surfaced from /api/fetch-url
+  // response. Null = no registration endpoint found, or scan didn't run.
+  // Used by the "Target Auto-Registration" panel to show username/password/
+  // path/owned-id with copy-to-clipboard buttons. Auto-passed to analyze-job
+  // via startBackgroundAnalysis crawlData arg.
+  const [autoRegInfo, setAutoRegInfo] = useState<any | null>(null);
+  const [showAutoRegPassword, setShowAutoRegPassword] = useState(false);
+  const [copiedField, setCopiedField] = useState<string | null>(null);
   const [validatingVulns, setValidatingVulns] = useState<Set<string>>(new Set());
 
   // ─── ANALYSIS LOCK & ABORT ────────────────────────────────────────────────
@@ -1057,13 +1065,16 @@ export default function CryptoSentinelDashboard() {
     contractName: string,
     targetType: string,
     targetUrl?: string,
-    crawlData?: { discoveredEndpoints?: string[]; discoveredForms?: any[]; discoveredParams?: string[] },
+    crawlData?: { discoveredEndpoints?: string[]; discoveredForms?: any[]; discoveredParams?: string[]; autoRegisteredAccount?: any },
   ) => {
     addActivity('scan', 'Starting background analysis...', 'running', targetUrl || contractName, 5);
 
     // Step 1: Start the job — pass crawl data so analyze-job can run
     // per-endpoint active probes BEFORE AI even starts. This is what
     // "literally search everywhere on the site" means.
+    // ALSO: pass autoRegisteredAccount — if /api/fetch-url auto-registered
+    // an account on the TARGET, the creds flow through to analyze-job's
+    // identity matrix automatically (no manual Token A/B entry needed).
     const res = await fetch('/api/analyze-job', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1072,6 +1083,7 @@ export default function CryptoSentinelDashboard() {
         discoveredEndpoints: crawlData?.discoveredEndpoints || [],
         discoveredForms: crawlData?.discoveredForms || [],
         discoveredParams: crawlData?.discoveredParams || [],
+        autoRegisteredAccount: crawlData?.autoRegisteredAccount || null,
       }),
     });
 
@@ -1253,7 +1265,22 @@ export default function CryptoSentinelDashboard() {
         addActivity('system', `URL content fetched: ${data.sourceCode.length} chars`, 'success', '', 20);
       }
 
-      // Start background analysis with fetched code + crawl data
+      // ── AUTO-REGISTRATION INFO ────────────────────────────────────────
+      // If the auto-registrar on the server succeeded, surface it to the
+      // user as a prominent activity + store it for the auto-reg panel.
+      if (data.autoRegisteredAccount) {
+        const acct = data.autoRegisteredAccount;
+        setAutoRegInfo(acct);
+        const idStr = acct.createdId != null ? `, owned id=${acct.createdId}` : '';
+        const tokenStr = acct.sessionToken ? ' [token]' : '';
+        const cookieStr = acct.sessionCookie ? ' [cookie]' : '';
+        addActivity('reg', `Auto-registered: ${acct.username} via POST ${acct.regPath}${idStr}${tokenStr}${cookieStr}`, 'success', `password: ${acct.password}`, 25);
+      } else {
+        setAutoRegInfo(null);
+        addActivity('reg', 'Auto-registration: no register endpoint found on target', 'info', 'Anonymous scan only', 25);
+      }
+
+      // Start background analysis with fetched code + crawl data + auto-reg
       const apiType = targetType === 'hackenproof' ? 'contract' : targetType;
       await startBackgroundAnalysis(
         data.sourceCode,
@@ -1264,6 +1291,7 @@ export default function CryptoSentinelDashboard() {
           discoveredEndpoints: data.discoveredEndpoints,
           discoveredForms: data.discoveredForms,
           discoveredParams: data.discoveredParams,
+          autoRegisteredAccount: data.autoRegisteredAccount,
         },
       );
       addActivity('scan', 'URL analysis complete', 'success', 'Done', 100);
@@ -1402,23 +1430,40 @@ export default function CryptoSentinelDashboard() {
   const avgConfidence = validatedVulns.length > 0 ? validatedVulns.reduce((s, v) => s + v.confidence, 0) / validatedVulns.length : 0;
 
   return (
-    <div className="min-h-screen bg-white text-slate-900">
-      {/* Header */}
-      <header className="border-b border-slate-200 bg-white sticky top-0 z-50">
+    <div className="min-h-screen bg-zinc-950 text-zinc-100 dark">
+      {/* Cyber grid background overlay */}
+      <div className="fixed inset-0 pointer-events-none opacity-[0.03] z-0"
+           style={{ backgroundImage: 'linear-gradient(rgba(34, 197, 94, 0.4) 1px, transparent 1px), linear-gradient(90deg, rgba(34, 197, 94, 0.4) 1px, transparent 1px)', backgroundSize: '40px 40px' }} />
+
+      {/* Header — cyber dark with neon accent line */}
+      <header className="border-b border-zinc-800 bg-zinc-950/95 backdrop-blur sticky top-0 z-50 relative">
+        <div className="absolute inset-x-0 bottom-0 h-px bg-gradient-to-r from-transparent via-emerald-500/60 to-transparent" />
         <div className="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-lg bg-emerald-600 flex items-center justify-center">
-              <Shield className="w-5 h-5 text-white" />
+            <div className="w-9 h-9 rounded-lg bg-gradient-to-br from-emerald-500 to-cyan-500 flex items-center justify-center shadow-lg shadow-emerald-500/30">
+              <Shield className="w-5 h-5 text-zinc-950" />
             </div>
             <div>
-              <h1 className="text-lg font-bold tracking-tight">CryptoSentinel</h1>
-              <p className="text-xs text-slate-500">Autonomous AI Vulnerability Scanner — OpenRouter</p>
+              <h1 className="text-lg font-bold tracking-tight text-zinc-100">
+                Crypto<span className="text-emerald-400">Sentinel</span>
+              </h1>
+              <p className="text-[11px] text-zinc-500 font-mono">Autonomous AI Vulnerability Scanner</p>
             </div>
+            {/* Auto-Registration status pill */}
+            {autoRegInfo ? (
+              <Badge variant="outline" className="ml-2 text-emerald-400 border-emerald-500/50 bg-emerald-500/10 font-mono text-[10px] animate-pulse">
+                <CheckCircle2 className="w-3 h-3 mr-1" /> Auto-Reg: {autoRegInfo.username}
+              </Badge>
+            ) : (
+              <Badge variant="outline" className="ml-2 text-zinc-600 border-zinc-700 bg-zinc-900 font-mono text-[10px]">
+                <Lock className="w-3 h-3 mr-1" /> Auto-Reg: idle
+              </Badge>
+            )}
           </div>
           <div className="flex items-center gap-2">
-            <Badge variant="outline" className={hasKey ? 'text-emerald-600 border-emerald-300' : 'text-amber-600 border-amber-300'}>
+            <Badge variant="outline" className={hasKey ? 'text-emerald-400 border-emerald-500/40 bg-emerald-500/10' : 'text-amber-400 border-amber-500/40 bg-amber-500/10'}>
               {hasKey ? <Wifi className="w-3 h-3 mr-1" /> : <WifiOff className="w-3 h-3 mr-1" />}
-              {hasKey ? `${model.split('/').pop()} Active` : 'No API Key'}
+              {hasKey ? `${model.split('/').pop()}` : 'No API Key'}
             </Badge>
             {/* Activity Feed Toggle */}
             <Button size="sm" variant="outline" onClick={() => setShowActivity(!showActivity)} className="relative">
@@ -1556,22 +1601,22 @@ export default function CryptoSentinelDashboard() {
         </div>
       </header>
 
-      <main className="max-w-7xl mx-auto px-4 py-6">
+      <main className="max-w-7xl mx-auto px-4 py-6 relative z-10">
         {/* Stats — three-state verdict model */}
         <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-6">
           {[
-            { label: 'Total Findings', value: validatedVulns.length, icon: Bug, color: 'text-amber-600' },
-            { label: 'Exploitable', value: exploitableVulns.length, icon: CheckCircle2, color: 'text-emerald-600' },
-            { label: 'Not Exploitable', value: notExploitableVulns.length, icon: XCircle, color: 'text-red-600' },
-            { label: 'Inconclusive', value: inconclusiveVulns.length, icon: Clock, color: 'text-yellow-600' },
-            { label: 'Critical', value: criticalVulns.length, icon: AlertTriangle, color: 'text-red-600' },
+            { label: 'Total Findings', value: validatedVulns.length, icon: Bug, color: 'text-amber-400' },
+            { label: 'Exploitable', value: exploitableVulns.length, icon: CheckCircle2, color: 'text-emerald-400' },
+            { label: 'Not Exploitable', value: notExploitableVulns.length, icon: XCircle, color: 'text-red-400' },
+            { label: 'Inconclusive', value: inconclusiveVulns.length, icon: Clock, color: 'text-yellow-400' },
+            { label: 'Critical', value: criticalVulns.length, icon: AlertTriangle, color: 'text-red-400' },
           ].map((s, i) => (
-            <Card key={i} className="border-slate-200">
+            <Card key={i} className="bg-zinc-900/70 border-zinc-800 backdrop-blur">
               <CardContent className="p-4 flex items-center gap-3">
-                <s.icon className={`w-8 h-8 ${s.color} opacity-80`} />
+                <s.icon className={`w-8 h-8 ${s.color}`} />
                 <div>
-                  <p className="text-xs text-slate-500">{s.label}</p>
-                  <p className="text-xl font-bold">{s.value}</p>
+                  <p className="text-xs text-zinc-500 font-mono">{s.label}</p>
+                  <p className="text-xl font-bold text-zinc-100">{s.value}</p>
                 </div>
               </CardContent>
             </Card>
@@ -1580,13 +1625,13 @@ export default function CryptoSentinelDashboard() {
 
         {/* Tabs */}
         <Tabs defaultValue="dashboard" className="space-y-4">
-          <TabsList className="w-full md:w-auto">
-            <TabsTrigger value="dashboard"><Activity className="w-4 h-4 mr-1" /> Dashboard</TabsTrigger>
-            <TabsTrigger value="analyze"><Search className="w-4 h-4 mr-1" /> Analyze</TabsTrigger>
-            <TabsTrigger value="findings"><Bug className="w-4 h-4 mr-1" /> Findings</TabsTrigger>
-            <TabsTrigger value="memory"><Brain className="w-4 h-4 mr-1" /> Memory</TabsTrigger>
-            <TabsTrigger value="pipeline"><Zap className="w-4 h-4 mr-1" /> Pipeline</TabsTrigger>
-            <TabsTrigger value="admin"><Terminal className="w-4 h-4 mr-1" /> Admin</TabsTrigger>
+          <TabsList className="bg-zinc-900/70 border border-zinc-800">
+            <TabsTrigger value="dashboard" className="data-[state=active]:bg-emerald-500/20 data-[state=active]:text-emerald-300 text-zinc-400"><Activity className="w-4 h-4 mr-1" /> Dashboard</TabsTrigger>
+            <TabsTrigger value="analyze" className="data-[state=active]:bg-emerald-500/20 data-[state=active]:text-emerald-300 text-zinc-400"><Search className="w-4 h-4 mr-1" /> Analyze</TabsTrigger>
+            <TabsTrigger value="findings" className="data-[state=active]:bg-emerald-500/20 data-[state=active]:text-emerald-300 text-zinc-400"><Bug className="w-4 h-4 mr-1" /> Findings</TabsTrigger>
+            <TabsTrigger value="memory" className="data-[state=active]:bg-emerald-500/20 data-[state=active]:text-emerald-300 text-zinc-400"><Brain className="w-4 h-4 mr-1" /> Memory</TabsTrigger>
+            <TabsTrigger value="pipeline" className="data-[state=active]:bg-emerald-500/20 data-[state=active]:text-emerald-300 text-zinc-400"><Zap className="w-4 h-4 mr-1" /> Pipeline</TabsTrigger>
+            <TabsTrigger value="admin" className="data-[state=active]:bg-emerald-500/20 data-[state=active]:text-emerald-300 text-zinc-400"><Terminal className="w-4 h-4 mr-1" /> Admin</TabsTrigger>
           </TabsList>
 
           {/* Dashboard */}
@@ -1699,17 +1744,17 @@ export default function CryptoSentinelDashboard() {
                 </CardContent>
               </Card>
 
-              <Card className="border-slate-200">
+              <Card className="border-zinc-800 bg-zinc-900/70 backdrop-blur">
                 <CardHeader>
-                  <CardTitle>Analyze Target</CardTitle>
-                  <CardDescription>By URL or paste source code — via {model.split('/').pop()}</CardDescription>
+                  <CardTitle className="text-emerald-400">Analyze Target</CardTitle>
+                  <CardDescription className="text-zinc-500">By URL or paste source code — via {model.split('/').pop()}</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-3">
                   {projects.length > 0 && (
                     <div className="space-y-1">
-                      <label className="text-xs text-slate-500">Project <span className="text-slate-400">(auto-selected if empty)</span></label>
+                      <label className="text-xs text-zinc-500">Project <span className="text-zinc-600">(auto-selected if empty)</span></label>
                       <Select value={activeProject || undefined} onValueChange={setActiveProject}>
-                        <SelectTrigger className={activeProject ? '' : 'text-slate-400'}><SelectValue placeholder="Auto-select" /></SelectTrigger>
+                        <SelectTrigger className={activeProject ? '' : 'text-zinc-600'}><SelectValue placeholder="Auto-select" /></SelectTrigger>
                         <SelectContent>
                           {projects.map(p => <SelectItem key={p.id} value={p.id}>{p.name}</SelectItem>)}
                         </SelectContent>
@@ -1718,10 +1763,10 @@ export default function CryptoSentinelDashboard() {
                   )}
 
                   {/* URL Analysis Section */}
-                  <div className="space-y-2 p-3 rounded-lg bg-slate-50 border border-slate-200">
+                  <div className="space-y-2 p-3 rounded-lg bg-zinc-950/60 border border-zinc-800">
                     <div className="flex items-center gap-2">
-                      <Globe className="w-4 h-4 text-blue-600" />
-                      <span className="text-sm font-medium text-slate-700">Analyze by URL</span>
+                      <Globe className="w-4 h-4 text-cyan-400" />
+                      <span className="text-sm font-medium text-zinc-200">Analyze by URL</span>
                     </div>
                     <div className="grid grid-cols-3 gap-2">
                       <Select value={targetType} onValueChange={v => { setTargetType(v as 'contract' | 'exchange' | 'hackenproof'); setFetchError(''); }}>
@@ -1799,6 +1844,145 @@ export default function CryptoSentinelDashboard() {
                       </div>
                     )}
                   </div>
+
+                  {/* ─── TARGET AUTO-REGISTRATION PANEL ─────────────────────────
+                      After /api/fetch-url deep-crawls the target, the auto-registrar
+                      module tries to register an account on the TARGET site using
+                      discovered endpoints (/api/register, /api/users, /signup,
+                      discovered forms with username+password). If success, the
+                      registered creds are surfaced here AND auto-passed to
+                      /api/analyze-job as autoRegisteredAccount — the identity
+                      matrix uses them as sessionA automatically, no manual
+                      Token A/B entry needed. */}
+                  {autoRegInfo ? (
+                    <div className="rounded-lg overflow-hidden border border-emerald-500/40 bg-gradient-to-br from-emerald-950 via-zinc-900 to-zinc-950">
+                      <div className="px-3 py-2 flex items-center justify-between border-b border-emerald-500/30 bg-emerald-500/10">
+                        <div className="flex items-center gap-2">
+                          <div className="relative">
+                            <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                            <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
+                          </div>
+                          <span className="text-xs font-mono font-semibold text-emerald-300 tracking-wider uppercase">Target Auto-Registration</span>
+                        </div>
+                        <Badge variant="outline" className="text-emerald-300 border-emerald-500/50 bg-emerald-500/10 font-mono text-[10px]">
+                          {autoRegInfo.method?.toUpperCase()} · HTTP {autoRegInfo.responseStatus}
+                        </Badge>
+                      </div>
+                      <div className="p-3 space-y-2 font-mono text-xs">
+                        <div className="grid grid-cols-[100px_1fr_auto] items-center gap-2">
+                          <span className="text-zinc-500">username</span>
+                          <code className="text-emerald-300 bg-emerald-500/5 px-2 py-0.5 rounded truncate">{autoRegInfo.username}</code>
+                          <button
+                            onClick={async () => { try { await navigator.clipboard.writeText(autoRegInfo.username); setCopiedField('username'); setTimeout(() => setCopiedField(null), 1500); } catch {} }}
+                            className="text-zinc-500 hover:text-emerald-300 transition"
+                            title="Copy username"
+                          >
+                            {copiedField === 'username' ? <CheckCircle2 className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                          </button>
+                        </div>
+                        <div className="grid grid-cols-[100px_1fr_auto] items-center gap-2">
+                          <span className="text-zinc-500">password</span>
+                          <code className="text-amber-300 bg-amber-500/5 px-2 py-0.5 rounded truncate">
+                            {showAutoRegPassword ? autoRegInfo.password : '•'.repeat(Math.min(20, autoRegInfo.password?.length || 8))}
+                          </code>
+                          <div className="flex gap-1">
+                            <button
+                              onClick={() => setShowAutoRegPassword(s => !s)}
+                              className="text-zinc-500 hover:text-zinc-300 transition"
+                              title={showAutoRegPassword ? 'Hide' : 'Reveal'}
+                            >
+                              {showAutoRegPassword ? <Eye className="w-3 h-3" /> : <Lock className="w-3 h-3" />}
+                            </button>
+                            <button
+                              onClick={async () => { try { await navigator.clipboard.writeText(autoRegInfo.password); setCopiedField('password'); setTimeout(() => setCopiedField(null), 1500); } catch {} }}
+                              className="text-zinc-500 hover:text-amber-300 transition"
+                              title="Copy password"
+                            >
+                              {copiedField === 'password' ? <CheckCircle2 className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                            </button>
+                          </div>
+                        </div>
+                        <div className="grid grid-cols-[100px_1fr_auto] items-center gap-2">
+                          <span className="text-zinc-500">reg path</span>
+                          <code className="text-cyan-300 bg-cyan-500/5 px-2 py-0.5 rounded truncate">POST {autoRegInfo.regPath}</code>
+                          <button
+                            onClick={async () => { try { await navigator.clipboard.writeText(autoRegInfo.regPath); setCopiedField('regPath'); setTimeout(() => setCopiedField(null), 1500); } catch {} }}
+                            className="text-zinc-500 hover:text-cyan-300 transition"
+                            title="Copy path"
+                          >
+                            {copiedField === 'regPath' ? <CheckCircle2 className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                          </button>
+                        </div>
+                        {autoRegInfo.createdId != null && (
+                          <div className="grid grid-cols-[100px_1fr_auto] items-center gap-2">
+                            <span className="text-zinc-500">owned id</span>
+                            <code className="text-fuchsia-300 bg-fuchsia-500/5 px-2 py-0.5 rounded">{String(autoRegInfo.createdId)}</code>
+                            <button
+                              onClick={async () => { try { await navigator.clipboard.writeText(String(autoRegInfo.createdId)); setCopiedField('id'); setTimeout(() => setCopiedField(null), 1500); } catch {} }}
+                              className="text-zinc-500 hover:text-fuchsia-300 transition"
+                              title="Copy ID"
+                            >
+                              {copiedField === 'id' ? <CheckCircle2 className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                            </button>
+                          </div>
+                        )}
+                        {autoRegInfo.sessionToken && (
+                          <div className="grid grid-cols-[100px_1fr_auto] items-center gap-2">
+                            <span className="text-zinc-500">session</span>
+                            <code className="text-violet-300 bg-violet-500/5 px-2 py-0.5 rounded truncate" title={autoRegInfo.sessionToken}>
+                              {autoRegInfo.sessionToken.slice(0, 24)}…{autoRegInfo.sessionToken.slice(-8)}
+                            </code>
+                            <button
+                              onClick={async () => { try { await navigator.clipboard.writeText(autoRegInfo.sessionToken); setCopiedField('token'); setTimeout(() => setCopiedField(null), 1500); } catch {} }}
+                              className="text-zinc-500 hover:text-violet-300 transition"
+                              title="Copy token"
+                            >
+                              {copiedField === 'token' ? <CheckCircle2 className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                            </button>
+                          </div>
+                        )}
+                        {autoRegInfo.sessionCookie && (
+                          <div className="grid grid-cols-[100px_1fr_auto] items-start gap-2">
+                            <span className="text-zinc-500 pt-0.5">cookie</span>
+                            <code className="text-orange-300 bg-orange-500/5 px-2 py-0.5 rounded text-[10px] break-all">{autoRegInfo.sessionCookie.slice(0, 80)}…</code>
+                            <button
+                              onClick={async () => { try { await navigator.clipboard.writeText(autoRegInfo.sessionCookie); setCopiedField('cookie'); setTimeout(() => setCopiedField(null), 1500); } catch {} }}
+                              className="text-zinc-500 hover:text-orange-300 transition"
+                              title="Copy cookie"
+                            >
+                              {copiedField === 'cookie' ? <CheckCircle2 className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                            </button>
+                          </div>
+                        )}
+                        {autoRegInfo.uniqueFields && Object.keys(autoRegInfo.uniqueFields).length > 0 && (
+                          <div className="grid grid-cols-[100px_1fr] items-start gap-2 pt-1 border-t border-zinc-800">
+                            <span className="text-zinc-500 pt-0.5">unique</span>
+                            <div className="flex flex-wrap gap-1">
+                              {Object.entries(autoRegInfo.uniqueFields).slice(0, 6).map(([k, v]: any) => (
+                                <span key={k} className="text-[10px] text-zinc-400 bg-zinc-800/60 px-1.5 py-0.5 rounded">
+                                  {k}={String(v).slice(0, 20)}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                      <div className="px-3 py-2 border-t border-zinc-800 bg-zinc-900/50">
+                        <p className="text-[10px] text-zinc-500 font-mono leading-relaxed">
+                          → Auto-passed to identity matrix as <span className="text-emerald-400">sessionA</span>.
+                          Matrix will probe <span className="text-cyan-400">IDOR</span> / <span className="text-cyan-400">BFLA</span> / <span className="text-cyan-400">mass-assignment</span> / <span className="text-cyan-400">missing-authn</span> using these creds — no manual Token A/B entry needed.
+                        </p>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="rounded-lg border border-zinc-800 bg-zinc-900/30 p-3 text-center">
+                      <p className="text-[11px] text-zinc-500 font-mono">
+                        <Lock className="w-3 h-3 inline mr-1" />
+                        No auto-registration yet — scan a target to auto-create an account
+                      </p>
+                    </div>
+                  )}
+                  {/* ─── END AUTO-REG PANEL ─────────────────────────────────── */}
 
                   <div className="relative">
                     <div className="absolute inset-x-0 top-0 flex items-center justify-center">

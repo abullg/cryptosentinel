@@ -809,6 +809,31 @@ ${crawl.discoveredParams.slice(0, 30).map((p, i) => `  ${i+1}. ${p}`).join('\n')
       discoveredParams: crawl.discoveredParams,
       crawledPages: crawl.pages.length,
       jsBundlesAnalyzed: crawl.jsBundles.length,
+      // Target Auto-Registration — try to register an account on the TARGET
+      // site using discovered endpoints. If success, the registered creds are
+      // surfaced to the UI and auto-passed to analyze-job so the identity
+      // matrix can probe authenticated surfaces (IDOR/BFLA/mass-assignment)
+      // without the user manually entering Token A/B.
+      // Run AFTER crawl but BEFORE the response so the result is fresh.
+      // Hard 12s timeout — auto-reg should never block the scan pipeline.
+      // Wrapped in try/catch — never fails the fetch-url on reg errors.
+      autoRegisteredAccount: await (async () => {
+        try {
+          const { autoRegister } = await import('@/lib/auto-registrar');
+          return await Promise.race([
+            autoRegister({
+              baseUrl: urlStr,
+              discoveredEndpoints: crawl.discoveredEndpoints,
+              discoveredForms: crawl.discoveredForms,
+              timeoutMs: 8000,
+            }),
+            new Promise<null>((r) => setTimeout(() => r(null), 12_000)),
+          ]);
+        } catch (e) {
+          console.warn('[fetchWebAppWithAI] auto-registrar failed:', String(e).slice(0, 100));
+          return null;
+        }
+      })(),
     });
 
   } catch (e) {
