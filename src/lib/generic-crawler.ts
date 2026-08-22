@@ -517,8 +517,14 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
             }
           }
         } else {
-          console.log('[crawler] No login + no registration found — fail closed');
-          return { ...result, targetClass: 'spa-n/a' };
+          // Per Claude v11 P2: do NOT early-return here. Continue to
+          // Step 2 (OpenAPI), Step 3 (HTML crawl — text-path extractor
+          // can discover /vapi/api1/user from /vapi/ Redoc page), and
+          // Step 3.5 (post-crawl registration from discovered parent
+          // paths). If all those also fail, the matrix returns 0
+          // confirmed honestly — but at least we tried every discovery
+          // path before giving up.
+          console.log('[crawler] No login + no registration via hardcoded paths — continuing unauthenticated, will try /vapi/ /docs/ /swagger/ + discovered paths in Step 3.5');
         }
       }
     }
