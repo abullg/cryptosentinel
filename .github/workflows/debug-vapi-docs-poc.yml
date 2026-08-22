@@ -100,14 +100,25 @@ jobs:
             --auth '{"username":"alice","password":"alice"}' \
             --no-fallback 2>&1 | tail -15 || echo "hunt.mjs exited non-zero"
           echo ""
-          echo "─── Fresh DB dump: FULL poc column for latest vAPI idor ───"
+          echo "─── Fresh DB dump: latest idor finding (use location, not target — target stores contractName) ───"
           DB_FILE=$(find /opt/cryptosentinel /data -name "*.db" -type f 2>/dev/null | head -1)
           if [ -z "$DB_FILE" ]; then DB_FILE="/data/cryptosentinel.db"; fi
-          sqlite3 "$DB_FILE" "SELECT length(poc) AS poc_len, substr(poc, 1, 80) AS poc_first80 FROM Vulnerability WHERE type='idor' AND target LIKE '%3011%' ORDER BY createdAt DESC LIMIT 1;" 2>&1
+          echo "DB file: $DB_FILE"
+          ls -la "$DB_FILE" "$DB_FILE-wal" "$DB_FILE-shm" 2>&1 | head -5
+
           echo ""
-          echo "─── FULL poc column text (latest vAPI idor) ───"
-          sqlite3 "$DB_FILE" "SELECT poc FROM Vulnerability WHERE type='idor' AND target LIKE '%3011%' ORDER BY createdAt DESC LIMIT 1;" 2>&1
+          echo "─── Last 5 idor findings (ANY target — to confirm hunt.mjs wrote to DB) ───"
+          sqlite3 -header -column "$DB_FILE" "SELECT id, type, target, substr(location, 1, 60) AS location_preview, length(poc) AS poc_len, createdAt FROM Vulnerability WHERE type='idor' ORDER BY createdAt DESC LIMIT 5;" 2>&1
+
           echo ""
-          echo "─── Full evidence + payload columns for same finding ───"
-          sqlite3 "$DB_FILE" "SELECT description, codeSnippet FROM Vulnerability WHERE type='idor' AND target LIKE '%3011%' ORDER BY createdAt DESC LIMIT 1;" 2>&1 | head -50
+          echo "─── Latest idor finding: FULL poc column ───"
+          sqlite3 "$DB_FILE" "SELECT poc FROM Vulnerability WHERE type='idor' ORDER BY createdAt DESC LIMIT 1;" 2>&1
+
+          echo ""
+          echo "─── Same finding: full description + codeSnippet + location ───"
+          sqlite3 "$DB_FILE" "SELECT description, codeSnippet, location FROM Vulnerability WHERE type='idor' ORDER BY createdAt DESC LIMIT 1;" 2>&1 | head -30
+
+          echo ""
+          echo "─── ALL rows for vAPI (location LIKE %3011%) — should include hunt.mjs run ───"
+          sqlite3 -header -column "$DB_FILE" "SELECT id, type, substr(location, 1, 60) AS loc, length(poc) AS poc_len, createdAt FROM Vulnerability WHERE location LIKE '%3011%' ORDER BY createdAt DESC LIMIT 10;" 2>&1
           REMOTE_EOF
