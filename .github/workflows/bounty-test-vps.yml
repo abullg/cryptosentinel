@@ -124,8 +124,9 @@ jobs:
             --no-fallback 2>&1 || echo "hunt.mjs exited non-zero"
 
           echo ""
-          echo "=== Step 7: PM2 logs (RAW, no grep — show everything) ==="
-          pm2 logs cryptosentinel --lines 100 --nostream --raw 2>&1 | tail -60
+          echo "=== Step 7: PM2 logs (sleep 3 for buffer flush) ==="
+          sleep 3
+          pm2 logs cryptosentinel --lines 200 --nostream --raw 2>&1 | tail -80
 
           echo ""
           echo "=== Cleanup: remove BOUNTY_MODE from PM2 env ==="

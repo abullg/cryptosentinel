@@ -609,7 +609,7 @@ async function runAnalysisInBackground(jobId: string, config: {
       }
 
       // DEBUG: log what we have BEFORE the if/else chain
-      console.log(`[analyze-job] PRE-IF-CHECK: targetUrl=${targetUrl}, isLocalhost=${targetUrl?.startsWith('http://localhost') || targetUrl?.startsWith('http://127.0.0.1')}, bountyMode=${bountyMode}, authSessions=${authSessions ? JSON.stringify(authSessions).slice(0, 100) : 'undefined'}, authSessions.length=${authSessions?.length}`);
+      console.log('[analyze-job] PRE-IF-CHECK: bountyMode=' + bountyMode + ' authSessions.len=' + (authSessions?.length ?? 'undef') + ' targetUrl=' + (targetUrl || 'undef'));
 
       // ─── ACTIVE FUZZER (Phase C per Claude §4+§5) ───
       // Run REAL active fuzzing with deterministic oracles on discovered
