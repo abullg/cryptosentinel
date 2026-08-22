@@ -58,25 +58,22 @@ jobs:
           # Flush PM2 logs
           pm2 flush cryptosentinel 2>&1 | tail -2
 
-          # Build hunt.mjs args
-          HUNT_ARGS="--url '$TARGET'"
-          HUNT_ARGS="\$HUNT_ARGS --auth '{\"username\":\"user\",\"password\":\"user\"}'"
-          HUNT_ARGS="\$HUNT_ARGS --auth '{\"username\":\"alice\",\"password\":\"alice\"}'"
-          if [ "$NO_FALLBACK" = "true" ]; then
-            HUNT_ARGS="\$HUNT_ARGS --no-fallback"
-          fi
+          echo "=== Running hunt.mjs ==="
+          echo "Target: $TARGET"
+          echo "No-fallback: $NO_FALLBACK"
+          echo "Generate-PoC: $GEN_POC"
+          echo ""
+
+          # Build args array (avoid eval/quoting issues with JSON)
+          ARGS=(node scripts/hunt.mjs --url "$TARGET" --no-fallback)
           if [ "$GEN_POC" = "true" ]; then
-            HUNT_ARGS="\$HUNT_ARGS --generate-poc"
+            ARGS+=(--generate-poc)
           fi
 
-          echo "=== Running hunt.mjs ==="
-          echo "Args: \$HUNT_ARGS"
-          echo ""
           # NOTE: GT_ALLOWLIST_ENABLED=false — we're scanning an EXTERNAL
           # target. The SSRF allowlist that restricts to localhost GT
           # containers must be DISABLED for external fetches to work.
-          # The /api/fetch-url endpoint checks this env var.
-          GT_ALLOWLIST_ENABLED=false timeout 300 node scripts/hunt.mjs \$HUNT_ARGS 2>&1 || echo "hunt.mjs exited non-zero"
+          GT_ALLOWLIST_ENABLED=false timeout 300 "\${ARGS[@]}" 2>&1 || echo "hunt.mjs exited non-zero"
 
           echo ""
           echo "=== PM2 logs (analyze-job telemetry) ==="
