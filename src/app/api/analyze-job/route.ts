@@ -994,6 +994,35 @@ async function runAnalysisInBackground(jobId: string, config: {
               }
               fuzzFindings.push(...bountyFindings);
             }
+            // BOUNTY MODE COMPLETE — save findings + early return.
+            // Don't fall through to static-first "AI failed" path.
+            const bountyConfirmed = fuzzFindings.length;
+            for (const f of fuzzFindings) {
+              try {
+                const hashSig = makeVulnHash(contractId, f.type, `${f.target}-${f.evidence.slice(0, 50)}`);
+                await withTimeout(db.vulnerability.create({
+                  data: {
+                    id: `vuln_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+                    contractId, type: f.type, severity: f.severity,
+                    title: `${f.type} on ${f.target?.slice(0, 60) || 'target'}`,
+                    description: f.evidence, location: f.target || targetUrl || '',
+                    codeSnippet: f.payload || '', confidence: 0.95,
+                    status: 'confirmed', target: contractName,
+                    patternTag: f.type, hashSignature: hashSig,
+                    poc: `Oracle: ${f.oracle}\nEvidence: ${f.evidence}\nPayload: ${f.payload}`,
+                    pocFilename: `${f.type}_poc.txt`,
+                  },
+                }), 10_000, null, 'bounty vuln.create');
+              } catch {}
+            }
+            await withTimeout(db.analysisJob.update({
+              where: { id: jobId },
+              data: { status: 'completed', progress: 100, resultCount: bountyConfirmed,
+                message: `Bounty mode complete: ${bountyConfirmed} confirmed (GET-only IDOR via ownership proof)` },
+            }), 10_000, null, 'bounty completion updateJob');
+            fireAndForget(db.audit.update({ where: { id: auditId }, data: { status: 'completed', findings: bountyConfirmed, completedAt: new Date() } }), 'bounty audit.update');
+            console.log(`[analyze-job] ✓ Bounty mode complete: ${bountyConfirmed} confirmed`);
+            return;  // EARLY RETURN — skip static-first "AI failed" path
           } catch (e) {
             console.error(`[analyze-job] Bounty mode failed: ${String(e).slice(0, 200)}`);
           }
