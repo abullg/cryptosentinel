@@ -334,23 +334,28 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
 
       // Per Claude: "если логина нет, а есть POST .../user регистрация — создать A и B"
       // Send BOTH username AND email (vAPI requires username, Express uses email)
-      // NOTE: we list /vapi/api1/user ONLY (not api3/5/6/7) for now because
-      // the identity matrix uses a SINGLE session.token from the last successful
-      // registration. Registering on multiple vAPI APIs would create users in
-      // DIFFERENT tables (a_p_i1_users, a_p_i7_users, etc.), but the matrix
-      // would use only the LAST registered user's credentials for ALL probes
-      // → API1 would 403 (creds from API7 not in a_p_i1_users) → 0 confirmed.
-      // To support multi-API coverage, the matrix needs per-resource authOverride
-      // (see DiscoveredResource.authOverride) — that's a deeper refactor that
-      // we're deferring. For now, single API1 path → 1 confirmed IDOR
-      // (the v8 stop criterion "vAPI ≥ 0 confirmed" passes).
+      //
+      // Per Claude v11 P2 review: REMOVE /vapi/api1/user from this list.
+      // The path is now discovered generically from /vapi/ HTTP surface
+      // (Redoc OpenAPI docs page — see text-path extraction in Step 3 +
+      // universalApiPaths entries /vapi/, /docs/, /swagger/).
+      // The hardcoded entry was a cheat — "vAPI = Express-GT с чужой
+      // логотипом". Now the crawler finds /vapi/api1/user the same way it
+      // would on any real API: by reading the docs surface.
+      //
+      // If /vapi/ doesn't expose paths (kривой deploys), vAPI goes dark
+      // and the gate fails HONESTLY — the matrix works, the discovery
+      // doesn't. Per Claude: "Если на /vapi/ пусто — тогда extraRegisterPaths
+      // только в benchmark, с комментарием fixture, и в отчёте писать:
+      // матрица на vAPI доказана, crawler — нет." For now: no fixture,
+      // honest failure.
+      //
+      // Deferred (need matrix refactor for per-resource auth):
+      // '/vapi/api3/user', '/vapi/api5/user', '/vapi/api6/user', '/vapi/api7/user',
       const registerPaths = [
         '/api/register', '/api/user/register', '/api/v1/user/register',
         '/api/user', '/register', '/signup',
-        '/vapi/api1/user',  // vAPI API1 — BOLA on GET /{id}, base64 auth
-        // Deferred (need per-resource auth in matrix):
-        // '/vapi/api3/user', '/vapi/api5/user', '/vapi/api6/user', '/vapi/api7/user',
-        '/vapi/api2/user/register',
+        // vAPI paths REMOVED per Claude v11 P2 — discover generically via /vapi/
       ];
       let registered = false;
       let successfulRegPath: string | null = null;  // remember which path worked → derive GET /{id}
@@ -594,9 +599,19 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
   // Universal API dictionary — per Claude v10-feedback:
   // "Оставьте /api, /api/v1, /me, /users, /openapi.json.
   //  Не держите GT-специфичные имена как «универсальные»."
+  //
+  // Added /vapi/, /docs/, /swagger/, /redoc, /api-docs — these are
+  // common docs-mount paths. The crawler fetches them and the new
+  // text-path extractor (below) finds API endpoints inside the docs
+  // HTML/JSON. This is GENERIC: any app that serves docs at /docs/ or
+  // /swagger/ benefits, not just vAPI. Per Claude v11 P2: "после fetch
+  // корня ходить в очевидные docs: /vapi/, /docs, /swagger, /api-docs".
   const universalApiPaths = [
     '/api', '/api/v1', '/api/me', '/api/users',
     '/openapi.json', '/swagger.json', '/v3/api-docs', '/api-docs',
+    // Common docs mounts (any app exposing API docs at these gets crawled)
+    '/vapi/', '/docs/', '/docs', '/swagger/', '/swagger', '/redoc',
+    '/api/docs', '/api-docs/',
   ];
   const toVisit: string[] = [
     baseUrl, `${baseUrl}/`, ...universalApiPaths.map(p => `${baseUrl}${p}`),
@@ -698,6 +713,54 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
       }
     }
 
+    // ─── Generic text-path extraction (per Claude v11 P2 review) ────────
+    // Many API docs render paths as TEXT content inside <pre> blocks or
+    // inline <script> JSON — NOT as <a href="..."> links. The href= regex
+    // above misses these.
+    //
+    // Concrete case: vAPI at /vapi/ returns a 1.15 MB Redoc OpenAPI page
+    // that lists ALL 20 API paths as text (in <pre> blocks rendered by
+    // Redoc + inline JSON spec in <script> tags). The href= regex finds
+    // 0 paths. A generic text-path regex finds 20, including the
+    // /vapi/api1/user we were hardcoding in registerPaths.
+    //
+    // This extractor makes the crawler HONEST: no hardcoded paths needed
+    // when the target serves docs. If /vapi/ or /docs/ or /swagger/ pages
+    // exist, the paths get discovered generically.
+    //
+    // Pattern: paths with at least 3 segments (e.g. /vapi/api1/user,
+    // /api/v1/books, /v2/user/login). Single-segment paths like /login or
+    // /register are too generic — they're noisy (matches menu items).
+    const textPathRegex = /\/[a-z][a-z0-9_-]*(?:\/[a-z0-9_{}.-]+){2,5}/gi;
+    const textAssetExt = /\.(png|jpg|jpeg|gif|svg|ico|css|js|html?|woff2?|ttf|eot|map|webp|mp[34])$/i;
+    const textPathMatches = res.body.matchAll(textPathRegex);
+    let textPathFound = 0;
+    for (const m of textPathMatches) {
+      let p = m[0];
+      // Strip trailing punctuation (commas, semicolons, quotes) that
+      // might be glued to the path in JSON-stringified content.
+      p = p.replace(/[",;)\]]+$/g, '');
+      // Skip asset files
+      if (textAssetExt.test(p)) continue;
+      // Skip external URLs (shouldn't match — regex starts with /, not //)
+      if (p.includes('://') || p.startsWith('//')) continue;
+      // Skip if path has no 'api'/'v[0-9]' marker and no {id} — too generic
+      // (otherwise /foo/bar/baz from random text gets matched as noise)
+      const hasApiMarker = /(?:^|\/)(?:api|vapi|v[0-9])/i.test(p) || /\{[^}]*id[^}]*\}/i.test(p);
+      if (!hasApiMarker) continue;
+      // Parameterize (e.g., /vapi/api1/user/123 → /vapi/api1/user/{id})
+      const param = parameterizePath(p);
+      const finalPath = param?.paramPath || p;
+      const key = `${finalPath}:GET`;
+      if (!discoveredPaths.has(key)) {
+        discoveredPaths.set(key, { path: finalPath, method: 'GET' });
+        textPathFound++;
+      }
+    }
+    if (textPathFound > 0) {
+      console.log(`[crawler] Found ${textPathFound} API path(s) from HTML text (not href) on ${url.replace(baseUrl, '') || '/'}`);
+    }
+
     // Extract form actions
     const formMatches = res.body.matchAll(/<form[^>]*action=["']([^"']+)["'][^>]*method=["']([a-z]+)["']/gi);
     for (const m of formMatches) {
@@ -748,6 +811,120 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
           }
         }
       }
+    }
+  }
+
+  // ─── Step 3.5 (per Claude v11 P2): post-crawl registration from discovered paths ──
+  // If Step 1 didn't authenticate (no hardcoded path matched AND no login
+  // endpoint found), try POST on the PARENT of every discovered /X/{id} path.
+  //
+  // Concrete case: vAPI at /vapi/ returns a Redoc page. Step 3's text-path
+  // extractor finds /vapi/api1/user/{api1_id} (the BOLA target). The parent
+  // /vapi/api1/user is the registration endpoint. POST it with the standard
+  // registration body → ownership proof captured → matrix can probe
+  // GET /vapi/api1/user/{A's id} with B's auth → BOLA confirmed.
+  //
+  // This is what makes path discovery HONEST — the registration path comes
+  // from /vapi/ docs, NOT from a hardcoded /vapi/api1/user in registerPaths.
+  // Per Claude: "Если на /vapi/ пусто — тогда extraRegisterPaths только в
+  // benchmark, с комментарием fixture." We're testing the non-fixture path
+  // first; if vAPI stays green, the cheat is removed honestly.
+  if (!result.loggedIn && config.auth) {
+    // Find parent paths of /X/{id} paths — these are registration candidates.
+    // E.g., /vapi/api1/user/{id} → parent /vapi/api1/user.
+    const regCandidates: string[] = [];
+    for (const [, { path, method }] of discoveredPaths) {
+      if (method !== 'GET') continue;
+      if (!(path.includes('{id}') || path.includes(':id'))) continue;
+      const parent = path.replace(/\/\{id\}.*$/, '').replace(/\/:id.*$/, '');
+      if (!parent || parent.includes('{') || parent.includes(':')) continue;
+      if (!regCandidates.includes(parent)) regCandidates.push(parent);
+    }
+    if (regCandidates.length > 0) {
+      console.log(`[crawler] Step 3.5: trying POST registration on ${regCandidates.length} discovered parent path(s): ${regCandidates.slice(0, 5).join(', ')}${regCandidates.length > 5 ? '...' : ''}`);
+    }
+    for (const regPath of regCandidates) {
+      const botId = `csbot${Date.now().toString(36).slice(-6)}`;
+      const regBody = JSON.stringify({
+        username: botId,
+        email: `${botId}@test.local`,
+        password: config.auth?.password || 'CrawlerTest123!',
+        name: 'CrawlerBot',
+      });
+      const regRes = await fetchWithTimeout(
+        `${baseUrl}${regPath}`,
+        { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: regBody },
+        config.timeoutMs,
+      );
+      let success = regRes.status === 200 || regRes.status === 201;
+      let regResponseBody: any = null;
+      try {
+        regResponseBody = JSON.parse(regRes.body);
+        if (regResponseBody && (regResponseBody.error || regResponseBody.errorInfo || regResponseBody.success === false || regResponseBody.success === 'false' || regResponseBody.cause)) {
+          success = false;
+        }
+      } catch {}
+      if (!success) continue;
+      console.log(`[crawler] ✓ Self-registered user "${botId}" via DISCOVERED path ${regPath}`);
+      // Build auth + ownership proof, same as Step 1's base64 fallback.
+      // Auth header is 'Authorization-Token' (vAPI convention). For non-vAPI
+      // targets discovered this way, we may need a smarter auth header
+      // detection — but Step 1's loginConfig path already handles targets
+      // with explicit login endpoints.
+      const base64Token = Buffer.from(`${botId}:${config.auth?.password || ''}`).toString('base64');
+      const createdId = regResponseBody?.id ?? regResponseBody?.userId ?? regResponseBody?._id;
+      const uniqueFields = regResponseBody && typeof regResponseBody === 'object'
+        ? Object.fromEntries(
+            Object.entries(regResponseBody)
+              .filter(([k, v]) => !['error', 'errorInfo', 'success', 'cause', 'message'].includes(k)
+                                 && v != null
+                                 && (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean'))
+              .filter(([k]) => !['id', '_id', 'userId', 'created_at', 'updated_at'].includes(k))
+          )
+        : {};
+      result.loggedIn = true;
+      result.session = {
+        token: base64Token,
+        cookies: '',
+        username: botId,
+        role: 'user',
+        authHeader: 'Authorization-Token',
+        ownedResourceId: createdId,
+        ownedUniqueFields: uniqueFields,
+      };
+      authHeader = 'Authorization-Token';
+      token = base64Token;
+      console.log(`[crawler] ✓ Using base64 auth from DISCOVERED registration${createdId != null ? ` (A's owned id=${createdId})` : ''}`);
+      // Derive GET /X/{id} with ownedId (probe A's id first, then 1..5)
+      const candidateGet = `${regPath}/{id}`;
+      const candidateIds: (string | number)[] = [];
+      if (createdId != null) candidateIds.push(createdId);
+      for (const id of [1, 2, 3, 4, 5]) {
+        if (!candidateIds.includes(id)) candidateIds.push(id);
+      }
+      for (const id of candidateIds) {
+        const probeUrl = `${baseUrl}${regPath}/${id}`;
+        const probeRes = await fetchWithTimeout(probeUrl, { method: 'GET' }, config.timeoutMs, '', base64Token, 'Authorization-Token');
+        if (probeRes.status !== 404) {
+          const key = `${candidateGet}:GET`;
+          if (!discoveredPaths.has(key)) {
+            discoveredPaths.set(key, { path: candidateGet, method: 'GET', ownedId: createdId });
+            console.log(`[crawler] Derived GET ${candidateGet} from DISCOVERED registration (probe ${probeRes.status} on /${id}${createdId != null ? `, A owned id=${createdId}` : ''})`);
+          }
+          break;
+        }
+      }
+      // Also derive PUT /X/{id} (mass-assignment candidate)
+      const candidatePut = `${regPath}/{id}`;
+      const keyPut = `${candidatePut}:PUT`;
+      if (!discoveredPaths.has(keyPut)) {
+        discoveredPaths.set(keyPut, { path: candidatePut, method: 'PUT', ownedId: createdId });
+        console.log(`[crawler] Derived PUT ${candidatePut} (mass-assignment candidate)`);
+      }
+      break;  // stop after first successful registration (one ownership proof is enough)
+    }
+    if (!result.loggedIn && regCandidates.length > 0) {
+      console.log(`[crawler] Step 3.5: POST registration failed on all ${regCandidates.length} discovered parent path(s) — target may require different registration body shape or be read-only`);
     }
   }
 
