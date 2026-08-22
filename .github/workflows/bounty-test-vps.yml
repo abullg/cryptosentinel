@@ -126,10 +126,10 @@ jobs:
 
           echo ""
           echo "=== Step 7: Query DB for job message (durable) ==="
-          DB_FILE=$(find /opt/cryptosentinel /data -name "*.db" -type f 2>/dev/null | head -1)
-          if [ -z "$DB_FILE" ]; then DB_FILE="/data/cryptosentinel.db"; fi
-          echo "DB: $DB_FILE"
-          sqlite3 -header -column "$DB_FILE" "SELECT id, progress, message, status FROM AnalysisJob ORDER BY createdAt DESC LIMIT 3;" 2>&1
+          DB_FILE=\$(find /opt/cryptosentinel /data -name "*.db" -type f 2>/dev/null | head -1)
+          if [ -z "\$DB_FILE" ]; then DB_FILE="/data/cryptosentinel.db"; fi
+          echo "DB: \$DB_FILE"
+          sqlite3 -header -column "\$DB_FILE" "SELECT id, progress, message, status FROM AnalysisJob ORDER BY createdAt DESC LIMIT 3;" 2>&1
           echo ""
           echo "=== PM2 logs (last 50 lines) ==="
           sleep 3
