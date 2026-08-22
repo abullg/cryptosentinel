@@ -618,8 +618,6 @@ async function runAnalysisInBackground(jobId: string, config: {
       }
 
       // DEBUG: log what we have BEFORE the if/else chain
-      // Use updateJob (DB write) instead of console.log — PM2 log buffering
-      // is unreliable. DB write is durable and visible via job-status polling.
       try {
         await withTimeout(db.analysisJob.update({
           where: { id: jobId },
@@ -627,6 +625,12 @@ async function runAnalysisInBackground(jobId: string, config: {
         }), 5_000, null, 'PRE-IF-CHECK updateJob');
       } catch {}
       console.log('[analyze-job] PRE-IF-CHECK: bountyMode=' + bountyMode + ' authSessions.len=' + (authSessions?.length ?? 'undef') + ' targetUrl=' + (targetUrl || 'undef'));
+
+      // Declare fuzzFindings HERE (before if/else chain) so ALL branches
+      // (localhost active fuzzer, bounty mode, passive crawler) can access it.
+      // Previously it was declared INSIDE the if(localhost) block → ReferenceError
+      // in the else-if(bountyMode) block → catch swallowed error → 0 confirmed.
+      const fuzzFindings: any[] = [];
 
       // ─── ACTIVE FUZZER (Phase C per Claude §4+§5) ───
       // Run REAL active fuzzing with deterministic oracles on discovered
@@ -670,7 +674,7 @@ async function runAnalysisInBackground(jobId: string, config: {
 
           // 4. Run active fuzzers on each endpoint
           //    Use auth cookies if available (for DVWA authenticated pages)
-          const fuzzFindings: any[] = [];
+          // fuzzFindings declared BEFORE if/else chain (line 633)
           for (const ep of allEndpoints.slice(0, 10)) {  // cap at 10 endpoints
             console.log(`[analyze-job]   Fuzzing: ${ep.url} ${ep.cookies ? '(auth)' : '(no-auth)'}`);
             const findings = await fuzzAllOracles(ep.url, ep.params?.[0], {
