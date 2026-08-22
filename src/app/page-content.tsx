@@ -1586,6 +1586,7 @@ export default function CryptoSentinelDashboard() {
             <TabsTrigger value="findings"><Bug className="w-4 h-4 mr-1" /> Findings</TabsTrigger>
             <TabsTrigger value="memory"><Brain className="w-4 h-4 mr-1" /> Memory</TabsTrigger>
             <TabsTrigger value="pipeline"><Zap className="w-4 h-4 mr-1" /> Pipeline</TabsTrigger>
+            <TabsTrigger value="admin"><Terminal className="w-4 h-4 mr-1" /> Admin</TabsTrigger>
           </TabsList>
 
           {/* Dashboard */}
@@ -2315,6 +2316,134 @@ export default function CryptoSentinelDashboard() {
                       <p className="text-xs text-slate-400">Target: {a.target}</p>
                     </div>
                   ))}
+                </div>
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          {/* Admin */}
+          <TabsContent value="admin" className="space-y-4">
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2"><Terminal className="w-5 h-5" /> Server Control</CardTitle>
+                <CardDescription>Full VPS admin — containers, PM2, DB, logs, scans</CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                {/* Server Status */}
+                <div className="flex items-center gap-2">
+                  <Button variant="outline" size="sm" onClick={async () => {
+                    try {
+                      const res = await fetch('/api/admin?action=status');
+                      const data = await res.json();
+                      alert(`PM2:\n${data.pm2}\n\nDocker:\n${data.docker}\n\nDisk:\n${data.disk}\n\nMem:\n${data.mem}`);
+                    } catch (e) { alert('Error: ' + e); }
+                  }}><RefreshCw className="w-4 h-4 mr-1" /> Server Status</Button>
+                  <Button variant="outline" size="sm" onClick={async () => {
+                    try {
+                      const res = await fetch('/api/admin?action=db-count');
+                      const data = await res.json();
+                      alert(`Vulnerabilities: ${data.vulnerabilities}\nAnalysis Jobs: ${data.jobs}`);
+                    } catch (e) { alert('Error: ' + e); }
+                  }}><Database className="w-4 h-4 mr-1" /> DB Count</Button>
+                </div>
+
+                {/* GT Container Controls */}
+                <div>
+                  <h4 className="text-sm font-semibold mb-2">GT Containers</h4>
+                  <div className="flex flex-wrap gap-2">
+                    <Button variant="default" size="sm" onClick={async () => {
+                      try { const res = await fetch('/api/admin', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'gt-start' }) }); const data = await res.json(); alert(data.result || data.error); } catch (e) { alert('Error: ' + e); }
+                    }}><Play className="w-4 h-4 mr-1" /> Start GT</Button>
+                    <Button variant="destructive" size="sm" onClick={async () => {
+                      try { const res = await fetch('/api/admin', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'gt-stop' }) }); const data = await res.json(); alert(data.result || data.error); } catch (e) { alert('Error: ' + e); }
+                    }}><Square className="w-4 h-4 mr-1" /> Stop GT</Button>
+                    <Button variant="outline" size="sm" onClick={async () => {
+                      try { const res = await fetch('/api/admin', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'gt-restart' }) }); const data = await res.json(); alert(data.result || data.error); } catch (e) { alert('Error: ' + e); }
+                    }}><RefreshCw className="w-4 h-4 mr-1" /> Restart GT</Button>
+                  </div>
+                </div>
+
+                {/* PM2 Controls */}
+                <div>
+                  <h4 className="text-sm font-semibold mb-2">PM2 Process</h4>
+                  <div className="flex flex-wrap gap-2">
+                    <Button variant="outline" size="sm" onClick={async () => {
+                      try { const res = await fetch('/api/admin', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'pm2-restart' }) }); const data = await res.json(); alert(data.result || data.error); } catch (e) { alert('Error: ' + e); }
+                    }}><RefreshCw className="w-4 h-4 mr-1" /> Restart PM2</Button>
+                    <Button variant="outline" size="sm" onClick={async () => {
+                      try { const res = await fetch('/api/admin', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'flush-logs' }) }); const data = await res.json(); alert(data.result || data.error); } catch (e) { alert('Error: ' + e); }
+                    }}><Trash2 className="w-4 h-4 mr-1" /> Flush Logs</Button>
+                    <Button variant="outline" size="sm" onClick={async () => {
+                      try { const res = await fetch('/api/admin?action=logs&lines=50'); const data = await res.json(); alert(data.logs || data.error); } catch (e) { alert('Error: ' + e); }
+                    }}><Eye className="w-4 h-4 mr-1" /> View Logs (50)</Button>
+                  </div>
+                </div>
+
+                {/* DB Management */}
+                <div>
+                  <h4 className="text-sm font-semibold mb-2">Database</h4>
+                  <div className="flex flex-wrap gap-2">
+                    <Button variant="destructive" size="sm" onClick={async () => {
+                      if (!confirm('Clear ALL vulnerabilities and jobs? This cannot be undone.')) return;
+                      try { const res = await fetch('/api/admin', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'clear-db' }) }); const data = await res.json(); alert(data.result || data.error); } catch (e) { alert('Error: ' + e); }
+                    }}><Trash2 className="w-4 h-4 mr-1" /> Clear DB</Button>
+                  </div>
+                </div>
+
+                {/* Quick Scan */}
+                <div>
+                  <h4 className="text-sm font-semibold mb-2">Quick Scan (any URL)</h4>
+                  <div className="flex gap-2">
+                    <Input id="admin-scan-url" placeholder="https://example.com or http://127.0.0.1:3010" className="flex-1" />
+                    <Button onClick={async () => {
+                      const urlInput = document.getElementById('admin-scan-url') as HTMLInputElement;
+                      const url = urlInput?.value;
+                      if (!url) { alert('Enter a URL'); return; }
+                      try {
+                        const fetchRes = await fetch('/api/fetch-url', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url, type: 'exchange' }) });
+                        const fetchData = await fetchRes.json();
+                        if (fetchData.error) { alert('Fetch error: ' + fetchData.error); return; }
+                        const analyzeRes = await fetch('/api/analyze-job', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sourceCode: fetchData.sourceCode, contractName: url.replace(/^https?:\/\//, '').split('/')[0], targetType: 'exchange', targetUrl: url, discoveredEndpoints: fetchData.discoveredEndpoints || [], discoveredForms: fetchData.discoveredForms || [], discoveredParams: fetchData.discoveredParams || [], staticAnalysis: fetchData.staticAnalysis || null, noFallback: true }) });
+                        const analyzeData = await analyzeRes.json();
+                        if (analyzeData.jobId) { alert('Scan started! Job ID: ' + analyzeData.jobId + '\nCheck Findings tab for results.'); } else { alert('Analysis failed: ' + JSON.stringify(analyzeData)); }
+                      } catch (e) { alert('Error: ' + e); }
+                    }}><Search className="w-4 h-4 mr-1" /> Scan</Button>
+                  </div>
+                </div>
+
+                {/* Bounty Mode Scan */}
+                <div>
+                  <h4 className="text-sm font-semibold mb-2">Bounty Mode (authorized target)</h4>
+                  <div className="space-y-2">
+                    <Input id="bounty-url" placeholder="https://staging.yours.com" />
+                    <Input id="bounty-token-a" placeholder="Bearer token A (from DevTools)" />
+                    <Input id="bounty-token-b" placeholder="Bearer token B (peer, from DevTools)" />
+                    <Input id="bounty-owned" placeholder="/api/users/1,/api/orders/123 (owned by A)" />
+                    <Button onClick={async () => {
+                      const url = (document.getElementById('bounty-url') as HTMLInputElement)?.value;
+                      const tokenA = (document.getElementById('bounty-token-a') as HTMLInputElement)?.value;
+                      const tokenB = (document.getElementById('bounty-token-b') as HTMLInputElement)?.value;
+                      const owned = (document.getElementById('bounty-owned') as HTMLInputElement)?.value;
+                      if (!url || !tokenA || !tokenB) { alert('URL + both tokens required'); return; }
+                      try {
+                        const fetchRes = await fetch('/api/fetch-url', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url, type: 'exchange' }) });
+                        const fetchData = await fetchRes.json();
+                        const analyzeRes = await fetch('/api/analyze-job', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sourceCode: fetchData.sourceCode || '', contractName: url.replace(/^https?:\/\//, '').split('/')[0], targetType: 'exchange', targetUrl: url, noFallback: true, bountyMode: true, authSessions: [{ headers: { Authorization: tokenA }, owned: owned ? owned.split(',') : [] }, { headers: { Authorization: tokenB } }], ownedResources: owned ? owned.split(',') : [] }) });
+                        const analyzeData = await analyzeRes.json();
+                        if (analyzeData.jobId) { alert('Bounty scan started! Job ID: ' + analyzeData.jobId); } else { alert('Failed: ' + JSON.stringify(analyzeData)); }
+                      } catch (e) { alert('Error: ' + e); }
+                    }}><Zap className="w-4 h-4 mr-1" /> Start Bounty Scan</Button>
+                  </div>
+                </div>
+
+                {/* Git + Deploy */}
+                <div>
+                  <h4 className="text-sm font-semibold mb-2">Git & Deploy</h4>
+                  <div className="flex flex-wrap gap-2">
+                    <Button variant="outline" size="sm" onClick={async () => {
+                      try { const res = await fetch('/api/admin', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'git-pull' }) }); const data = await res.json(); alert(data.result || data.error); } catch (e) { alert('Error: ' + e); }
+                    }}><Download className="w-4 h-4 mr-1" /> Git Pull</Button>
+                  </div>
                 </div>
               </CardContent>
             </Card>
