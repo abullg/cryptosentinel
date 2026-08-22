@@ -1,0 +1,84 @@
+name: Hunt External Target
+on:
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: 'Target URL to scan (e.g. https://vvs.finance/)'
+        required: true
+        default: 'https://vvs.finance/'
+      no_fallback:
+        description: 'Use --no-fallback (generic crawler only, no hardcoded oracles)'
+        required: false
+        type: boolean
+        default: true
+      generate_poc:
+        description: 'Generate PoC report text for any confirmed findings'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p 22 -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Run hunt.mjs against external target
+        run: |
+          HOST="${{ secrets.VPS_HOST }}"
+          USER="${{ secrets.VPS_USER || 'root' }}"
+          TARGET="${{ inputs.target_url }}"
+          NO_FALLBACK="${{ inputs.no_fallback }}"
+          GEN_POC="${{ inputs.generate_poc }}"
+
+          echo "============================================================"
+          echo "  CryptoSentinel Hunt — External Production Target"
+          echo "============================================================"
+          echo "  Target: $TARGET"
+          echo "  No-fallback: $NO_FALLBACK"
+          echo "  Generate-PoC: $GEN_POC"
+          echo "  Mode: PASSIVE-ONLY (active fuzzer auto-skipped for non-localhost)"
+          echo "  Authorization: User-initiated scan of public webpage"
+          echo "  Active probing: NONE (no SQLi/XSS/IDOR injection on target)"
+          echo "  What runs: HTML fetch + static sink-hint analysis + LLM analysis"
+          echo "============================================================"
+          echo ""
+
+          # Flush PM2 logs first so we capture only this run's output
+          ssh -p 22 -o StrictHostKeyChecking=no -o ConnectTimeout=60 -i ~/.ssh/id_ed25519 $USER@$HOST "bash -s" <<REMOTE_EOF
+          set +e
+          cd /opt/cryptosentinel
+
+          # Flush PM2 logs
+          pm2 flush cryptosentinel 2>&1 | tail -2
+
+          # Build hunt.mjs args
+          HUNT_ARGS="--url '$TARGET'"
+          HUNT_ARGS="\$HUNT_ARGS --auth '{\"username\":\"user\",\"password\":\"user\"}'"
+          HUNT_ARGS="\$HUNT_ARGS --auth '{\"username\":\"alice\",\"password\":\"alice\"}'"
+          if [ "$NO_FALLBACK" = "true" ]; then
+            HUNT_ARGS="\$HUNT_ARGS --no-fallback"
+          fi
+          if [ "$GEN_POC" = "true" ]; then
+            HUNT_ARGS="\$HUNT_ARGS --generate-poc"
+          fi
+
+          echo "=== Running hunt.mjs ==="
+          echo "Args: \$HUNT_ARGS"
+          echo ""
+          # NOTE: GT_ALLOWLIST_ENABLED=false — we're scanning an EXTERNAL
+          # target. The SSRF allowlist that restricts to localhost GT
+          # containers must be DISABLED for external fetches to work.
+          # The /api/fetch-url endpoint checks this env var.
+          GT_ALLOWLIST_ENABLED=false timeout 300 node scripts/hunt.mjs \$HUNT_ARGS 2>&1 || echo "hunt.mjs exited non-zero"
+
+          echo ""
+          echo "=== PM2 logs (analyze-job telemetry) ==="
+          pm2 logs cryptosentinel --lines 400 --nostream 2>&1 | grep -iE "crawler|matrix|analyze-job|register|login|derived|base64|vvs|api|IDOR|BFLA|mass|CONFIRMED|sensitive|sink-hint|static|LLM|generatePoC|fetch" | tail -100
+          REMOTE_EOF
