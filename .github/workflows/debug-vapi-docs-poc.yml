@@ -1,0 +1,116 @@
+name: Debug vAPI Docs + PoC
+on:
+  workflow_dispatch:
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p 22 -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+      - name: Inspect /vapi/ HTTP surface + extract generatePoC text from DB
+        run: |
+          HOST="${{ secrets.VPS_HOST }}"
+          USER="${{ secrets.VPS_USER || 'root' }}"
+          ssh -p 22 -o StrictHostKeyChecking=no -o ConnectTimeout=60 -i ~/.ssh/id_ed25519 $USER@$HOST "bash -s" <<'REMOTE_EOF'
+          set -e
+
+          # ─── PART 1: /vapi/ HTTP surface ─────────────────────────────
+          echo ""
+          echo "=========================================="
+          echo "PART 1: /vapi/ HTTP surface — does it expose API paths?"
+          echo "=========================================="
+          # Start vAPI (might be stopped from previous bench-down)
+          cd /opt/vapi 2>/dev/null || { echo "vAPI repo not found"; exit 1; }
+          docker compose up -d --build 2>&1 | tail -3
+          echo "Waiting 25s for MySQL..."
+          sleep 25
+          docker compose ps 2>&1 | tail -3
+
+          echo ""
+          echo "─── HTTP status for /vapi/ ───"
+          curl -s -o /dev/null -w "HTTP %{http_code}  size=%{size_download}\n" --max-time 10 http://127.0.0.1:3011/vapi/
+
+          echo ""
+          echo "─── /vapi/ HTML (first 4000 chars) ───"
+          curl -s --max-time 10 http://127.0.0.1:3011/vapi/ | head -c 4000
+          echo ""
+
+          echo ""
+          echo "─── All /vapi/api* paths mentioned in /vapi/ HTML ───"
+          curl -s --max-time 10 http://127.0.0.1:3011/vapi/ | grep -oE '/vapi/[a-zA-Z0-9/_{}.-]+' | sort -u
+
+          echo ""
+          echo "─── All href=\"...\" links in /vapi/ HTML ───"
+          curl -s --max-time 10 http://127.0.0.1:3011/vapi/ | grep -oE 'href="[^"]+"' | sort -u | head -20
+
+          echo ""
+          echo "─── Probing common docs/spec endpoints ───"
+          for path in /vapi/swagger.json /vapi/openapi.json /vapi/api-docs /vapi/docs /vapi/swagger /vapi/swagger/v1/swagger.json /vapi/postman /vapi/postman/vAPI.postman_collection.json /swagger.json /openapi.json /v3/api-docs /api-docs; do
+            status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "http://127.0.0.1:3011${path}")
+            echo "  ${status}  ${path}"
+          done
+
+          echo ""
+          echo "─── Does /vapi/ HTML mention Postman or Swagger as text? ───"
+          curl -s --max-time 10 http://127.0.0.1:3011/vapi/ | grep -iE 'postman|swagger|openapi|apidoc|api-doc' | head -10
+
+          echo ""
+          echo "─── If /vapi/postman/vAPI.postman_collection.json exists, dump first 3000 chars ───"
+          curl -s --max-time 5 http://127.0.0.1:3011/vapi/postman/vAPI.postman_collection.json 2>&1 | head -c 3000
+          echo ""
+
+          # ─── PART 2: generatePoC text from DB ────────────────────────
+          echo ""
+          echo "=========================================="
+          echo "PART 2: generatePoC saved text for vAPI IDOR"
+          echo "=========================================="
+          # Find the DB file
+          DB_FILE=$(find /opt/cryptosentinel /data -name "*.db" -type f 2>/dev/null | head -1)
+          if [ -z "$DB_FILE" ]; then
+            DB_FILE="/data/cryptosentinel.db"
+          fi
+          echo "DB file: $DB_FILE"
+
+          if [ ! -f "$DB_FILE" ]; then
+            echo "WARNING: DB file not found"
+          else
+            # Show schema of Vulnerability table
+            echo ""
+            echo "─── Vulnerability table schema ───"
+            sqlite3 "$DB_FILE" ".schema Vulnerability" 2>&1 | head -30
+
+            # Show last 3 vAPI idor findings with all fields
+            echo ""
+            echo "─── Last 3 vAPI idor findings (full records) ───"
+            sqlite3 -header -column "$DB_FILE" "SELECT id, type, severity, oracle, substr(evidence, 1, 200) AS evidence_preview, substr(payload, 1, 200) AS payload_preview, substr(COALESCE(pocOutline, ''), 1, 200) AS poc_preview, createdAt FROM Vulnerability WHERE type='idor' AND target LIKE '%3011%' ORDER BY id DESC LIMIT 3;" 2>&1
+
+            # Dump full pocOutline for the latest vAPI idor finding
+            echo ""
+            echo "─── Full pocOutline for latest vAPI idor finding ───"
+            sqlite3 "$DB_FILE" "SELECT pocOutline FROM Vulnerability WHERE type='idor' AND target LIKE '%3011%' ORDER BY id DESC LIMIT 1;" 2>&1
+
+            # Also check for any column that might hold PoC text (might be named differently)
+            echo ""
+            echo "─── All columns of Vulnerability table ───"
+            sqlite3 "$DB_FILE" "PRAGMA table_info(Vulnerability);" 2>&1 | head -30
+          fi
+
+          # ─── PART 3: Re-run hunt.mjs with disabled hardcoded paths ──
+          # We'll add an env var that the crawler can read to skip the
+          # hardcoded /vapi/api1/user entry. If /vapi/ exposes paths via
+          # HTML or OpenAPI, the crawler should still find them.
+          # For now this is informational — we're not modifying the crawler
+          # in this debug workflow.
+          echo ""
+          echo "=========================================="
+          echo "PART 3: Manual test — can crawler find /vapi/api1/user from /vapi/ alone?"
+          echo "=========================================="
+          echo "(Skipped in this debug run — would need crawler code change to disable hardcoded path.)"
+          echo "Conclusion will be drawn from PART 1: if /vapi/ exposes the path via HTML/swagger,"
+          echo "we can remove the hardcoded entry. If not, we need extraRegisterPaths (test fixture only)."
+          REMOTE_EOF
