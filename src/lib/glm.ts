@@ -280,6 +280,40 @@ export async function callDeepSeek(
 }
 
 /**
+ * Call LLM for free-form text generation (no JSON parsing).
+ *
+ * Use this for: PoC report generation, vulnerability description enhancement,
+ * remediation text, summary writing — any task where the LLM produces prose /
+ * markdown / structured text, NOT a JSON findings array.
+ *
+ * Returns the raw text content from the LLM response (response.content).
+ * Throws if the LLM call itself fails (network, auth, timeout).
+ *
+ * Per Claude v11 P1 review: generatePoC must actually save PoC text to DB.
+ * Previous implementation used analyzeWithGLM, which:
+ *   (a) injects a smart-contract vulnerability-detection system prompt
+ *   (b) wraps user content in a `Contract: ... ```solidity ...``` ` template
+ *   (c) demands JSON output: 'Your FINAL output MUST be a valid JSON array'
+ * When called with a markdown-report prompt (generatePoC's use case),
+ * the LLM either followed the smart-contract system prompt and returned
+ * JSON (which analyzeWithGLM parsed → returned findings, not text) or
+ * got confused and returned empty → 'LLM returned no response' every time.
+ *
+ * callGLMRaw fixes this by sending ONLY what the caller provides — no
+ * system prompt injection, no JSON-demand suffix, no smart-contract framing.
+ */
+export async function callGLMRaw(
+  messages: GLMMessage[],
+  config: GLMConfig
+): Promise<string> {
+  // Use callGLM under the hood — it handles timeout, retry, error formatting.
+  // Caller is responsible for providing the system prompt + user content
+  // in the messages[] array.
+  const response = await callGLM(messages, config);
+  return response.content || '';
+}
+
+/**
  * System prompt for vulnerability analysis — ENHANCED with blockchain verification
  */
 export const VULN_ANALYSIS_SYSTEM_PROMPT = `You are CryptoSentinel, an elite autonomous AI vulnerability scanner for smart contracts and crypto ecosystems. You perform HACKENPROOF-TIER deep scanning — not surface-level pattern matching. You combine CodeQL dataflow analysis, Semgrep pattern precision, formal verification reasoning, and DeFi economic attack modeling.

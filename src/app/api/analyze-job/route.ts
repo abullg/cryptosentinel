@@ -843,13 +843,15 @@ async function runAnalysisInBackground(jobId: string, config: {
                     parameter: s.rawFinding?.parameter,
                   }, apiKey, model);
                   if (poc) {
-                    // Update the finding with PoC report text
-                    const pocText = `CWE: ${poc.cwe}\n\nImpact:\n${poc.impact}\n\nReproduction:\n${poc.steps}\n\nRemediation:\n${poc.remediation}\n\ncurl replay:\n${poc.curlReplay}`;
+                    // Build the canonical pocText (structured sections + curl).
+                    // Then APPEND the raw LLM markdown response under a divider
+                    // so the full audit trail is preserved in the DB.
+                    const pocText = `CWE: ${poc.cwe}\n\nImpact:\n${poc.impact}\n\nReproduction:\n${poc.steps}\n\nRemediation:\n${poc.remediation}\n\ncurl replay:\n${poc.curlReplay}\n\n---\nFull LLM report (audit):\n${poc.rawReport}`;
                     await withTimeout(db.vulnerability.update({
                       where: { id: s.vuln.id },
                       data: { poc: pocText } as any,
                     }), 10_000, null, 'generatePoC update');
-                    console.log(`[analyze-job]   ✓ PoC generated for ${s.rawFinding?.type} on ${s.rawFinding?.target?.slice(0, 50)}`);
+                    console.log(`[analyze-job]   ✓ PoC generated for ${s.rawFinding?.type} on ${s.rawFinding?.target?.slice(0, 50)} (${pocText.length} chars)`);
                   }
                 } catch (e) {
                   console.warn(`[analyze-job]   generatePoC failed for finding: ${String(e).slice(0, 80)}`);

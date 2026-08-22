@@ -21,7 +21,7 @@
  *   - Writes remediation recommendation
  */
 
-import { analyzeWithGLM, DEFAULT_MODEL } from './glm';
+import { callGLMRaw, DEFAULT_MODEL, type GLMMessage } from './glm';
 
 export interface ConfirmedFinding {
   type: string;
@@ -39,6 +39,7 @@ export interface PoCReport {
   steps: string;
   remediation: string;
   curlReplay: string;
+  rawReport: string;  // full markdown LLM response — for audit / debug
 }
 
 const CWE_MAP: Record<string, string> = {
@@ -99,42 +100,62 @@ export async function generatePoC(
   try {
     const prompt = buildPoCPrompt(finding);
     console.log(`[generatePoc] Generating PoC for ${finding.type} on ${finding.target}`);
-    
-    const response = await analyzeWithGLM(
-      prompt,
-      finding.type,
-      { apiKey, model, timeoutMs: 60_000 },
-      undefined,
-    );
-    
-    if (!response || !response.findings || response.findings.length === 0) {
-      console.log('[generatePoc] LLM returned no response');
-      return null;
-    }
-    
-    // The LLM returns findings in our standard format — but we only care
-    // about the description field which contains the PoC report text
-    const reportText = response.findings[0]?.description || '';
-    
-    if (!reportText) {
+
+    // Per Claude v11 P1: use callGLMRaw (free-form text) — NOT analyzeWithGLM.
+    // analyzeWithGLM hardcodes a smart-contract vuln-detection system prompt
+    // and demands JSON output, which doesn't work for markdown report
+    // generation. The previous implementation always returned null/empty
+    // because the LLM followed the smart-contract prompt instead of the
+    // report-generation prompt.
+    const messages: GLMMessage[] = [
+      {
+        role: 'system',
+        content: 'You are a security report writer. You write professional bug bounty reports in markdown based ONLY on provided evidence. You do NOT detect vulnerabilities, change severity, or suggest additional attack vectors. You output ONLY markdown text.',
+      },
+      { role: 'user', content: prompt },
+    ];
+    const reportText = await callGLMRaw(messages, {
+      apiKey,
+      model,
+      temperature: 0.2,  // low temp for stable report formatting
+      timeoutMs: 90_000,  // 90s — report writing shouldn't take 4 min
+    });
+
+    if (!reportText || reportText.trim().length === 0) {
       console.log('[generatePoc] LLM returned empty report');
       return null;
     }
-    
-    const cwe = CWE_MAP[finding.type] || 'CWE-?';
-    const curlReplay = `curl -X ${finding.type.includes('upload') ? 'POST' : 'GET'} '${finding.target}${finding.parameter ? '?' + finding.parameter + '=' + encodeURIComponent(finding.payload) : ''}'`;
-    
+
     console.log(`[generatePoc] ✓ PoC generated (${reportText.length} chars)`);
-    
+
+    const cwe = CWE_MAP[finding.type] || 'CWE-?';
+    // Build curl replay using finding.target + parameter + payload.
+    // For GET IDOR: GET /vapi/api1/user/{id} with Authorization-Token header
+    // (we leave the auth-token placeholder since the actual session token is
+    // not part of the static PoC — testers replace <PEER_B_TOKEN> with their own).
+    const isPost = finding.type.includes('upload') || finding.payload?.includes('POST');
+    const curlReplay = isPost
+      ? `curl -X POST '${finding.target}' -H 'Content-Type: application/json' -d '${finding.payload || '<PAYLOAD>'}'`
+      : `curl -X GET '${finding.target}' -H 'Authorization-Token: <PEER_B_TOKEN>'`;
+
+    // Extract sections from the LLM markdown response.
+    // Falls back to the full report text if a section is missing.
+    const sectionAfter = (header: string) => {
+      const re = new RegExp(`##\\s*${header}\\s*([\\s\\S]*?)(?=\\n##\\s|$)`, 'i');
+      const m = reportText.match(re);
+      return m ? m[1].trim() : '';
+    };
+
     return {
       cwe,
-      impact: reportText.split('## Impact')[1]?.split('##')[0]?.trim() || 'See evidence',
-      steps: reportText.split('## Reproduction')[1]?.split('##')[0]?.trim() || curlReplay,
-      remediation: reportText.split('## Remediation')[1]?.trim() || 'See CWE guidance',
+      impact: sectionAfter('Impact') || 'See full report below',
+      steps: sectionAfter('Reproduction') || curlReplay,
+      remediation: sectionAfter('Remediation') || 'See CWE guidance',
       curlReplay,
+      rawReport: reportText,  // preserve full markdown for audit
     };
   } catch (e) {
-    console.error(`[generatePoc] Failed: ${String(e).slice(0, 100)}`);
+    console.error(`[generatePoc] Failed: ${String(e).slice(0, 200)}`);
     return null;
   }
 }
