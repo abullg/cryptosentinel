@@ -609,6 +609,14 @@ async function runAnalysisInBackground(jobId: string, config: {
       }
 
       // DEBUG: log what we have BEFORE the if/else chain
+      // Use updateJob (DB write) instead of console.log — PM2 log buffering
+      // is unreliable. DB write is durable and visible via job-status polling.
+      try {
+        await withTimeout(db.analysisJob.update({
+          where: { id: jobId },
+          data: { progress: 5, message: `PRE-IF-CHECK: bountyMode=${bountyMode} authSessions.len=${authSessions?.length} targetUrl=${targetUrl?.slice(0, 50)}` },
+        }), 5_000, null, 'PRE-IF-CHECK updateJob');
+      } catch {}
       console.log('[analyze-job] PRE-IF-CHECK: bountyMode=' + bountyMode + ' authSessions.len=' + (authSessions?.length ?? 'undef') + ' targetUrl=' + (targetUrl || 'undef'));
 
       // ─── ACTIVE FUZZER (Phase C per Claude §4+§5) ───
