@@ -566,6 +566,9 @@ async function runAnalysisInBackground(jobId: string, config: {
     // Previous hard caps (4 min, 9 min) were too tight and killed AI mid-reasoning.
     // Each pass has its own 300s timeout (5 min) which is generous for 32K tokens.
 
+    // Per Claude v11: bounty mode skips AI analysis — GET-only matrix, no LLM.
+    // The if/else chain below handles bounty mode directly.
+    if (!bountyMode || !authSessions || authSessions.length < 2) {
     await updateJob(30, 'Starting AI surface analysis (pass 1/2)...');
     let aiVulns: any[] = [];
     // Declare OUTSIDE try so catch block can access it
@@ -607,6 +610,8 @@ async function runAnalysisInBackground(jobId: string, config: {
       //
       // The static analysis is passed via the analyze-job POST body as
       // `staticAnalysis` field (modified by benchmark.js + frontend).
+
+    } // end if (!bountyMode) — AI analysis skipped for bounty mode
 
       // V3 of analyze-job: read staticAnalysis from config (passed in from POST body)
       // sa is destructured from config at top of runAnalysisInBackground
