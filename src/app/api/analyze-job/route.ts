@@ -124,6 +124,10 @@ export async function POST(req: NextRequest) {
       noFallback: reqBody?.noFallback === true,  // pass --no-fallback from POST body
       // Static analysis layer (Claude §8) — from /api/fetch-url
       staticAnalysis: staticAnalysis || null,
+      // Per Claude v11 §2: bounty mode — pass auth sessions + owned resources
+      authSessions: authSessions || [],
+      bountyMode: bountyMode === true,
+      ownedResources: ownedResources || [],
     }).catch(async (err) => {
       // Fire-and-forget on error path — don't block on DB
       fireAndForget(
