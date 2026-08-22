@@ -98,6 +98,16 @@ jobs:
           pm2 flush cryptosentinel 2>&1 | tail -2
           echo ""
           cd /opt/cryptosentinel  # FIX: Step 1 cd'd to tests/gt, need to go back
+          echo "=== Git check: ensure latest code ==="
+          git pull --ff-only 2>&1 | tail -3
+          git log --oneline -3
+          echo "=== Verify bounty mode code exists ==="
+          grep -c "bountyMode" src/app/api/analyze-job/route.ts || echo "bountyMode NOT found in code!"
+          echo "=== Verify BOUNTY_MODE env var ==="
+          echo "BOUNTY_MODE=$BOUNTY_MODE"
+          echo "AUTHORIZED_HOSTS=$AUTHORIZED_HOSTS"
+          node -e "console.log('BOUNTY_MODE from node:', process.env.BOUNTY_MODE)" 2>&1
+          echo ""
           GT_ALLOWLIST_ENABLED=false timeout 180 node scripts/hunt.mjs \
             --url "\${TARGET}" \
             --auth-file /tmp/a.json \
