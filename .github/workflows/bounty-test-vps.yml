@@ -125,9 +125,15 @@ jobs:
             --no-fallback 2>&1 || echo "hunt.mjs exited non-zero"
 
           echo ""
-          echo "=== Step 7: PM2 logs (sleep 3 for buffer flush) ==="
+          echo "=== Step 7: Query DB for job message (durable) ==="
+          DB_FILE=$(find /opt/cryptosentinel /data -name "*.db" -type f 2>/dev/null | head -1)
+          if [ -z "$DB_FILE" ]; then DB_FILE="/data/cryptosentinel.db"; fi
+          echo "DB: $DB_FILE"
+          sqlite3 -header -column "$DB_FILE" "SELECT id, progress, message, status FROM AnalysisJob ORDER BY createdAt DESC LIMIT 3;" 2>&1
+          echo ""
+          echo "=== PM2 logs (last 50 lines) ==="
           sleep 3
-          pm2 logs cryptosentinel --lines 200 --nostream --raw 2>&1 | tail -80
+          pm2 logs cryptosentinel --lines 50 --nostream 2>&1 | tail -40
 
           echo ""
           echo "=== Cleanup: remove BOUNTY_MODE from PM2 env ==="
