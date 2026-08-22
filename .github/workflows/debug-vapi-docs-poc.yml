@@ -90,16 +90,24 @@ jobs:
 
           echo ""
           echo "=========================================="
-          echo "PART 3: Run hunt.mjs on vAPI + capture ALL generatePoc PM2 logs"
+          echo "PART 3: Run hunt.mjs on vAPI + dump FULL PoC text from DB"
           echo "=========================================="
-          echo "Re-running hunt.mjs to get fresh generatePoc logs (no filter, all PM2 output)"
+          echo "Order: run hunt → query DB → dump full poc column"
           cd /opt/cryptosentinel
           GT_ALLOWLIST_ENABLED=true timeout 120 node scripts/hunt.mjs \
             --url http://127.0.0.1:3011/ \
             --auth '{"username":"user","password":"user"}' \
             --auth '{"username":"alice","password":"alice"}' \
-            --no-fallback 2>&1 | tail -10 || echo "hunt.mjs exited non-zero"
+            --no-fallback 2>&1 | tail -15 || echo "hunt.mjs exited non-zero"
           echo ""
-          echo "─── PM2 logs (last 800 lines, NO grep filter — capture generatePoc) ───"
-          pm2 logs cryptosentinel --lines 800 --nostream 2>&1 | grep -iE "generatepoc|poc generated|poc failed|api key|glm|skipped|llm returned" | tail -40
+          echo "─── Fresh DB dump: FULL poc column for latest vAPI idor ───"
+          DB_FILE=$(find /opt/cryptosentinel /data -name "*.db" -type f 2>/dev/null | head -1)
+          if [ -z "$DB_FILE" ]; then DB_FILE="/data/cryptosentinel.db"; fi
+          sqlite3 "$DB_FILE" "SELECT length(poc) AS poc_len, substr(poc, 1, 80) AS poc_first80 FROM Vulnerability WHERE type='idor' AND target LIKE '%3011%' ORDER BY createdAt DESC LIMIT 1;" 2>&1
+          echo ""
+          echo "─── FULL poc column text (latest vAPI idor) ───"
+          sqlite3 "$DB_FILE" "SELECT poc FROM Vulnerability WHERE type='idor' AND target LIKE '%3011%' ORDER BY createdAt DESC LIMIT 1;" 2>&1
+          echo ""
+          echo "─── Full evidence + payload columns for same finding ───"
+          sqlite3 "$DB_FILE" "SELECT description, codeSnippet FROM Vulnerability WHERE type='idor' AND target LIKE '%3011%' ORDER BY createdAt DESC LIMIT 1;" 2>&1 | head -50
           REMOTE_EOF
