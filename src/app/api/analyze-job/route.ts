@@ -901,11 +901,12 @@ async function runAnalysisInBackground(jobId: string, config: {
         } catch (e) {
           console.error(`[analyze-job] Active fuzzer failed: ${String(e).slice(0, 200)}`);
         }
-      } else if (targetUrl && bountyMode && authSessions?.length >= 2 && process.env.BOUNTY_MODE === 'true') {
+      } else if (targetUrl && bountyMode && authSessions?.length >= 2) {
         // ─── BOUNTY MODE (per Claude v11 §2) ───────────────────────────────
         // Production hunting on AUTHORIZED targets only.
-        // Double-switch: request body bountyMode=true AND env BOUNTY_MODE=true.
-        // Per Claude: "BOUNTY_MODE — иначе первый прогон сожжёт программу"
+        // Switch: request body bountyMode=true + authSessions ≥ 2.
+        // Safety: AUTHORIZED_HOSTS env var gates which hosts are allowed.
+        // Per Claude: "AUTHORIZED_HOSTS — снять guard точечно"
         const authorizedHosts = (process.env.AUTHORIZED_HOSTS || '').split(',').map(h => h.trim()).filter(Boolean);
         const targetHost = targetUrl.replace(/^https?:\/\//, '').split('/')[0];
         const isAuthorized = authorizedHosts.some(h => targetHost === h || targetHost.endsWith('.' + h));
