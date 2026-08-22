@@ -1,0 +1,120 @@
+name: Bounty Test (VPS Express-GT)
+on:
+  workflow_dispatch:
+
+jobs:
+  bounty:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p 22 -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Bounty mode test on VPS Express-GT (via public IP, not localhost)
+        run: |
+          HOST="${{ secrets.VPS_HOST }}"
+          USER="${{ secrets.VPS_USER || 'root' }}"
+
+          echo "============================================================"
+          echo "  Bounty Test — VPS Express-GT via public IP"
+          echo "  VPS Host: $HOST"
+          echo "  Target: http://$HOST:3010/ (Express-GT, non-localhost)"
+          echo "  What happens:"
+          echo "    1. Ensure Express-GT is running on port 3010"
+          echo "    2. Login as user A (user:user) → JWT A"
+          echo "    3. Login as user B (alice:alice) → JWT B"
+          echo "    4. Set AUTHORIZED_HOSTS + BOUNTY_MODE on PM2"
+          echo "    5. Run hunt.mjs --mode bounty --owned /api/users/1"
+          echo "    6. Matrix: B does GET /api/users/1 with B's JWT"
+          echo "       → if body contains user A's data → IDOR confirmed"
+          echo "    7. Cleanup BOUNTY_MODE from PM2 env (safety)"
+          echo "============================================================"
+
+          ssh -p 22 -o StrictHostKeyChecking=no -o ConnectTimeout=60 -i ~/.ssh/id_ed25519 $USER@$HOST "bash -s" <<REMOTE_EOF
+          set +e
+          cd /opt/cryptosentinel
+
+          echo "=== Step 1: Ensure Express-GT is running ==="
+          cd /opt/cryptosentinel/tests/gt
+          docker compose up -d 2>&1 | tail -5
+          sleep 5
+          docker compose ps 2>&1 | tail -5
+
+          echo ""
+          echo "=== Step 2: Login as user A (user:user) ==="
+          TARGET="http://${HOST}:3010"
+          LOGIN_A=\$(curl -s --max-time 10 -X POST -H "Content-Type: application/json" \
+            -d '{"username":"user","password":"user"}' \
+            "\${TARGET}/api/login")
+          TOKEN_A=\$(echo "\$LOGIN_A" | python3 -c "import json,sys; r=json.load(sys.stdin); print(r.get('token','') or r.get('accessToken',''))" 2>/dev/null)
+          echo "Token A: \${TOKEN_A:0:40}..."
+
+          echo "=== Step 3: Login as user B (alice:alice) ==="
+          LOGIN_B=\$(curl -s --max-time 10 -X POST -H "Content-Type: application/json" \
+            -d '{"username":"alice","password":"alice"}' \
+            "\${TARGET}/api/login")
+          TOKEN_B=\$(echo "\$LOGIN_B" | python3 -c "import json,sys; r=json.load(sys.stdin); print(r.get('token','') or r.get('accessToken',''))" 2>/dev/null)
+          echo "Token B: \${TOKEN_B:0:40}..."
+
+          if [ -z "\$TOKEN_A" ] || [ -z "\$TOKEN_B" ]; then
+            echo "ERROR: Could not login to Express-GT at \$TARGET"
+            echo "Login A response: \$LOGIN_A"
+            echo "Login B response: \$LOGIN_B"
+            exit 1
+          fi
+
+          echo ""
+          echo "=== Step 4: Create auth files ==="
+          cat > /tmp/a.json <<EOF
+          {"headers":{"Authorization":"Bearer \${TOKEN_A}"},"owned":["/api/users/1","/api/users/2"]}
+          EOF
+          cat > /tmp/b.json <<EOF
+          {"headers":{"Authorization":"Bearer \${TOKEN_B}"}}
+          EOF
+          echo "a.json: \$(cat /tmp/a.json | head -c 150)"
+          echo "b.json: \$(cat /tmp/b.json | head -c 150)"
+
+          echo ""
+          echo "=== Step 5: Set AUTHORIZED_HOSTS + BOUNTY_MODE on PM2 ==="
+          ECOSYSTEM=/opt/cryptosentinel/ecosystem.config.js
+          if [ -f "\$ECOSYSTEM" ]; then
+            # Remove old entries first (idempotent)
+            sed -i '/AUTHORIZED_HOSTS/d; /BOUNTY_MODE/d' "\$ECOSYSTEM"
+            # Add fresh
+            sed -i "s/env: {/env: {\\n        AUTHORIZED_HOSTS: \"${HOST}\",\\n        BOUNTY_MODE: \"true\",/" "\$ECOSYSTEM"
+          fi
+          grep -E "AUTHORIZED_HOSTS|BOUNTY_MODE" "\$ECOSYSTEM" 2>/dev/null
+          pm2 restart cryptosentinel --update-env 2>&1 | tail -3
+          echo "Waiting 10s for PM2 to pick up env vars..."
+          sleep 10
+          pm2 list 2>&1 | head -5
+
+          echo ""
+          echo "=== Step 6: Flush PM2 logs + run hunt.mjs ==="
+          pm2 flush cryptosentinel 2>&1 | tail -2
+          echo ""
+          GT_ALLOWLIST_ENABLED=false timeout 180 node scripts/hunt.mjs \
+            --url "\${TARGET}" \
+            --auth-file /tmp/a.json \
+            --auth-file /tmp/b.json \
+            --mode bounty \
+            --owned '/api/users/1,/api/users/2' \
+            --no-fallback 2>&1 || echo "hunt.mjs exited non-zero"
+
+          echo ""
+          echo "=== Step 7: PM2 logs (bounty mode telemetry) ==="
+          pm2 logs cryptosentinel --lines 300 --nostream 2>&1 | grep -iE "BOUNTY|authorized|bounty|session|owned|matrix|confirmed|IDOR|PASSIVE|CRAWLER|auth\.A|auth\.B|first.party|login|Step 3.5|crawlForApi|Discovered|resource" | tail -80
+
+          echo ""
+          echo "=== Cleanup: remove BOUNTY_MODE from PM2 env ==="
+          if [ -f "\$ECOSYSTEM" ]; then
+            sed -i '/AUTHORIZED_HOSTS/d; /BOUNTY_MODE/d' "\$ECOSYSTEM"
+            pm2 restart cryptosentinel --update-env 2>&1 | tail -2
+          fi
+          rm -f /tmp/a.json /tmp/b.json
+          echo "Cleanup done — BOUNTY_MODE removed, AUTHORIZED_HOSTS removed"
+          REMOTE_EOF
