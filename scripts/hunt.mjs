@@ -1,20 +1,32 @@
 #!/usr/bin/env node
 
 /**
- * CryptoSentinel Hunt CLI — per Claude v10 DoD item 8.
+ * CryptoSentinel Hunt CLI — per Claude v10 DoD item 8 + v11 bounty mode.
  *
- * Usage:
- *   node hunt.mjs --url http://target:port \
+ * GT mode (lab):
+ *   node hunt.mjs --url http://127.0.0.1:3010 \
  *     --auth '{"username":"user","password":"user"}' \
  *     --auth '{"username":"admin","password":"admin"}' \
- *     --no-fallback \
- *     --generate-poc
+ *     --no-fallback --generate-poc
  *
- * This is a thin CLI wrapper that calls the same /api/fetch-url + /api/analyze-job
- * endpoints as benchmark.js, but for a SINGLE target with explicit auth config.
+ * Bounty mode (production, per Claude v11 §2):
+ *   node hunt.mjs --url https://staging.yours.com \
+ *     --auth-file ./a.json --auth-file ./b.json \
+ *     --mode bounty --owned '/api/orders/123,/api/profile/456' \
+ *     --no-fallback
  *
- * Per Claude: "CLI — тонкая обёртка, не вынос из Next.js. Скрипт hunt.mjs,
- * который вызывает те же функции, что /api/analyze-job"
+ * a.json format (header-based sessions, NOT username/password):
+ *   {
+ *     "headers": {
+ *       "Cookie": "session=abc123",
+ *       "Authorization": "Bearer eyJ..."
+ *     },
+ *     "owned": ["/api/orders/123"]
+ *   }
+ *
+ * Per Claude v11: "Сессии приносите вы, crawler их не угадывает.
+ * DeFi не логинится через POST /api/login. Нужен вход через
+ * DevTools → copy headers → --auth-file."
  */
 
 import { readFileSync } from 'fs';
@@ -27,30 +39,51 @@ for (let i = 0; i < args.length; i++) {
   else if (args[i] === '--auth-file') { if (!opts.auths) opts.auths = []; opts.auths.push(JSON.parse(readFileSync(args[++i], 'utf-8'))); }
   else if (args[i] === '--no-fallback') opts.noFallback = true;
   else if (args[i] === '--generate-poc') opts.generatePoc = true;
+  else if (args[i] === '--mode') opts.mode = args[++i];  // 'gt' | 'bounty'
+  else if (args[i] === '--owned') opts.owned = args[++i].split(',').map(s => s.trim());  // comma-separated resource paths
   else if (args[i] === '--scope') opts.scope = args[++i];
   else if (args[i] === '--api-base') opts.apiBase = args[++i];
   else if (args[i] === '--help' || args[i] === '-h') {
     console.log(`CryptoSentinel Hunt CLI
 
-Usage:
+Usage (GT mode — lab):
   node hunt.mjs --url http://127.0.0.1:3010 \\
     --auth '{"username":"user","password":"user"}' \\
     --auth '{"username":"admin","password":"admin"}' \\
     --no-fallback --generate-poc
 
+Usage (bounty mode — production, per Claude v11 §2):
+  node hunt.mjs --url https://staging.yours.com \\
+    --auth-file ./a.json --auth-file ./b.json \\
+    --mode bounty --owned '/api/orders/123,/api/profile/456' \\
+    --no-fallback
+
+  a.json format (header-based sessions, NOT username/password):
+    {
+      "headers": {
+        "Cookie": "session=abc123",
+        "Authorization": "Bearer eyJ..."
+      },
+      "owned": ["/api/orders/123"]
+    }
+
 Options:
   --url URL          Target URL to scan
-  --auth JSON        Auth config (can repeat for multiple users)
+  --auth JSON        Auth config: {username, password} for GT mode (can repeat)
   --auth-file FILE   Auth config from JSON file (can repeat)
+                      Bounty format: {headers: {Cookie, Authorization}, owned: [...]}
+  --mode MODE        'gt' (default, full matrix) | 'bounty' (GET-only, no register)
+  --owned PATHS      Comma-separated resource paths owned by account A
+                      (e.g. /api/orders/123,/api/profile/456)
   --no-fallback      Don't fall back to hardcoded oracles if crawler finds 0
   --generate-poc     Generate PoC report text for confirmed findings (needs API key)
   --scope FILE       Scope allowlist file (one URL pattern per line)
   --api-base URL     API base URL (default: http://localhost:3000)
   --help             Show this help
 
-Per Claude v10: "на вход — base URL + 2 учётки; на выход — confirmed
-+ curl-replay + черновик отчёта. Сначала на Express-GT без
-захардкоженных путей."
+Per Claude v11: bounty mode = GET-only matrix, no self-register,
+no PUT/DELETE, no WAF bypass. Sessions brought by user via
+--auth-file headers. Owned resource IDs via --owned.
 `);
     process.exit(0);
   }
@@ -66,9 +99,11 @@ const API_BASE = opts.apiBase || 'http://localhost:3000';
 async function hunt() {
   console.log(`CryptoSentinel Hunt`);
   console.log(`  Target: ${opts.url}`);
-  console.log(`  Auth: ${opts.auths?.length || 0} users`);
+  console.log(`  Auth: ${opts.auths?.length || 0} ${opts.mode === 'bounty' ? 'sessions (header-based)' : 'users (username/password)'}`);
+  console.log(`  Mode: ${opts.mode || 'gt'}`);
   console.log(`  No-fallback: ${opts.noFallback || false}`);
   console.log(`  Generate-PoC: ${opts.generatePoc || false}`);
+  if (opts.owned) console.log(`  Owned resources (A): ${opts.owned.length} paths`);
   console.log();
 
   // Step 1: Fetch URL
@@ -105,8 +140,12 @@ async function hunt() {
       discoveredParams: data.discoveredParams || [],
       staticAnalysis: data.staticAnalysis || null,
       noFallback: opts.noFallback || false,
+      // Per Claude v11: pass auth sessions + bounty mode + owned resources
+      authSessions: opts.auths || [],  // [{headers: {Cookie, Authorization}, owned: [...]}]
+      bountyMode: opts.mode === 'bounty',
+      ownedResources: opts.owned || [],  // ['/api/orders/123', ...]
     }),
-    signal: AbortSignal.timeout(15_000),
+    signal: AbortSignal.timeout(opts.mode === 'bounty' ? 300_000 : 15_000),  // bounty: 5min (passive crawl + GET-only matrix)
   });
   if (!analyzeRes.ok) {
     console.error(`  ANALYZE FAILED: ${analyzeRes.status}`);

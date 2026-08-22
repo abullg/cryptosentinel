@@ -49,6 +49,10 @@ export async function POST(req: NextRequest) {
             // Contains gitleaks findings + sink-hints + skipLLM flag.
             // If skipLLM=true, LLM is not invoked at all.
             staticAnalysis,
+            // Per Claude v11 §2: bounty mode — production hunting on authorized targets
+            authSessions,  // [{headers: {Cookie, Authorization}, owned: [...]}]
+            bountyMode,   // boolean — GET-only matrix, no self-register, no PUT/DELETE
+            ownedResources,  // ['/api/orders/123', ...] — user-provided resource IDs owned by A
     } = body;
     const reqBody = body;  // alias for later access (e.g. sa = reqBody?.staticAnalysis)
 
@@ -897,6 +901,83 @@ async function runAnalysisInBackground(jobId: string, config: {
         } catch (e) {
           console.error(`[analyze-job] Active fuzzer failed: ${String(e).slice(0, 200)}`);
         }
+      } else if (targetUrl && bountyMode && authSessions?.length >= 2 && process.env.BOUNTY_MODE === 'true') {
+        // ─── BOUNTY MODE (per Claude v11 §2) ───────────────────────────────
+        // Production hunting on AUTHORIZED targets only.
+        // Double-switch: request body bountyMode=true AND env BOUNTY_MODE=true.
+        // Per Claude: "BOUNTY_MODE — иначе первый прогон сожжёт программу"
+        const authorizedHosts = (process.env.AUTHORIZED_HOSTS || '').split(',').map(h => h.trim()).filter(Boolean);
+        const targetHost = targetUrl.replace(/^https?:\/\//, '').split('/')[0];
+        const isAuthorized = authorizedHosts.some(h => targetHost === h || targetHost.endsWith('.' + h));
+        if (!isAuthorized) {
+          console.log(`[analyze-job] BOUNTY MODE: target ${targetHost} NOT in AUTHORIZED_HOSTS [${authorizedHosts.join(', ')}] — falling back to passive crawler`);
+          // Fall through to passive crawler below
+        } else {
+          console.log(`[analyze-job] BOUNTY MODE: target ${targetHost} IS authorized — running GET-only matrix with user-provided sessions`);
+          try {
+            // Build AuthSession objects from user-provided auth files
+            // a.json = {headers: {Cookie: "...", Authorization: "Bearer ..."}, owned: ["/api/orders/123"]}
+            const sessionA: any = {
+              token: authSessions[0]?.headers?.['Authorization'] || authSessions[0]?.headers?.['authorization'] || '',
+              cookies: authSessions[0]?.headers?.['Cookie'] || authSessions[0]?.headers?.['cookie'] || '',
+              username: 'userA',
+              role: 'user',
+              authHeader: 'Authorization',
+            };
+            const sessionB: any = {
+              token: authSessions[1]?.headers?.['Authorization'] || authSessions[1]?.headers?.['authorization'] || '',
+              cookies: authSessions[1]?.headers?.['Cookie'] || authSessions[1]?.headers?.['cookie'] || '',
+              username: 'userB',
+              role: 'user',
+              authHeader: 'Authorization',
+            };
+            // Merge owned resources from --owned flag + auth file
+            const ownedPaths = [
+              ...(ownedResources || []),
+              ...(authSessions[0]?.owned || []),
+            ].filter(Boolean);
+
+            console.log(`[analyze-job]   Session A: ${sessionA.token ? 'Bearer token set' : 'cookie-based'}, owned=${ownedPaths.length} resources`);
+            console.log(`[analyze-job]   Session B: ${sessionB.token ? 'Bearer token set' : 'cookie-based'} (peer)`);
+
+            // Build resources from user-provided owned paths
+            // These are paths A OWNS — B will try to GET them
+            const bountyResources = ownedPaths.map((p: string) => ({
+              path: p.includes('{id}') || p.includes(':id') ? p : p,
+              method: 'GET',
+              parameterized: p.includes('{id}') || p.includes(':id'),
+              paramType: 'int' as const,
+              sampleIds: [1, 2, 3],
+            }));
+
+            if (bountyResources.length === 0) {
+              console.log(`[analyze-job]   No owned resources provided — matrix has nothing to test. Provide --owned '/api/orders/123' or auth file with "owned": [...]`);
+            } else {
+              console.log(`[analyze-job]   Running GET-only matrix on ${bountyResources.length} owned resource(s)...`);
+              const bountyConfig = {
+                baseUrl: targetUrl.replace(/\/+$/, ''),
+                sessionA,
+                sessionB,
+                resources: bountyResources,
+                timeoutMs: 15_000,
+              };
+              // BOUNTY MODE: only test IDOR (GET) — skip mass-assign, BFLA, missing-authn
+              // Per Claude: "только GET (IDOR + missing authn), запрет PUT {role:admin}, DELETE"
+              // missing_authn is also GET (anonymous GET) — safe for bounty
+              const { runIdentityMatrix } = await import('@/lib/identity-matrix');
+              const matrixResult = await runIdentityMatrix(bountyConfig);
+              const bountyFindings = matrixResult.findings.filter(f => f.confirmed);
+              console.log(`[analyze-job]   Bounty matrix: ${bountyFindings.length} confirmed (GET-only IDOR)`);
+              for (const f of bountyFindings) {
+                console.log(`[analyze-job]     ✅ CONFIRMED ${f.type}: ${f.evidence.slice(0, 120)}`);
+              }
+              fuzzFindings.push(...bountyFindings);
+            }
+          } catch (e) {
+            console.error(`[analyze-job] Bounty mode failed: ${String(e).slice(0, 200)}`);
+          }
+        }
+        // If not authorized OR bounty didn't confirm → fall through to passive crawler
       } else if (targetUrl && !targetUrl.startsWith('http://127.0.0.1') && !targetUrl.startsWith('http://localhost')) {
         // ─── PASSIVE CRAWLER for production targets (per Claude §7) ───
         // For non-localhost targets, run ONLY passive discovery:
