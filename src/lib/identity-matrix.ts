@@ -24,6 +24,17 @@ export interface AuthSession {
   role: string;
   cookies?: string;
   authHeader?: string;  // custom auth header (e.g., 'Authorization-Token' for vAPI)
+  // Per Claude v11 (P0): ownership-based IDOR oracle. After A registers
+  // a new resource via POST, the response typically echoes back the
+  // created record with its `id` and A's unique fields (username, email).
+  // This is the "ownership proof" — when B (peer) does GET /{id} on
+  // A's just-created resource and sees A's username/email in the body,
+  // that's bytewise proof B reached A's object (not B's own).
+  // Without this, the matrix was probing seed user IDs (1, 2, 3) and
+  // looking for `flag{...}` — a CTF-shaped criterion that breaks on real
+  // production APIs where the BOLA victim field is just `username: "alice"`.
+  ownedResourceId?: string | number;  // id of the resource A created via POST
+  ownedUniqueFields?: Record<string, any>;  // A-specific fields from create response (username, email, etc.)
 }
 
 export interface DiscoveredResource {
@@ -83,8 +94,31 @@ async function fetchJson(url: string, opts: RequestInit, timeoutMs: number): Pro
 }
 
 /**
- * IDOR (horizontal): user B accesses user A's resource by ID.
- * Oracle: 200 + response body contains data belonging to user A.
+ * IDOR (horizontal): peer B accesses user A's resource by ID.
+ *
+ * Per Claude v11 P0 review: the previous oracle was CTF-shaped — it looked
+ * for value patterns (flag{...}, JWT, ≥24-char high-entropy strings) and
+ * skipped any field whose name wasn't in a hardcoded `sensitiveFields` list.
+ * That broke on real production APIs where the BOLA victim field is just
+ * `username: "alice"` — the oracle said "no sensitive fields, skip" and the
+ * bug was missed.
+ *
+ * New oracle (ownership-based, bytewise proof):
+ *   1. A "owns" resource R if A created it (POST returned R.id + A-specific
+ *      fields like A.username, A.email, or any field A set in the create body).
+ *   2. B (peer, NOT admin) does GET /R/{id} → CONFIRM ⟺ 2xx AND body
+ *      contains A's specific data (A's username, A's email, etc.).
+ *   3. NEGATIVE CONTROL: anonymous GET on /R/{id} must NOT return A's data
+ *      with 2xx. If it does, the resource is a public catalog (not BOLA) —
+ *      downgrade severity to 'info' and don't count as IDOR.
+ *   4. flag{...}/JWT/PAN value-shapes are now SEVERITY AMPLIFIERS, not
+ *      confirmation criteria. They bump severity 'high' → 'critical' but
+ *      don't gate the confirm itself.
+ *
+ * To use this oracle, the crawler must populate sessionA.ownedResourceId
+ * (the id A got back from POST) and sessionA.ownedUniqueFields (A's
+ * username/email/etc. from the create response). If those are absent,
+ * fall back to the legacy heuristic (sensitive-fields + value-shape).
  */
 async function testIdor(
   config: IdentityMatrixConfig,
@@ -98,11 +132,113 @@ async function testIdor(
   // B — user, тот же роль/tenant ← только так IDOR; Admin — для BFLA."
   // IDOR = HORIZONTAL: peer (same role) accesses another peer's data.
   // If B = admin → this is NOT IDOR (admin accessing user data is normal).
-  // Skip IDOR test if sessionB.role === 'admin'.
   if (config.sessionB.role === 'admin' || config.sessionB.role === 'administrator') {
     console.log(`[matrix]   idor: skipping — sessionB is admin (not peer). IDOR requires B = same-role peer.`);
     return [];
   }
+
+  // ─── PRIMARY ORACLE: ownership-based (Claude v11 P0) ──────────────────
+  // When sessionA has ownedUniqueFields (A's username/email from create
+  // response), use them as the bytewise proof — "B's response contains
+  // A's unique field" → BOLA confirmed, regardless of value shape.
+  const aOwnedFields = config.sessionA.ownedUniqueFields;
+  if (aOwnedFields && Object.keys(aOwnedFields).length > 0) {
+    // Step 1: A GETs the resource (sanity — should be 2xx for A's own resource)
+    const resA = await fetchJson(
+      `${config.baseUrl}${path}`,
+      { headers: makeHeaders(config.sessionA) },
+      config.timeoutMs,
+    );
+    if (resA.status < 200 || resA.status >= 300) {
+      console.log(`[matrix]   idor (ownership): A GET ${path} → ${resA.status} (baseline failed)`);
+      return [];
+    }
+
+    // Step 2: Peer B GETs the same resource
+    const resB = await fetchJson(
+      `${config.baseUrl}${path}`,
+      { headers: makeHeaders(config.sessionB) },
+      config.timeoutMs,
+    );
+    if (resB.status < 200 || resB.status >= 300) {
+      console.log(`[matrix]   idor (ownership): B GET ${path} → ${resB.status} (authz check exists — good)`);
+      return [];
+    }
+
+    // Step 3: Check if B's response contains A's owned unique fields
+    const bBodyStr = resB.raw || (resB.body ? JSON.stringify(resB.body) : '');
+    const leakedFields: string[] = [];
+    for (const [field, value] of Object.entries(aOwnedFields)) {
+      if (value == null) continue;
+      if (bBodyStr.includes(String(value))) {
+        leakedFields.push(field);
+      }
+    }
+
+    if (leakedFields.length === 0) {
+      console.log(`[matrix]   idor (ownership): B got 2xx but body does not contain A's unique fields — not A's object (or B's own object)`);
+      return [];
+    }
+
+    // Step 4: NEGATIVE CONTROL — anonymous GET must NOT return A's data with 2xx.
+    // If it does, the resource is public (catalog), not BOLA — downgrade.
+    const resAnon = await fetchJson(
+      `${config.baseUrl}${path}`,
+      { headers: { 'User-Agent': 'CryptoSentinel-Identity-Matrix/1.0' } },  // no auth
+      config.timeoutMs,
+    );
+    const anonBodyStr = resAnon.raw || (resAnon.body ? JSON.stringify(resAnon.body) : '');
+    let anonAlsoLeaks = false;
+    if (resAnon.status >= 200 && resAnon.status < 300) {
+      // Check if anonymous response contains A's unique fields too
+      for (const [, value] of Object.entries(aOwnedFields)) {
+        if (value != null && anonBodyStr.includes(String(value))) {
+          anonAlsoLeaks = true;
+          break;
+        }
+      }
+    }
+
+    if (anonAlsoLeaks) {
+      // Public catalog — not BOLA. Skip (don't pollute findings with non-bugs).
+      console.log(`[matrix]   idor (ownership): ⚠️ anonymous GET also returns A's data — public catalog, not BOLA. Skipping.`);
+      return [];
+    }
+
+    // CONFIRMED — B accessed A's object bytewise.
+    // Severity amplifier: if any leaked field's VALUE looks like a secret
+    // (flag{...}, JWT, ≥24-char high-entropy, etc.), bump to critical.
+    let amplifiedBy: string[] = [];
+    for (const f of leakedFields) {
+      const v = aOwnedFields[f];
+      if (v != null && looksLikeSecretValue(String(v))) {
+        amplifiedBy.push(f);
+      }
+    }
+    const severity = amplifiedBy.length > 0 ? 'critical' : 'high';
+
+    const evidence = `IDOR (horizontal) confirmed via ownership proof: user B (${config.sessionB.username}) accessed resource id=${resourceId} owned by user A (${config.sessionA.username}). B's response body contained A's unique fields: ${leakedFields.map(f => `${f}=${aOwnedFields[f]}`).join(', ')}. Anonymous GET returned ${resAnon.status} (no public access). No per-resource authorization check — any authenticated peer can read any other peer's resource by ID.${amplifiedBy.length > 0 ? ` Severity amplified to critical by secret-shaped values in fields: ${amplifiedBy.join(', ')}.` : ''}`;
+
+    findings.push({
+      type: 'idor',
+      severity,
+      confirmed: true,
+      oracle: 'auth-diff',
+      evidence,
+      payload: `GET ${path} with peer B's token (B ≠ A, same role) → 2xx + body contains A's unique data`,
+      target: `${config.baseUrl}${path}`,
+      parameter: 'id (path)',
+    });
+    console.log(`[matrix]   idor (ownership): ✅ CONFIRMED — B reached A's object via ${leakedFields.join(', ')}${amplifiedBy.length > 0 ? ` (severity amplified: ${amplifiedBy.join(', ')})` : ''}`);
+    return findings;
+  }
+
+  // ─── LEGACY FALLBACK (no ownership proof available) ───────────────────
+  // Used when crawler didn't capture ownedResourceId (e.g., login-based
+  // session without registration). Uses the old sensitive-fields heuristic.
+  // Kept for backward compatibility — Express-GT, VAmPI may still hit this
+  // path until they're updated to propagate ownedUniqueFields.
+  console.log(`[matrix]   idor (legacy): sessionA.ownedUniqueFields not set — falling back to sensitive-fields heuristic`);
 
   // Step 1: User A GETs their own resource (baseline)
   const resA = await fetchJson(
@@ -116,51 +252,31 @@ async function testIdor(
     return [];
   }
 
-  // Extract user A's sensitive fields. Two detection paths:
-  //  (a) Field name in a known sensitive-field list (email, password, …)
-  //  (b) Field VALUE looks like a secret/flag — covers vAPI's `course`
-  //      field that stores flag{api1_...}, and any custom field whose
-  //      value is a CTF flag, JWT, API key, etc. This is generic — we
-  //      don't hardcode `course` (that would be vAPI-specific).
+  // Extract user A's data — used to verify "B got A's exact object".
+  // All non-public A-specific fields are candidates.
   const sensitiveFields = ['ssn', 'email', 'password', 'token', 'secret', 'balance', 'phone', 'address', 'apikey', 'api_key', 'private_key', 'ssn_last4'];
   const aSensitiveData: Record<string, any> = {};
-  const publicFields = new Set(['id', 'username', 'name', 'first_name', 'last_name', 'display_name', 'avatar', 'profile_pic', 'created_at', 'updated_at']);
-  // Heuristic: detect common secret/flag value shapes in the response body.
-  const looksLikeSecret = (v: any): boolean => {
-    if (v == null) return false;
-    const s = String(v);
-    if (s.length < 4) return false;
-    // CTF flags (flag{...}, FLAG{...}, CTF{...})
-    if (/\b(?:flag|FLAG|CTF|ctf)\{[^}]{4,}\}/.test(s)) return true;
-    // JWT (3 base64 segments separated by dots)
-    if (/^ey[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}$/.test(s)) return true;
-    // API keys / bearer tokens (high-entropy strings ≥ 24 chars)
-    if (/^[A-Za-z0-9_\-]{24,}$/.test(s)) return true;
-    // Long hex strings (private keys, hashes, secrets) ≥ 32 hex chars
-    if (/^[a-f0-9]{32,}$/i.test(s)) return true;
-    // Credit-card-shaped (groups of 4 digits)
-    if (/^\d{4}[ -]?\d{4}[ -]?\d{4}[ -]?\d{4}$/.test(s)) return true;
-    return false;
-  };
+  const publicFields = new Set(['id', 'first_name', 'last_name', 'display_name', 'avatar', 'profile_pic', 'created_at', 'updated_at']);
+  // NOTE: 'username' and 'name' are NOT in publicFields anymore — Claude v11
+  // pointed out that 'username' IS the bytewise proof of "B reached A's
+  // object, not B's own". Excluding them was hiding real BOLA.
   if (resA.body && typeof resA.body === 'object') {
     for (const [field, value] of Object.entries(resA.body)) {
-      if (sensitiveFields.includes(field.toLowerCase())) {
+      const fLower = field.toLowerCase();
+      if (sensitiveFields.includes(fLower)) {
         aSensitiveData[field] = value;
         continue;
       }
-      // Skip public-ish fields — we don't want 'id' or 'username' to trigger
-      // false IDOR positives (those are often public and not a leak).
-      if (publicFields.has(field.toLowerCase())) continue;
-      // Otherwise: if the VALUE itself looks like a secret, treat the field
-      // as sensitive (this is what catches vAPI's `course: "flag{api1_...}"`).
-      if (looksLikeSecret(value)) {
+      if (publicFields.has(fLower)) continue;
+      // Any other field is a candidate (username, name, course, etc.)
+      if (value != null && String(value).length >= 1) {
         aSensitiveData[field] = value;
       }
     }
   }
 
   if (Object.keys(aSensitiveData).length === 0) {
-    console.log(`[matrix]   idor: no sensitive fields in A's response — skipping`);
+    console.log(`[matrix]   idor: no A-specific fields in response — skipping`);
     return [];
   }
 
@@ -171,29 +287,36 @@ async function testIdor(
     config.timeoutMs,
   );
 
-  // Oracle: 200 + B's response contains A's sensitive data
-  if (resB.status === 200 && resB.body) {
+  // Oracle: 2xx + B's response contains A's exact value for an A-specific field
+  if (resB.status >= 200 && resB.status < 300 && resB.body) {
     const bData = JSON.stringify(resB.body);
     let leakedFields: string[] = [];
     for (const [field, value] of Object.entries(aSensitiveData)) {
-      // Check if B's response contains A's exact value for this field
       if (bData.includes(String(value))) {
         leakedFields.push(field);
       }
     }
 
     if (leakedFields.length > 0) {
+      // Severity amplifier
+      let amplifiedBy: string[] = [];
+      for (const f of leakedFields) {
+        if (looksLikeSecretValue(String(aSensitiveData[f]))) {
+          amplifiedBy.push(f);
+        }
+      }
+      const severity = amplifiedBy.length > 0 ? 'critical' : 'high';
       findings.push({
         type: 'idor',
-        severity: 'high',
+        severity,
         confirmed: true,
         oracle: 'auth-diff',
-        evidence: `IDOR (horizontal) confirmed: user B (${config.sessionB.username}) accessed resource id=${resourceId} belonging to user A (${config.sessionA.username}). Response contained A's sensitive fields: ${leakedFields.join(', ')}. Values: ${leakedFields.map(f => `${f}=${aSensitiveData[f]}`).join(', ')}. No per-user authorization check — any authenticated user can access any resource by ID.`,
+        evidence: `IDOR (horizontal) confirmed: user B (${config.sessionB.username}) accessed resource id=${resourceId}. B's response contained A's specific fields: ${leakedFields.join(', ')}. Values: ${leakedFields.map(f => `${f}=${aSensitiveData[f]}`).join(', ')}. No per-user authorization check — any authenticated user can access any resource by ID.${amplifiedBy.length > 0 ? ` Severity amplified by secret-shaped values: ${amplifiedBy.join(', ')}.` : ''}`,
         payload: `GET ${path} with Bearer token of user B (different from user A who owns the resource)`,
         target: `${config.baseUrl}${path}`,
         parameter: 'id (path)',
       });
-      console.log(`[matrix]   idor: ✅ CONFIRMED — B accessed A's data (${leakedFields.join(', ')})`);
+      console.log(`[matrix]   idor: ✅ CONFIRMED — B accessed A's data (${leakedFields.join(', ')})${amplifiedBy.length > 0 ? ` (severity amplified: ${amplifiedBy.join(', ')})` : ''}`);
     }
   } else if (resB.status === 401 || resB.status === 403) {
     console.log(`[matrix]   idor: B got ${resB.status} — authz check exists (good)`);
@@ -202,6 +325,28 @@ async function testIdor(
   }
 
   return findings;
+}
+
+/**
+ * Severity amplifier (NOT a confirmation criterion).
+ * Detects value shapes that, when present in a confirmed IDOR leak,
+ * bump severity 'high' → 'critical'. Per Claude v11 P0: this function
+ * must NEVER be the only reason an IDOR is confirmed — the primary
+ * oracle is ownership proof (B's response contains A's unique fields).
+ */
+function looksLikeSecretValue(s: string): boolean {
+  if (!s || s.length < 4) return false;
+  // CTF flags (flag{...}, FLAG{...}, CTF{...})
+  if (/\b(?:flag|FLAG|CTF|ctf)\{[^}]{4,}\}/.test(s)) return true;
+  // JWT (3 base64 segments separated by dots)
+  if (/^ey[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}$/.test(s)) return true;
+  // Long hex (private key / hash, ≥32 hex chars)
+  if (/^[a-f0-9]{32,}$/i.test(s)) return true;
+  // Credit-card-shaped (dddd-dddd-dddd-dddd)
+  if (/^\d{4}[ -]?\d{4}[ -]?\d{4}[ -]?\d{4}$/.test(s)) return true;
+  // NOTE: the old ≥24-char [A-Za-z0-9_-] rule was too broad — it matched
+  // UUIDs, slugs, public ids. Removed per Claude v11 P0 review.
+  return false;
 }
 
 /**

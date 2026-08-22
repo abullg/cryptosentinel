@@ -308,7 +308,10 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
   // Discovered paths map — declared here at top of function so Step 1 (base64
   // auth fallback can pre-populate it with derived /{id} endpoints) and Step 3
   // (HTML/JS crawl) can both append to it without TDZ issues.
-  const discoveredPaths = new Map<string, { path: string; method: string }>();
+  // Optional ownedId: when the path was derived from a successful registration,
+  // we record the resource id the server assigned to A. The matrix then
+  // prioritizes probing A's owned id (cleanest bytewise IDOR proof).
+  const discoveredPaths = new Map<string, { path: string; method: string; ownedId?: string | number }>();
 
   // Step 1: Login (if auth configured)
   if (config.auth) {
@@ -359,7 +362,12 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
       // credentials that were registered ON THAT API's path, otherwise
       // the API's auth check (where('username', X)->where('password', Y))
       // will reject with 403 and the matrix will say "baseline failed".
-      const successfulRegCreds: { path: string; username: string; password: string }[] = [];
+      //
+      // Per Claude v11 P0: also captures ownership proof (createdId +
+      // uniqueFields from registration response) so the identity matrix
+      // can run the new ownership-based IDOR oracle instead of the legacy
+      // flag{...} heuristic.
+      const successfulRegCreds: { path: string; username: string; password: string; createdId?: string | number; uniqueFields?: Record<string, any> }[] = [];
       for (const regPath of registerPaths) {
         // Generate unique username + email per attempt
         const botId = `csbot${Date.now().toString(36).slice(-6)}`;
@@ -376,12 +384,17 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
         );
         // 200/201 = success, but check for error fields (vAPI uses errorInfo, success:"false")
         let success = regRes.status === 200 || regRes.status === 201;
+        // Per Claude v11 P0: capture A's owned resource id + A's unique fields
+        // from the registration response. This is the bytewise proof the
+        // identity matrix uses for the ownership-based IDOR oracle: B does
+        // GET /X/user/{A's id} → if body contains A's username → BOLA confirmed.
+        let regResponseBody: any = null;
         try {
-          const data = JSON.parse(regRes.body);
+          regResponseBody = JSON.parse(regRes.body);
           // vAPI returns {"errorInfo":[...]} on error, {"success":"false","cause":"..."} on fail
-          if (data.error || data.errorInfo || data.success === false || data.success === "false" || data.cause) {
+          if (regResponseBody.error || regResponseBody.errorInfo || regResponseBody.success === false || regResponseBody.success === "false" || regResponseBody.cause) {
             success = false;
-            console.log(`[crawler] Registration at ${regPath} failed: ${JSON.stringify(data).slice(0, 100)}`);
+            console.log(`[crawler] Registration at ${regPath} failed: ${JSON.stringify(regResponseBody).slice(0, 100)}`);
           }
         } catch {}
         if (success) {
@@ -396,7 +409,25 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
           successfulRegPath = regPath;  // for single-path derive (kept for backward compat)
           successfulRegPaths.push(regPath);  // collect ALL successful paths
           // Per-path credentials — critical for vAPI where each API has its own users table
-          successfulRegCreds.push({ path: regPath, username: botId, password: config.auth.password || '' });
+          successfulRegCreds.push({
+            path: regPath,
+            username: botId,
+            password: config.auth.password || '',
+            // Ownership proof for the new identity-matrix IDOR oracle:
+            //   - createdId: the resource id the server assigned to A
+            //   - uniqueFields: A-specific fields echoed back (username, email, name)
+            // Both come from the POST response body.
+            createdId: regResponseBody?.id ?? regResponseBody?.userId ?? regResponseBody?._id,
+            uniqueFields: regResponseBody && typeof regResponseBody === 'object'
+              ? Object.fromEntries(
+                  Object.entries(regResponseBody)
+                    .filter(([k, v]) => !['error', 'errorInfo', 'success', 'cause', 'message'].includes(k)
+                                       && v != null
+                                       && (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean'))
+                    .filter(([k]) => !['id', '_id', 'userId', 'created_at', 'updated_at'].includes(k))  // exclude ids/timestamps from "unique fields" (they're not A-specific)
+                )
+              : {},
+          });
           // Now try to login with the new account
           loginConfig = await detectLogin(config);
           if (loginConfig) { break; }
@@ -412,6 +443,9 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
         if (registered) {
           console.log('[crawler] Registration succeeded but no login found — trying base64 auth...');
           const base64Token = Buffer.from(`${config.auth?.username}:${config.auth?.password}`).toString('base64');
+          // Find the ownership proof from the LAST successful registration
+          // (matches the creds used for base64Token).
+          const lastReg = successfulRegCreds[successfulRegCreds.length - 1];
           result.loggedIn = true;
           result.session = {
             token: base64Token,
@@ -419,9 +453,15 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
             username: config.auth?.username || '',
             role: 'user',
             authHeader: 'Authorization-Token',  // vAPI custom header
+            // Per Claude v11 P0: ownership proof — used by identity-matrix
+            // ownership-based IDOR oracle. If A's createdId is known, the
+            // matrix will probe GET /X/user/{A's id} with B's credentials
+            // and check if B's response contains A's username/unique fields.
+            ownedResourceId: lastReg?.createdId,
+            ownedUniqueFields: lastReg?.uniqueFields,
           };
           authHeader = 'Authorization-Token';  // for Step 2/3 fetches
-          console.log(`[crawler] ✓ Using base64 auth (Authorization-Token header)`);
+          console.log(`[crawler] ✓ Using base64 auth (Authorization-Token header)${lastReg?.createdId != null ? ` (A's owned resource id=${lastReg.createdId})` : ''}`);
           // Populate local token/cookies so Step 2 (OpenAPI) + Step 3 (HTML crawl)
           // execute AS the authenticated user, not anonymous. Use the credentials
           // from the MOST RECENT successful registration (works for HTML crawl of
@@ -434,20 +474,30 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
           // ONLY in a_p_i1_users — using that credential to auth against
           // /vapi/api7/user/{id} would 403. So each derived endpoint must be
           // probed with the credentials that were registered ON THAT path.
-          for (const { path: regPath, username, password } of successfulRegCreds) {
+          for (const { path: regPath, username, password, createdId, uniqueFields } of successfulRegCreds) {
             const pathBase64Token = Buffer.from(`${username}:${password}`).toString('base64');
             const candidateGet = `${regPath}/{id}`;
-            // Try small IDs — most seed DBs use 1..5
-            let probeFound = false;
+            // Try small IDs — most seed DBs use 1..5. ALSO try A's OWN created
+            // id first (the ownership-based IDOR oracle prefers probing A's
+            // own resource, since that's the cleanest bytewise proof).
+            const candidateIds: (string | number)[] = [];
+            if (createdId != null) candidateIds.push(createdId);
             for (const id of [1, 2, 3, 4, 5]) {
+              if (!candidateIds.includes(id)) candidateIds.push(id);
+            }
+            let probeFound = false;
+            for (const id of candidateIds) {
               const probeUrl = `${baseUrl}${regPath}/${id}`;
               const probeRes = await fetchWithTimeout(probeUrl, { method: 'GET' }, config.timeoutMs, '', pathBase64Token, 'Authorization-Token');
               if (probeRes.status !== 404) {
                 // 200/401/403/500 = endpoint exists (404 = no such route)
                 const key = `${candidateGet}:GET`;
                 if (!discoveredPaths.has(key)) {
-                  discoveredPaths.set(key, { path: candidateGet, method: 'GET' });
-                  console.log(`[crawler] Derived GET ${candidateGet} from registration path (probe ${probeRes.status} on /${id}, user=${username})`);
+                  // Carry the ownedId (if known) so Step 4 prepends A's
+                  // created resource id to sampleIds — the matrix then
+                  // prioritizes probing A's owned object for IDOR.
+                  discoveredPaths.set(key, { path: candidateGet, method: 'GET', ownedId: createdId });
+                  console.log(`[crawler] Derived GET ${candidateGet} from registration path (probe ${probeRes.status} on /${id}, user=${username}${createdId != null ? `, A owned id=${createdId}` : ''})`);
                 }
                 probeFound = true;
                 break;  // found one for this path — stop probing, move to next regPath
@@ -457,7 +507,7 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
             const candidatePut = `${regPath}/{id}`;
             const keyPut = `${candidatePut}:PUT`;
             if (!discoveredPaths.has(keyPut)) {
-              discoveredPaths.set(keyPut, { path: candidatePut, method: 'PUT' });
+              discoveredPaths.set(keyPut, { path: candidatePut, method: 'PUT', ownedId: createdId });
               console.log(`[crawler] Derived PUT ${candidatePut} (mass-assignment candidate, user=${username})`);
             }
           }
@@ -702,13 +752,21 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
   }
 
   // Step 4: Convert discovered paths to resources
-  for (const [key, { path, method }] of discoveredPaths) {
+  for (const [key, { path, method, ownedId }] of discoveredPaths) {
     // Check if path has {id}
     const hasId = path.includes('{id}') || path.includes(':id');
     const paramResult = hasId ? null : parameterizePath(path);
     const finalPath = paramResult?.paramPath || path;
     const paramType = paramResult?.paramType || (hasId ? 'int' : 'unknown');
-    const sampleIds = paramResult ? [paramResult.idValue] : (hasId ? [1, 2, 3] : []);
+    let sampleIds: (string | number)[] = paramResult ? [paramResult.idValue] : (hasId ? [1, 2, 3] : []);
+    // Per Claude v11 P0: prepend A's owned resource id to sampleIds so the
+    // identity matrix probes A's just-created resource FIRST (cleanest
+    // bytewise proof for the ownership-based IDOR oracle).
+    if (ownedId != null && !sampleIds.includes(ownedId)) {
+      sampleIds.unshift(ownedId);
+    }
+    // Matrix slices sampleIds to .slice(0, 3) — ensure ownedId survives the slice
+    // (it's first, so it always will).
 
     result.resources.push({
       path: finalPath,
