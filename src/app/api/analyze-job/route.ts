@@ -605,6 +605,9 @@ async function runAnalysisInBackground(jobId: string, config: {
         console.error(`[analyze-job] DEBUG log threw: ${String(e).slice(0, 200)}`);
       }
 
+      // DEBUG: log what we have BEFORE the if/else chain
+      console.log(`[analyze-job] PRE-IF-CHECK: targetUrl=${targetUrl}, isLocalhost=${targetUrl?.startsWith('http://localhost') || targetUrl?.startsWith('http://127.0.0.1')}, bountyMode=${bountyMode}, authSessions=${authSessions ? JSON.stringify(authSessions).slice(0, 100) : 'undefined'}, authSessions.length=${authSessions?.length}`);
+
       // ─── ACTIVE FUZZER (Phase C per Claude §4+§5) ───
       // Run REAL active fuzzing with deterministic oracles on discovered
       // endpoints. This is the path that actually finds SQLi/XSS —
