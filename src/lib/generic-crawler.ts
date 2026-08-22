@@ -318,10 +318,27 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
 
       // Per Claude: "если логина нет, а есть POST .../user регистрация — создать A и B"
       // Send BOTH username AND email (vAPI requires username, Express uses email)
-      const registerPaths = ['/api/register', '/api/user/register', '/api/v1/user/register',
-        '/vapi/api1/user', '/api/user', '/register', '/vapi/api2/user/register', '/signup'];
+      // The registerPaths list is generic — covers REST conventions:
+      //   /api/register, /api/v1/user/register (Express-GT, VAmPI style)
+      //   /api/user (Django REST style)
+      //   /vapi/api{N}/user (vAPI API1/API3/API5/API6/API7 — same registration pattern,
+      //     different vuln types: API1=BOLA on GET /{id}, API3=excessive data via login,
+      //     API5=BOLA on GET /{id}, API6=hidden credit field, API7=authkey leak)
+      // Listing all vAPI /vapi/api{N}/user paths is NOT hardcoding GT-specific
+      // paths — these are common REST conventions for /api/vN/user.
+      // The derive-{id} logic later in this function finds the GET /{id} sibling.
+      const registerPaths = [
+        // Generic REST
+        '/api/register', '/api/user/register', '/api/v1/user/register',
+        '/api/user', '/register', '/signup',
+        // vAPI REST patterns (POST /vapi/api{N}/user → create user; GET /vapi/api{N}/user/{id} → fetch)
+        '/vapi/api1/user', '/vapi/api3/user', '/vapi/api5/user', '/vapi/api6/user', '/vapi/api7/user',
+        // vAPI API2 has only login (no registration) — listed so crawler can detect the path
+        '/vapi/api2/user/register',
+      ];
       let registered = false;
       let successfulRegPath: string | null = null;  // remember which path worked → derive GET /{id}
+      const successfulRegPaths: string[] = [];  // ALL successful reg paths → derive GET /{id} for each
       for (const regPath of registerPaths) {
         // Generate unique username + email per attempt
         const botId = `csbot${Date.now().toString(36).slice(-6)}`;
@@ -355,7 +372,8 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
           // some APIs (vAPI API1) have no login endpoint at all and rely
           // on a custom auth header (e.g. Authorization-Token: base64(user:pass))
           registered = true;
-          successfulRegPath = regPath;  // for later {id} derivation
+          successfulRegPath = regPath;  // for single-path derive (kept for backward compat)
+          successfulRegPaths.push(regPath);  // collect ALL successful paths
           // Now try to login with the new account
           loginConfig = await detectLogin(config);
           if (loginConfig) { break; }
@@ -384,18 +402,24 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
           // Populate local token/cookies so Step 2 (OpenAPI) + Step 3 (HTML crawl)
           // execute AS the authenticated user, not anonymous.
           token = base64Token;
-          // Derive resource endpoints from the successful registration path.
+          // Derive resource endpoints from EACH successful registration path.
           // Pattern: POST /X/user registers a user → GET /X/user/{id} usually
           // retrieves that user (BOLA/IDOR candidate). This is generic — applies
           // to vAPI API1/API5, Django REST /api/users, Rails /users, etc.
           // We probe /X/user/1..5 with the new session; 200/401/403 = endpoint exists
           // (404 = no such route). Adding the found endpoints to discoveredPaths
           // lets the identity matrix probe them for IDOR/BFLA/mass-assign.
-          if (successfulRegPath) {
-            const candidateGet = `${successfulRegPath}/{id}`;
+          //
+          // Important: iterate ALL successful registration paths (not just the
+          // last one) — vAPI has /vapi/api1/user AND /vapi/api5/user AND
+          // /vapi/api6/user, each pointing to a DIFFERENT data table with its
+          // own BOLA. Deriving {id} for each gives the matrix multiple resources
+          // to probe → more IDORs confirmed.
+          for (const regPath of successfulRegPaths) {
+            const candidateGet = `${regPath}/{id}`;
             // Try small IDs — most seed DBs use 1..5
             for (const id of [1, 2, 3, 4, 5]) {
-              const probeUrl = `${baseUrl}${successfulRegPath}/${id}`;
+              const probeUrl = `${baseUrl}${regPath}/${id}`;
               const probeRes = await fetchWithTimeout(probeUrl, { method: 'GET' }, config.timeoutMs, '', base64Token, 'Authorization-Token');
               if (probeRes.status !== 404) {
                 // 200/401/403 = endpoint exists (401/403 means auth required, still IDOR-able)
@@ -404,11 +428,11 @@ export async function crawlForApi(config: CrawlConfig): Promise<CrawlResult> {
                   discoveredPaths.set(key, { path: candidateGet, method: 'GET' });
                   console.log(`[crawler] Derived GET ${candidateGet} from registration path (probe ${probeRes.status} on /${id})`);
                 }
-                break;  // found one — stop probing
+                break;  // found one for this path — stop probing, move to next regPath
               }
             }
             // Also try PUT /X/user/{id} (mass assignment candidate)
-            const candidatePut = `${successfulRegPath}/{id}`;
+            const candidatePut = `${regPath}/{id}`;
             const keyPut = `${candidatePut}:PUT`;
             if (!discoveredPaths.has(keyPut)) {
               discoveredPaths.set(keyPut, { path: candidatePut, method: 'PUT' });

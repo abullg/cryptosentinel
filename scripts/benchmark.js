@@ -53,10 +53,10 @@ const TIER2_TARGETS = [
   {
     url: 'http://127.0.0.1:3011/',
     name: 'vAPI',
-    targetClass: 'http-nav',  // Per Claude: informational until ≥1 authz confirmed
-    recall_required: null,    // NOT a gate — we don't know vAPI's vuln types
-    types: [],
-    notes: 'Per Claude: "vAPI в бенче — informational, пока 0 authz; после первой находки — гейт recall_required=0"',
+    targetClass: 'http-server',  // PHP/Laravel REST API — promoted from http-nav after bench #46 (≥1 confirmed)
+    recall_required: 0,    // GATE (recall_required=0 per Claude rule: "после первой находки — гейт recall_required=0")
+    types: ['idor'],  // API1 BOLA — confirmed in bench #46 via GET /vapi/api1/user/{id}
+    notes: 'Promoted from informational → GATE after bench #46 (commit 355fc99) proved IDOR via base64-auth fallback + value-shape secret detection. vAPI covers OWASP API1-API10; future iterations target API2-API10 (login+token APIs, JWT, OTP, etc.).',
   },
   {
     url: 'http://127.0.0.1:3005/',
@@ -173,9 +173,9 @@ async function benchmark() {
             // Per Claude v10-feedback: --no-fallback for REST API targets
             // "Если crawler нашёл 0 — 0 confirmed, а не «спасибо hardcoded»"
             // Tier 1 (DVWA) uses DVWA-specific auth-crawler, not affected.
-            // Tier 2 REST API targets (VAmPI, Express-GT) get noFallback=true
+            // Tier 2 REST API targets (VAmPI, Express-GT, vAPI) get noFallback=true
             // to prove the generic crawler finds surface WITHOUT hardcoded paths.
-            noFallback: tier.tierKey === 'tier2' && (url.includes(':3009') || url.includes(':3010') || url.includes('/api/')),
+            noFallback: tier.tierKey === 'tier2' && (url.includes(':3009') || url.includes(':3010') || url.includes(':3011') || url.includes('/api/')),
           }),
           signal: AbortSignal.timeout(15_000),
         });
