@@ -66,9 +66,12 @@ export async function POST(req: NextRequest) {
 
     // For GT (localhost) targets, API key is NOT required — static-first
     // pipeline + active fuzzer can complete without LLM.
-    // Only production targets need LLM (and thus API key).
+    // For BOUNTY MODE targets, API key is NOT required — bounty mode uses
+    // GET-only identity matrix with deterministic oracles (no LLM).
+    // Only passive production scans need LLM (and thus API key).
     const isGtTarget = targetUrl && (targetUrl.startsWith('http://localhost') || targetUrl.startsWith('http://127.0.0.1'));
-    if (!isGtTarget && (!apiKey || !apiKey.startsWith('sk-or-v1-'))) {
+    const isBountyMode = bountyMode && authSessions?.length >= 2;
+    if (!isGtTarget && !isBountyMode && (!apiKey || !apiKey.startsWith('sk-or-v1-'))) {
       return NextResponse.json({ error: 'OpenRouter API key not configured' }, { status: 401 });
     }
 
